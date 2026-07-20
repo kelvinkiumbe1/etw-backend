@@ -10,7 +10,29 @@ const STATUS_KEY = 'dxtrade';
 const SOURCE = 'dxtrade';
 const active = new Map();
 
-function apiBase(webUrl) { return String(webUrl || '').replace(/\/+$/, '') + '/api'; }
+// Validate the user-supplied DXtrade URL to prevent SSRF (server fetches this host).
+// Require https and reject localhost / private / link-local / reserved IPs.
+function validateWebUrl(webUrl) {
+  let url;
+  try { url = new URL(String(webUrl)); } catch (e) { throw new Error('Invalid DXtrade URL.'); }
+  if (url.protocol !== 'https:') throw new Error('DXtrade URL must start with https://.');
+  const host = url.hostname.toLowerCase();
+  if (host === 'localhost' || host.endsWith('.local') || host.endsWith('.internal') || host === 'metadata.google.internal') {
+    throw new Error('That DXtrade host is not allowed.');
+  }
+  if (host.includes(':')) throw new Error('That DXtrade host is not allowed.'); // IPv6 literal
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+    const o = host.split('.').map(Number);
+    const isPrivate = o[0] === 10 || o[0] === 127 || o[0] === 0 ||
+      (o[0] === 172 && o[1] >= 16 && o[1] <= 31) ||
+      (o[0] === 192 && o[1] === 168) ||
+      (o[0] === 169 && o[1] === 254) ||
+      o[0] >= 224; // multicast/reserved
+    if (isPrivate) throw new Error('That DXtrade host is not allowed.');
+  }
+  return url.origin + url.pathname.replace(/\/+$/, '');
+}
+function apiBase(webUrl) { return validateWebUrl(webUrl) + '/api'; }
 const setStatus = (uid, patch) => store.setStatus(uid, STATUS_KEY, patch);
 
 async function req(url, opts) {
