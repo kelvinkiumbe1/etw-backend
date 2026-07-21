@@ -1,121 +1,342 @@
 rules_version = '2';
-
-// ETW Journal — Firestore security rules.
-// Principle: every user can only touch their own data; server-only data
-// (OAuth tokens, EA keys) is never client-readable; the backend uses the
-// Admin SDK which BYPASSES these rules, so all server writes keep working.
-// Anything not matched below is denied by default.
-
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // ── helpers ─────────────────────────────────────────────
-    function isSignedIn() { return request.auth != null; }
-    function isOwner(uid) { return isSignedIn() && request.auth.uid == uid; }
+    // ══════════════════════════════════════════════════
+    //  HELPER FUNCTIONS
+    // ══════════════════════════════════════════════════
+
+    function isAuthed() {
+      return request.auth != null;
+    }
+
+    function isOwner() {
+      return resource.data.uid == request.auth.uid;
+    }
+
+    function isClaimingOwn() {
+      return request.resource.data.uid == request.auth.uid;
+    }
+
+    function hasRequiredFields() {
+      return request.resource.data.keys().hasAll(['uid', 'pair', 'createdAt'])
+          || request.resource.data.keys().hasAll(['uid', 'pair', 'updatedAt']);
+    }
+
+    function uidIsValid() {
+      return request.resource.data.uid is string
+          && request.resource.data.uid.size() > 0;
+    }
+
     function isAdmin() {
-      return isSignedIn() &&
+      return isAuthed() &&
         exists(/databases/$(database)/documents/admins/$(request.auth.uid));
     }
-    // Mentor/student relationship doc id is "<mentorUid>_<studentUid>".
-    // Firebase UIDs contain no underscores, so split('_') is safe.
-    function hasMentorLink(otherUid) {
-      return isSignedIn() && (
-        exists(/databases/$(database)/documents/mentorRelationships/$(request.auth.uid + '_' + otherUid)) ||
-        exists(/databases/$(database)/documents/mentorRelationships/$(otherUid + '_' + request.auth.uid))
+
+    function isMentorOf(studentUid) {
+      return isAuthed() &&
+        exists(/databases/$(database)/documents/mentorRelationships/$(request.auth.uid + '_' + studentUid));
+    }
+
+    function isStudentOf(mentorUid) {
+      return isAuthed() &&
+        exists(/databases/$(database)/documents/mentorRelationships/$(mentorUid + '_' + request.auth.uid));
+    }
+
+    function isInRelationshipWith(uid) {
+      return isMentorOf(uid) || isStudentOf(uid);
+    }
+
+    // ── Public landing-page ticket validation ─────────────────────
+    function isPublicLandingTicket() {
+      let d = request.resource.data;
+      return d.uid == 'guest'
+          && d.source == 'landing_page'
+          && d.keys().hasAll(['uid','userEmail','userName','subject','category','status','adminUnread','userUnread','source','createdAt','updatedAt'])
+          && d.userEmail is string && d.userEmail.size() > 0 && d.userEmail.size() < 200
+          && d.userName  is string && d.userName.size()  > 0 && d.userName.size()  < 100
+          && d.subject   is string && d.subject.size()   > 0 && d.subject.size()   < 200
+          && d.category  is string && d.category.size()  < 50
+          && d.status      == 'open'
+          && d.adminUnread == true
+          && d.userUnread  == false
+          && d.createdAt is int
+          && d.updatedAt is int;
+    }
+
+    function isPublicLandingMessage(ticketId) {
+      let d = request.resource.data;
+      let ticket = get(/databases/$(database)/documents/supportTickets/$(ticketId)).data;
+      return ticket.uid == 'guest'
+          && ticket.source == 'landing_page'
+          && d.role == 'user'
+          && d.uid  == 'guest'
+          && d.userName is string && d.userName.size() > 0 && d.userName.size() < 100
+          && d.text is string && d.text.size() > 0 && d.text.size() <= 4000
+          && d.ts is int;
+    }
+
+    function isGuestLandingTicket(ticketId) {
+      let ticket = get(/databases/$(database)/documents/supportTickets/$(ticketId)).data;
+      return ticket.uid == 'guest'
+          && ticket.source == 'landing_page';
+    }
+
+    function isPublicLandingTicketUpdate(ticketId) {
+      return isGuestLandingTicket(ticketId)
+          && request.resource.data.diff(resource.data).affectedKeys()
+               .hasOnly(['updatedAt', 'userUnread', 'adminUnread']);
+    }
+
+    // ══════════════════════════════════════════════════
+    //  TRADES COLLECTION
+    // ══════════════════════════════════════════════════
+    match /trades/{tradeId} {
+      allow read:   if isAuthed() && (
+        isOwner() ||
+        isMentorOf(resource.data.uid) ||
+        isStudentOf(resource.data.uid)
       );
+      allow create: if isAuthed() && isClaimingOwn() && uidIsValid() && hasRequiredFields();
+      allow update: if isAuthed() && isOwner() && isClaimingOwn() && uidIsValid();
+      allow delete: if isAuthed() && isOwner();
     }
 
-    // ── users + subcollections ──────────────────────────────
-    match /users/{uid} {
-      allow read:  if isOwner(uid) || isAdmin();
-      allow write: if isOwner(uid);   // profile/settings; backend broker-status writes use Admin SDK (bypass rules)
-
-      // cTrader OAuth access/refresh tokens — SERVER ONLY. Never exposed to clients.
-      match /private/{doc=**} { allow read, write: if false; }
-
-      // 2-device-limit registry
-      match /devices/{deviceId} { allow read, write: if isOwner(uid); }
-
-      // notebook + account profiles
-      match /notes/{id}       { allow read, write: if isOwner(uid); }
-      match /noteFolders/{id} { allow read, write: if isOwner(uid); }
-      match /accounts/{id}    { allow read, write: if isOwner(uid); }
+    // ══════════════════════════════════════════════════
+    //  PLAYBOOKS COLLECTION
+    // ══════════════════════════════════════════════════
+    match /playbooks/{playbookId} {
+      allow read:   if isAuthed() && (
+        isOwner() ||
+        isMentorOf(resource.data.uid) ||
+        isStudentOf(resource.data.uid)
+      );
+      allow create: if isAuthed() && isClaimingOwn() && uidIsValid();
+      allow update: if isAuthed() && isOwner() && isClaimingOwn() && uidIsValid();
+      allow delete: if isAuthed() && isOwner();
     }
 
-    // ── trades (each doc carries a uid field) ────────────────
-    match /trades/{id} {
-      allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
-      allow read:   if isSignedIn() && (resource.data.uid == request.auth.uid || hasMentorLink(resource.data.uid) || isAdmin());
-      allow update, delete: if isSignedIn() && resource.data.uid == request.auth.uid;
-      // Broker-sync imports are written by the backend Admin SDK (bypass rules).
+    // ══════════════════════════════════════════════════
+    //  TRADING RULES COLLECTION
+    // ══════════════════════════════════════════════════
+    match /trading_rules/{ruleId} {
+      allow read:   if isAuthed() && isOwner();
+      allow create: if isAuthed() && isClaimingOwn() && uidIsValid();
+      allow update: if isAuthed() && isOwner() && isClaimingOwn() && uidIsValid();
+      allow delete: if isAuthed() && isOwner();
     }
 
-    // ── playbooks (uid field) ────────────────────────────────
-    match /playbooks/{id} {
-      allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
-      allow read:   if isSignedIn() && (resource.data.uid == request.auth.uid || hasMentorLink(resource.data.uid) || isAdmin());
-      allow update, delete: if isSignedIn() && resource.data.uid == request.auth.uid;
+    // ══════════════════════════════════════════════════
+    //  PUBLIC SHARES COLLECTION
+    // ══════════════════════════════════════════════════
+    match /publicShares/{shareId} {
+      allow read:   if true;
+      allow create: if isAuthed() && isClaimingOwn() && uidIsValid();
+      allow update: if isAuthed() && isOwner() && isClaimingOwn() && uidIsValid();
+      allow delete: if isAuthed() && isOwner();
     }
 
-    // ── support tickets (signed-in users, unauthenticated guests, admins) ──
-    match /supportTickets/{id} {
-      allow create: if (isSignedIn() && request.resource.data.uid == request.auth.uid)
-                    || request.resource.data.uid == 'guest';
-      allow read, update: if isAdmin()
-                    || (isSignedIn() && resource.data.uid == request.auth.uid)
-                    || resource.data.uid == 'guest';
-      allow delete: if isAdmin();
-
-      match /messages/{msgId} {
-        function ticketUid() { return get(/databases/$(database)/documents/supportTickets/$(id)).data.uid; }
-        allow read, create: if isAdmin()
-                    || (isSignedIn() && ticketUid() == request.auth.uid)
-                    || ticketUid() == 'guest';
-      }
+    // ══════════════════════════════════════════════════
+    //  PRESENCE COLLECTION
+    // ══════════════════════════════════════════════════
+    match /presence/{uid} {
+      allow read:  if isAuthed() && (
+        request.auth.uid == uid ||
+        isInRelationshipWith(uid)
+      );
+      allow write: if isAuthed() && request.auth.uid == uid;
     }
 
-    // ── admins (read own status; managed manually in the console) ──
-    match /admins/{uid} {
-      allow read:  if isSignedIn();
+    // ══════════════════════════════════════════════════
+    //  ADMINS COLLECTION
+    // ══════════════════════════════════════════════════
+    match /admins/{adminUid} {
+      allow read:  if isAuthed() && request.auth.uid == adminUid;
       allow write: if false;
     }
 
-    // ── public shares (public read by link; owner writes) ────
-    match /publicShares/{shareId} {
-      allow read:   if true;   // shared journal pages are public by design
-      allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
-      allow update, delete: if isSignedIn() && resource.data.uid == request.auth.uid;
-    }
-    // likes/comments on public share pages (viewers may be unauthenticated)
-    match /publicInteractions/{shareId}/{rest=**} {
-      allow read, create: if true;
-      allow update, delete: if false;
-    }
-
-    // ── presence ─────────────────────────────────────────────
-    match /presence/{uid} {
-      allow read:  if isSignedIn();
-      allow write: if isOwner(uid);
+    // ══════════════════════════════════════════════════
+    //  USER DOCUMENT  (FIX 2 — added)
+    //  The app reads users/{uid} for broker/cTrader connection status
+    //  (connRefresh onSnapshot) and writes settings (e.g. mt5ApiKey).
+    //  Without this rule those reads/writes fall through to the final
+    //  deny. Backend broker-status writes use the Admin SDK (bypass rules).
+    // ══════════════════════════════════════════════════
+    match /users/{uid} {
+      allow read:  if isAuthed() && (request.auth.uid == uid || isAdmin());
+      allow write: if isAuthed() && request.auth.uid == uid;
     }
 
-    // ── tips (client creates; only admins read) ──────────────
-    match /tips/{id} {
-      allow create: if isSignedIn();
+    // ══════════════════════════════════════════════════
+    //  USERS SUB-COLLECTIONS
+    //  FIX 1 — `collection != 'private'` seals users/{uid}/private/**
+    //  (cTrader OAuth access/refresh tokens) from ALL client access.
+    //  The backend Admin SDK bypasses rules, so server sync still works.
+    // ══════════════════════════════════════════════════
+    match /users/{uid}/{collection}/{docId} {
+      allow read, write: if isAuthed() && request.auth.uid == uid && collection != 'private';
+      allow read: if isAuthed() &&
+        isMentorOf(uid) &&
+        collection in ['trades', 'playbooks'];
+    }
+
+    // ══════════════════════════════════════════════════
+    //  SUPPORT TICKETS COLLECTION
+    // ══════════════════════════════════════════════════
+    match /supportTickets/{ticketId} {
+      allow read: if (isAuthed() && (resource.data.uid == request.auth.uid || isAdmin()))
+        || (resource.data.uid == 'guest' && resource.data.source == 'landing_page');
+
+      allow create: if (isAuthed() && isClaimingOwn() && uidIsValid())
+        || isPublicLandingTicket();
+
+      allow update: if (isAuthed() && (resource.data.uid == request.auth.uid || isAdmin()))
+        || isPublicLandingTicketUpdate(ticketId);
+
+      allow delete: if isAdmin();
+
+      match /messages/{msgId} {
+        allow read: if (isAuthed() && (
+          get(/databases/$(database)/documents/supportTickets/$(ticketId)).data.uid
+            == request.auth.uid
+          || isAdmin()
+        )) || isGuestLandingTicket(ticketId);
+
+        allow create: if (isAuthed() && (
+          get(/databases/$(database)/documents/supportTickets/$(ticketId)).data.uid
+            == request.auth.uid
+          || isAdmin()
+        )) || isPublicLandingMessage(ticketId);
+
+        allow update, delete: if false;
+      }
+    }
+
+    // ══════════════════════════════════════════════════
+    //  TIPS  (FIX 3 — added; app does addDoc('tips', …))
+    // ══════════════════════════════════════════════════
+    match /tips/{tipId} {
+      allow create: if isAuthed();
       allow read:   if isAdmin();
       allow update, delete: if false;
     }
 
-    // ── mentor relationships + chat (both parties; id "<mentor>_<student>") ──
-    match /mentorRelationships/{relId} {
-      allow read, write: if isSignedIn() &&
-        (request.auth.uid == relId.split('_')[0] || request.auth.uid == relId.split('_')[1]);
-    }
-    match /mentorChat/{relId}/messages/{msgId} {
-      allow read, write: if isSignedIn() &&
-        (request.auth.uid == relId.split('_')[0] || request.auth.uid == relId.split('_')[1]);
+    // ══════════════════════════════════════════════════
+    //  MENTOR INVITES
+    // ══════════════════════════════════════════════════
+    match /mentorInvites/{code} {
+      allow read: if isAuthed();
+      allow create: if isAuthed() &&
+        request.resource.data.mentorUid == request.auth.uid;
+      allow update: if isAuthed() && resource.data.mentorUid == request.auth.uid;
+      allow delete: if isAuthed() && resource.data.mentorUid == request.auth.uid;
     }
 
-    // ── EA keys (secret key = doc id) — SERVER ONLY ──────────
-    match /eaKeys/{key} { allow read, write: if false; }
+    // ══════════════════════════════════════════════════
+    //  MENTOR RELATIONSHIPS
+    // ══════════════════════════════════════════════════
+    match /mentorRelationships/{relationId} {
+      allow read: if isAuthed() && (
+        resource.data.mentorUid  == request.auth.uid ||
+        resource.data.studentUid == request.auth.uid
+      );
+      allow list: if isAuthed();
+      allow create: if isAuthed() &&
+        request.resource.data.studentUid == request.auth.uid;
+      allow update: if isAuthed() &&
+        resource.data.studentUid == request.auth.uid &&
+        request.resource.data.studentUid == request.auth.uid;
+      allow delete: if isAuthed() && (
+        resource.data.mentorUid  == request.auth.uid ||
+        resource.data.studentUid == request.auth.uid
+      );
+    }
+
+    // ══════════════════════════════════════════════════
+    //  MENTOR CHAT
+    // ══════════════════════════════════════════════════
+    match /mentorChat/{relationId}/messages/{msgId} {
+      allow read: if isAuthed() && (
+        get(/databases/$(database)/documents/mentorRelationships/$(relationId)).data.mentorUid
+          == request.auth.uid ||
+        get(/databases/$(database)/documents/mentorRelationships/$(relationId)).data.studentUid
+          == request.auth.uid
+      );
+      allow create: if isAuthed() && (
+        get(/databases/$(database)/documents/mentorRelationships/$(relationId)).data.mentorUid
+          == request.auth.uid ||
+        get(/databases/$(database)/documents/mentorRelationships/$(relationId)).data.studentUid
+          == request.auth.uid
+      );
+      allow update, delete: if false;
+    }
+
+    // ══════════════════════════════════════════════════
+    //  PUBLIC INTERACTIONS (likes & comments)
+    // ══════════════════════════════════════════════════
+    match /publicInteractions/{shareId} {
+      allow read, write: if false;
+
+      match /likes/{likeId} {
+        allow read: if true;
+        allow create: if request.resource.data.count is int
+                      && request.resource.data.count == 1
+                      && request.resource.data.itemId is string
+                      && request.resource.data.itemId.size() > 0;
+        allow update: if request.resource.data.count is int
+                      && (request.resource.data.count == resource.data.count + 1
+                          || request.resource.data.count == resource.data.count - 1);
+        allow delete: if false;
+      }
+
+      match /{commentCol}/{commentId} {
+        allow read: if commentCol.matches('comments_[A-Za-z0-9]+');
+
+        allow create: if commentCol.matches('comments_[A-Za-z0-9]+')
+                      && request.resource.data.text is string
+                      && request.resource.data.text.size() > 0
+                      && request.resource.data.text.size() <= 500
+                      && request.resource.data.author is string
+                      && request.resource.data.author.size() > 0
+                      && request.resource.data.author.size() <= 40
+                      && (request.resource.data.parentId == null
+                          || (request.resource.data.parentId is string
+                              && request.resource.data.parentId.size() > 0))
+                      && (
+                           !('isOwner' in request.resource.data)
+                           || request.resource.data.isOwner == false
+                           ||
+                           (request.resource.data.isOwner == true
+                             && isAuthed()
+                             && get(/databases/$(database)/documents/publicShares/$(shareId)).data.uid
+                                  == request.auth.uid)
+                         );
+
+        allow update: if commentCol.matches('comments_[A-Za-z0-9]+')
+                      && isAuthed()
+                      && get(/databases/$(database)/documents/publicShares/$(shareId)).data.uid
+                           == request.auth.uid
+                      && resource.data.isOwner != true
+                      && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likedByOwner'])
+                      && request.resource.data.likedByOwner is bool;
+
+        allow delete: if commentCol.matches('comments_[A-Za-z0-9]+')
+                      && (
+                           resource.data.isOwner != true
+                           ||
+                           (isAuthed()
+                             && get(/databases/$(database)/documents/publicShares/$(shareId)).data.uid
+                                  == request.auth.uid)
+                         );
+      }
+    }
+
+    // ══════════════════════════════════════════════════
+    //  BLOCK ALL OTHER COLLECTIONS
+    // ══════════════════════════════════════════════════
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
   }
 }
