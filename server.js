@@ -51,20 +51,6 @@ app.get('/', (_req, res) => res.json({
   email: email.configured(),
 }));
 
-// TEMPORARY email test route — remove after verifying Brevo. Key-gated so it
-// can't be abused as an open relay. Usage: /api/email/test?key=etw_mailtest_x7q2&to=you@email.com
-app.get('/api/email/test', async (req, res) => {
-  if ((req.query.key || '') !== 'etw_mailtest_x7q2') return res.status(403).json({ error: 'forbidden' });
-  const to = req.query.to || process.env.BREVO_SENDER || '';
-  if (!to) return res.status(400).json({ error: 'no recipient (pass ?to= or set BREVO_SENDER)' });
-  const sent = await email.sendEmail({
-    to,
-    subject: 'ETW Journal — Brevo test email',
-    html: '<div style="font-family:system-ui,sans-serif"><h2>✅ It works</h2><p>This is a test from the ETW Journal backend. If you received it, Brevo email sending is configured correctly.</p></div>',
-  });
-  res.json({ configured: email.configured(), sent, to });
-});
-
 async function requireAuth(req, res, next) {
   const m = (req.headers.authorization || '').match(/^Bearer (.+)$/);
   if (!m) return res.status(401).json({ error: 'Missing Authorization: Bearer <idToken>' });
