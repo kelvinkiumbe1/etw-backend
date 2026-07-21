@@ -10,6 +10,7 @@ const PT = {
   HEARTBEAT: 51, APP_AUTH_REQ: 2100, APP_AUTH_RES: 2101,
   ACCOUNT_AUTH_REQ: 2102, ACCOUNT_AUTH_RES: 2103,
   SYMBOLS_LIST_REQ: 2114, SYMBOLS_LIST_RES: 2115,
+  SYMBOL_BY_ID_REQ: 2116, SYMBOL_BY_ID_RES: 2117,
   DEAL_LIST_REQ: 2133, DEAL_LIST_RES: 2134,
   ERROR_RES: 2142, GET_ACCOUNTS_REQ: 2149, GET_ACCOUNTS_RES: 2150,
 };
@@ -128,6 +129,30 @@ class CtSession {
 const SYMBOL_CACHE = {};
 const SYMBOL_TTL = 24 * 60 * 60 * 1000;
 
+// Per-account symbolId -> lotSize cache. The light SYMBOLS_LIST payload has names
+// but not lotSize, so we fetch full symbol details (ProtoOASymbolByIdReq) for the
+// symbols that actually appear in the deals, and cache them 24h.
+const LOTSIZE_CACHE = {};
+async function ensureLotSizes(session, ctid, symbolIds) {
+  const cached = LOTSIZE_CACHE[ctid];
+  const map = (cached && (Date.now() - cached.ts) < SYMBOL_TTL) ? { ...cached.map } : {};
+  const need = [...new Set(symbolIds.map(String))].filter((id) => id && id !== 'undefined' && map[id] == null);
+  if (need.length) {
+    try {
+      const res = await session.request(
+        PT.SYMBOL_BY_ID_REQ, PT.SYMBOL_BY_ID_RES,
+        { ctidTraderAccountId: ctid, symbolId: need.map(Number) }, 20000);
+      (res.symbol || []).forEach((s) => {
+        if (s && s.lotSize != null) map[String(s.symbolId)] = Number(s.lotSize);
+      });
+      LOTSIZE_CACHE[ctid] = { map, ts: Date.now() };
+    } catch (e) {
+      console.warn('[ctrader] lotSize fetch failed for', ctid, '- lots may be off:', e.message);
+    }
+  }
+  return map;
+}
+
 // Discover every ctidTraderAccount linked to this access token (isLive flag included).
 async function discoverAccounts({ clientId, clientSecret, accessToken }) {
   // Account list is token-scoped and returned on either host once the app is authed.
@@ -151,7 +176,7 @@ async function discoverAccounts({ clientId, clientSecret, accessToken }) {
 }
 
 // Map one closed cTrader deal into the shared Firestore "trades" schema.
-function mapDeal(d, { uid, accountId, symbolMap, accountLabel }) {
+function mapDeal(d, { uid, accountId, symbolMap, lotSizeMap, accountLabel }) {
   const close = d.closePositionDetail || {};
   const moneyDigits = close.moneyDigits != null ? close.moneyDigits : (d.moneyDigits != null ? d.moneyDigits : 2);
   const pnl = money((close.grossProfit || 0) + (close.swap || 0) + (close.commission || 0), moneyDigits);
@@ -160,7 +185,13 @@ function mapDeal(d, { uid, accountId, symbolMap, accountLabel }) {
   const tradeData = d.tradeData || {};
   const symbolName = (symbolMap && symbolMap[String(d.symbolId)]) || tradeData.symbolName || ('Symbol #' + d.symbolId);
   const openMs = Number(d.executionTimestamp || d.createTimestamp || Date.now());
-  const lot = Number(d.filledVolume || d.volume || 0) / 100;
+  // Volume→lots: cTrader reports volume in the symbol's own units; the real lot
+  // count is filledVolume / symbol.lotSize (lotSize varies per instrument, e.g.
+  // FX=10,000,000 but others differ). Falls back to the legacy /100 only if the
+  // symbol's lotSize couldn't be resolved.
+  const rawVol = Number(d.filledVolume || d.volume || 0);
+  const lotSize = lotSizeMap && Number(lotSizeMap[String(d.symbolId)]);
+  const lot = lotSize > 0 ? rawVol / lotSize : rawVol / 100;
   const p = r2(pnl);
   // We import the CLOSING deal; its side is opposite the position's direction
   // (a long is closed by a SELL, a short by a BUY) — so invert it.
@@ -226,7 +257,7 @@ async function fetchAccountDeals(session, account, { uid, from, to }) {
   // cTrader caps ProtoOADealListReq to a 1-week range per request — so walk the
   // full [from,to] span in sub-1-week windows, paging within each window.
   const WINDOW = 7 * 24 * 60 * 60 * 1000 - 3600000;
-  const out = [];
+  const raw = [];
   let seen = 0;
   for (let winStart = from; winStart < to; ) {
     const winEnd = Math.min(winStart + WINDOW, to);
@@ -237,7 +268,7 @@ async function fetchAccountDeals(session, account, { uid, from, to }) {
       });
       const all = res.deal || [];
       seen += all.length;
-      for (const d of all) if (d.closePositionDetail) out.push(mapDeal(d, { uid, accountId: ctid, symbolMap, accountLabel }));
+      for (const d of all) if (d.closePositionDetail) raw.push(d);
       if (all.length < MAX_ROWS) break;
       const maxTs = all.reduce((m, d) => Math.max(m, Number(d.executionTimestamp || d.createTimestamp || 0)), cursor);
       if (maxTs <= cursor) break;
@@ -245,6 +276,9 @@ async function fetchAccountDeals(session, account, { uid, from, to }) {
     }
     winStart = winEnd;
   }
+  // Resolve each traded symbol's lotSize (needed to convert volume → real lots).
+  const lotSizeMap = await ensureLotSizes(session, ctid, raw.map((d) => d.symbolId));
+  const out = raw.map((d) => mapDeal(d, { uid, accountId: ctid, symbolMap, lotSizeMap, accountLabel }));
   console.log('[ctrader] account', ctid, '(' + accountLabel + '):', seen, 'deals seen,', out.length, 'closed trades mapped');
   return { trades: out, accountLabel, ctid, isLive: !!account.isLive };
 }
