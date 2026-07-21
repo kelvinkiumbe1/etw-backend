@@ -184,7 +184,10 @@ service cloud.firestore {
     //  SUPPORT TICKETS COLLECTION
     // ══════════════════════════════════════════════════
     match /supportTickets/{ticketId} {
-      allow read: if (isAuthed() && (resource.data.uid == request.auth.uid || isAdmin()))
+      // Read own tickets by uid OR by matching verified email (compatibility path
+      // for tickets created under the same email but a different auth uid); admins
+      // read all; guests read their own landing-page ticket.
+      allow read: if (isAuthed() && (resource.data.uid == request.auth.uid || resource.data.userEmail == request.auth.token.email || isAdmin()))
         || (resource.data.uid == 'guest' && resource.data.source == 'landing_page');
 
       allow create: if (isAuthed() && isClaimingOwn() && uidIsValid())
