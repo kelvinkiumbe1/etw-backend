@@ -139,10 +139,13 @@ function mapDeal(d, { uid, accountId, symbolMap, accountLabel }) {
   const openMs = Number(d.executionTimestamp || d.createTimestamp || Date.now());
   const lot = Number(d.filledVolume || d.volume || 0) / 100;
   const p = r2(pnl);
+  // We import the CLOSING deal; its side is opposite the position's direction
+  // (a long is closed by a SELL, a short by a BUY) — so invert it.
+  const positionDir = side(d.tradeSide || tradeData.tradeSide) === 'LONG' ? 'SHORT' : 'LONG';
   return {
     uid,
     pair: symbolName,
-    direction: side(d.tradeSide || tradeData.tradeSide),
+    direction: positionDir,
     entry: close.entryPrice != null ? String(close.entryPrice) : '',
     closePrice: d.executionPrice != null ? String(d.executionPrice) : '',
     sl: '', tp: '',
