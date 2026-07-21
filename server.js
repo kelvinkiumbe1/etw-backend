@@ -250,6 +250,65 @@ app.post('/api/auth/login-alert', authLimiter, requireAuth, async (req, res) => 
   } catch (e) { console.error('login-alert:', e.message); }
 });
 
+// ── Branded auth emails via Brevo (path B) ─────────────────
+// The Admin SDK generates the secure Firebase action link; Brevo sends a
+// branded email carrying it — replacing Firebase's default sender that lands
+// in spam. Continue URL must be a Firebase-authorized domain (APP_URL).
+const APP_URL = process.env.APP_URL || 'https://etwiz.space';
+const actionSettings = { url: APP_URL, handleCodeInApp: false };
+
+function emailShell(title, bodyHtml, ctaText, ctaLink) {
+  return `<div style="font-family:system-ui,-apple-system,'Segoe UI',sans-serif;max-width:480px;margin:auto;color:#1a1a1a;padding:8px">
+    <h2 style="margin:0 0 12px;color:#C8973A">${title}</h2>
+    ${bodyHtml}
+    <p style="margin:22px 0"><a href="${ctaLink}" style="background:#C8973A;color:#fff;text-decoration:none;padding:12px 22px;border-radius:8px;font-weight:700;display:inline-block">${ctaText}</a></p>
+    <p style="color:#666;font-size:12px">If the button doesn't work, copy this link into your browser:<br><span style="word-break:break-all">${ctaLink}</span></p>
+    <p style="color:#999;font-size:12px;margin-top:20px">ETW Journal</p>
+  </div>`;
+}
+
+// Signed-in user requests their verification email.
+app.post('/api/auth/send-verification', authLimiter, requireAuth, async (req, res) => {
+  try {
+    const user = await admin.auth().getUser(req.uid);
+    if (!user.email) return res.status(400).json({ error: 'No email on this account' });
+    if (user.emailVerified) return res.json({ ok: true, already: true });
+    const link = await admin.auth().generateEmailVerificationLink(user.email, actionSettings);
+    const sent = await email.sendEmail({
+      to: user.email, toName: user.displayName || '',
+      subject: 'Verify your ETW Journal email',
+      html: emailShell('Verify your email',
+        `<p>Welcome to ETW Journal${user.displayName ? ', ' + escapeHtml(user.displayName) : ''}! Confirm your email address to activate your account.</p>`,
+        'Verify email', link),
+    });
+    if (!sent) return res.status(502).json({ error: 'Email send failed' });   // client falls back to Firebase
+    res.json({ ok: true, sent: true });
+  } catch (e) {
+    console.error('send-verification:', e.message);
+    res.status(500).json({ error: 'Could not send verification email' });
+  }
+});
+
+// Unauthenticated password-reset request. Always returns ok (no account
+// enumeration); only actually sends when the account exists.
+app.post('/api/auth/send-reset', authLimiter, async (req, res) => {
+  const addr = String((req.body && req.body.email) || '').trim();
+  if (!addr) return res.status(400).json({ error: 'email required' });
+  try {
+    const link = await admin.auth().generatePasswordResetLink(addr, actionSettings);
+    await email.sendEmail({
+      to: addr,
+      subject: 'Reset your ETW Journal password',
+      html: emailShell('Reset your password',
+        `<p>We received a request to reset your ETW Journal password. Click below to choose a new one. This link expires shortly.</p><p>If you didn't request this, you can safely ignore this email.</p>`,
+        'Reset password', link),
+    });
+  } catch (e) {
+    if (!/user-not-found|no user record|EMAIL_NOT_FOUND/i.test(e.message || '')) console.error('send-reset:', e.message);
+  }
+  res.json({ ok: true });
+});
+
 const port = process.env.PORT || 8080;
 app.listen(port, () => {
   console.log('etw-sync-backend listening on :' + port);
