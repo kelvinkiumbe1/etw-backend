@@ -12,6 +12,7 @@
 // (except the OAuth callback, which Spotware calls directly).
 require('dotenv').config();
 
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
@@ -307,6 +308,69 @@ app.post('/api/auth/send-reset', authLimiter, async (req, res) => {
     if (!/user-not-found|no user record|EMAIL_NOT_FOUND/i.test(e.message || '')) console.error('send-reset:', e.message);
   }
   res.json({ ok: true });
+});
+
+// ── Email 2FA (new/untrusted-device only) ──────────────────
+// Opt-in via users/{uid}.mfaEnabled. On login from a device not in the user's
+// trusted list, a 6-digit code is emailed (Brevo) and must be verified before
+// the app proceeds. Codes are stored hashed + expiring, with attempt lockout,
+// in users/{uid}/private/mfa (server-only). Client-side gate for v1.
+const MFA_CODE_TTL = 10 * 60 * 1000;         // 10 minutes
+const MFA_TRUST_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days
+const mfaLimiter = rl(10 * 60 * 1000, 15, 'Too many 2FA attempts. Please wait a few minutes.');
+function hashCode(code, uid) { return crypto.createHash('sha256').update(String(code) + '|' + uid).digest('hex'); }
+function mfaRef(uid) { return admin.firestore().collection('users').doc(uid).collection('private').doc('mfa'); }
+function codeEmailHtml(code) {
+  return `<div style="font-family:system-ui,-apple-system,'Segoe UI',sans-serif;max-width:440px;margin:auto;color:#1a1a1a;padding:8px">
+    <h2 style="margin:0 0 8px;color:#C8973A">Your sign-in code</h2>
+    <p>Use this code to finish signing in to ETW Journal on your new device:</p>
+    <div style="font-size:34px;font-weight:800;letter-spacing:8px;background:#f4f4f6;border-radius:10px;padding:16px;text-align:center;margin:16px 0">${escapeHtml(code)}</div>
+    <p style="color:#666;font-size:13px">This code expires in 10 minutes. If you didn't try to sign in, someone may have your password — reset it immediately.</p>
+    <p style="color:#999;font-size:12px;margin-top:16px">ETW Journal security</p>
+  </div>`;
+}
+
+// Decide whether this login needs a code; if so, generate + email it.
+app.post('/api/mfa/gate', mfaLimiter, requireAuth, async (req, res) => {
+  try {
+    const deviceId = String((req.body && req.body.deviceId) || '');
+    const udoc = await admin.firestore().collection('users').doc(req.uid).get();
+    if (!(udoc.exists && udoc.data().mfaEnabled === true)) return res.json({ required: false });
+    const snap = await mfaRef(req.uid).get();
+    const data = (snap.exists && snap.data()) || {};
+    const trusted = data.trusted || {};
+    if (deviceId && trusted[deviceId] && trusted[deviceId] > Date.now()) return res.json({ required: false });
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    await mfaRef(req.uid).set({ pending: { hash: hashCode(code, req.uid), exp: Date.now() + MFA_CODE_TTL, attempts: 0, deviceId } }, { merge: true });
+    const user = await admin.auth().getUser(req.uid).catch(() => null);
+    if (user && user.email) {
+      const sent = await email.sendEmail({ to: user.email, toName: user.displayName || '', subject: 'Your ETW Journal sign-in code', html: codeEmailHtml(code) });
+      if (!sent) return res.status(502).json({ required: true, sent: false, error: 'Could not send code email' });
+    }
+    res.json({ required: true, sent: true });
+  } catch (e) { console.error('mfa gate:', e.message); res.status(500).json({ error: 'MFA error' }); }
+});
+
+// Verify a submitted code; optionally trust the device for 30 days.
+app.post('/api/mfa/verify', mfaLimiter, requireAuth, async (req, res) => {
+  try {
+    const deviceId = String((req.body && req.body.deviceId) || '');
+    const code = String((req.body && req.body.code) || '');
+    const snap = await mfaRef(req.uid).get();
+    const data = (snap.exists && snap.data()) || {};
+    const p = data.pending;
+    if (!p) return res.status(400).json({ ok: false, error: 'No code pending — request a new one.' });
+    if (Date.now() > p.exp) { await mfaRef(req.uid).set({ pending: null }, { merge: true }); return res.status(400).json({ ok: false, error: 'Code expired — request a new one.' }); }
+    if ((p.attempts || 0) >= 5) { await mfaRef(req.uid).set({ pending: null }, { merge: true }); return res.status(429).json({ ok: false, error: 'Too many attempts — request a new code.' }); }
+    if (hashCode(code, req.uid) !== p.hash) {
+      await mfaRef(req.uid).set({ pending: { ...p, attempts: (p.attempts || 0) + 1 } }, { merge: true });
+      return res.status(401).json({ ok: false, error: 'Incorrect code.' });
+    }
+    const patch = { pending: null };
+    if (req.body && req.body.trust && deviceId) { const trusted = data.trusted || {}; trusted[deviceId] = Date.now() + MFA_TRUST_TTL; patch.trusted = trusted; }
+    await mfaRef(req.uid).set(patch, { merge: true });
+    res.json({ ok: true });
+  } catch (e) { console.error('mfa verify:', e.message); res.status(500).json({ ok: false, error: 'MFA error' }); }
 });
 
 const port = process.env.PORT || 8080;
