@@ -71,7 +71,7 @@ function normalizeHistory(payload, { uid, accountId }) {
       lot: String(pick(row, 'qty') ?? pick(row, 'lots') ?? ''),
       pnl: Math.round((pnl + Number.EPSILON) * 100) / 100,
       result: pnl > 0 ? 'WIN' : pnl < 0 ? 'LOSS' : 'BREAKEVEN',
-      tradeDate: openMs, closeTime: new Date(closeMs).toISOString(),
+      tradeDate: openMs, openTime: openMs, closeTime: new Date(closeMs).toISOString(),
       swap: parseFloat(pick(row, 'swap')) || 0, commission: parseFloat(pick(row, 'commission')) || 0,
       session: getSessionFromTime(openMs), ticket: String(ticket),
       source: SOURCE, rr: '', notes: '', rules: '', psychology: '', model: '',

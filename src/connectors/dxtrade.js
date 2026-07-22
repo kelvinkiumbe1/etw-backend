@@ -81,7 +81,7 @@ function normalize(rows, { uid, accountId }) {
       lot: String(Math.abs(parseFloat(row.quantity ?? row.qty ?? row.lots ?? 0))),
       pnl: Math.round((pnl + Number.EPSILON) * 100) / 100,
       result: pnl > 0 ? 'WIN' : pnl < 0 ? 'LOSS' : 'BREAKEVEN',
-      tradeDate: openMs, closeTime: new Date(closeMs).toISOString(),
+      tradeDate: openMs, openTime: openMs, closeTime: new Date(closeMs).toISOString(),
       swap: parseFloat(row.swap) || 0, commission: parseFloat(row.commission) || 0,
       session: getSessionFromTime(openMs), ticket: String(ticket),
       source: SOURCE, rr: '', notes: '', rules: '', psychology: '', model: '',

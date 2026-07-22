@@ -176,7 +176,7 @@ async function discoverAccounts({ clientId, clientSecret, accessToken }) {
 }
 
 // Map one closed cTrader deal into the shared Firestore "trades" schema.
-function mapDeal(d, { uid, accountId, symbolMap, lotSizeMap, accountLabel }) {
+function mapDeal(d, { uid, accountId, symbolMap, lotSizeMap, accountLabel, openTsByPos }) {
   const close = d.closePositionDetail || {};
   const moneyDigits = close.moneyDigits != null ? close.moneyDigits : (d.moneyDigits != null ? d.moneyDigits : 2);
   const pnl = money((close.grossProfit || 0) + (close.swap || 0) + (close.commission || 0), moneyDigits);
@@ -216,7 +216,7 @@ function mapDeal(d, { uid, accountId, symbolMap, lotSizeMap, accountLabel }) {
     tradeDate: openMs,
     // Position open time (from the deal's tradeData) — used by Trade Replay to place
     // the entry marker; the closing deal's executionTimestamp is the exit time.
-    openTime: tradeData.openTimestamp ? Number(tradeData.openTimestamp) : '',
+    openTime: (openTsByPos && d.positionId != null && openTsByPos[String(d.positionId)]) || (tradeData.openTimestamp ? Number(tradeData.openTimestamp) : ''),
     closeTime: new Date(openMs).toISOString(),
     swap: r2(swap),
     commission: r2(commission),
@@ -271,7 +271,7 @@ async function fetchAccountDeals(session, account, { uid, from, to }) {
       });
       const all = res.deal || [];
       seen += all.length;
-      for (const d of all) if (d.closePositionDetail) raw.push(d);
+      for (const d of all) raw.push(d);
       if (all.length < MAX_ROWS) break;
       const maxTs = all.reduce((m, d) => Math.max(m, Number(d.executionTimestamp || d.createTimestamp || 0)), cursor);
       if (maxTs <= cursor) break;
@@ -279,9 +279,15 @@ async function fetchAccountDeals(session, account, { uid, from, to }) {
     }
     winStart = winEnd;
   }
+  // True position open time = the earliest deal execution per positionId (the opening
+  // deal). We now keep ALL deals (not just closing ones) so this can be derived even
+  // when the closing deal's tradeData.openTimestamp is absent.
+  const openTsByPos = {};
+  raw.forEach((d) => { const pid = String(d.positionId || ''); if (!pid) return; const ts = Number(d.executionTimestamp || d.createTimestamp || 0); if (ts && (openTsByPos[pid] == null || ts < openTsByPos[pid])) openTsByPos[pid] = ts; });
+  const closingDeals = raw.filter((d) => d.closePositionDetail);
   // Resolve each traded symbol's lotSize (needed to convert volume → real lots).
-  const lotSizeMap = await ensureLotSizes(session, ctid, raw.map((d) => d.symbolId));
-  const out = raw.map((d) => mapDeal(d, { uid, accountId: ctid, symbolMap, lotSizeMap, accountLabel }));
+  const lotSizeMap = await ensureLotSizes(session, ctid, closingDeals.map((d) => d.symbolId));
+  const out = closingDeals.map((d) => mapDeal(d, { uid, accountId: ctid, symbolMap, lotSizeMap, accountLabel, openTsByPos }));
   console.log('[ctrader] account', ctid, '(' + accountLabel + '):', seen, 'deals seen,', out.length, 'closed trades mapped');
   return { trades: out, accountLabel, ctid, isLive: !!account.isLive };
 }
