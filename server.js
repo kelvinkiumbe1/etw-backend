@@ -168,6 +168,37 @@ app.post('/api/ai/groq', aiLimiter, requireAuth, async (req, res) => {
 // ── Market-data proxy (Twelve Data) ────────────────────────
 // Keeps the Twelve Data key server-side (was base64-obfuscated in the client).
 // Public market data, so no Firebase auth — protected by rate limiting only.
+//
+// In-memory cache: replay/backtest requests are windowed around PAST trades,
+// and historical candles never change — so a window fetched once can be served
+// to every later viewer for free (0 Twelve Data credits). Only the still-forming
+// most-recent window gets a short TTL. Bounded by entry count + a byte budget
+// (LRU eviction) so it can't blow the dyno's memory. Cache resets on redeploy;
+// that's fine — it simply re-warms from live requests.
+const MKT_CACHE = new Map();                 // key -> { body, status, exp, bytes }
+let   MKT_BYTES = 0, MKT_HITS = 0, MKT_MISS = 0;
+const MKT_MAX_ENTRIES = 500;
+const MKT_MAX_BYTES    = 80 * 1024 * 1024;   // ~80 MB budget
+function mktGet(k) {
+  const e = MKT_CACHE.get(k);
+  if (!e) return null;
+  if (e.exp && e.exp < Date.now()) { MKT_CACHE.delete(k); MKT_BYTES -= e.bytes; return null; }
+  MKT_CACHE.delete(k); MKT_CACHE.set(k, e);  // LRU touch (move to newest)
+  return e;
+}
+function mktSet(k, body, status, ttlMs) {
+  const bytes = Buffer.byteLength(body);
+  if (bytes > MKT_MAX_BYTES) return;         // single item too big to ever fit
+  const prev = MKT_CACHE.get(k);
+  if (prev) { MKT_BYTES -= prev.bytes; MKT_CACHE.delete(k); }
+  MKT_CACHE.set(k, { body, status, exp: ttlMs ? Date.now() + ttlMs : 0, bytes });
+  MKT_BYTES += bytes;
+  while ((MKT_CACHE.size > MKT_MAX_ENTRIES || MKT_BYTES > MKT_MAX_BYTES) && MKT_CACHE.size) {
+    const oldest = MKT_CACHE.keys().next().value;   // oldest = first inserted
+    const o = MKT_CACHE.get(oldest); MKT_CACHE.delete(oldest); MKT_BYTES -= o.bytes;
+  }
+}
+
 app.get('/api/market/twelvedata', marketLimiter, async (req, res) => {
   const key = process.env.TWELVE_DATA_KEY || '';
   if (!key) return res.status(503).json({ error: 'Market data is not configured on the server.' });
@@ -177,12 +208,41 @@ app.get('/api/market/twelvedata', marketLimiter, async (req, res) => {
     if (q[k] != null && q[k] !== '') p.set(k, String(q[k]));
   });
   if (!p.get('symbol') || !p.get('interval')) return res.status(400).json({ error: 'symbol and interval are required' });
+
+  // Cache key = the normalised query WITHOUT the apikey (added below).
+  const cacheKey = p.toString();
+  const hit = mktGet(cacheKey);
+  if (hit) { MKT_HITS++; res.set('X-Cache', 'HIT'); return res.status(hit.status).type('application/json').send(hit.body); }
+  MKT_MISS++;
+
   p.set('apikey', key);
   try {
     const r = await fetch('https://api.twelvedata.com/time_series?' + p.toString());
-    const data = await r.json().catch(() => ({}));
-    res.status(r.status).json(data);
+    const text = await r.text();
+    // Only cache genuinely good payloads — never rate-limit (429) or error responses.
+    let ok = r.ok;
+    if (ok) { try { const j = JSON.parse(text); if (!j || j.status === 'error' || !Array.isArray(j.values) || !j.values.length) ok = false; } catch (_) { ok = false; } }
+    if (ok) {
+      // Immutable if the requested window ends in the past; else short TTL (last bar still forming).
+      const endMs  = Date.parse(String(q.end_date || '').replace(' ', 'T') + 'Z');
+      const isPast = isFinite(endMs) && endMs < Date.now() - 2 * 60 * 1000;
+      mktSet(cacheKey, text, r.status, isPast ? 30 * 24 * 3600 * 1000 : 60 * 1000);
+    }
+    res.set('X-Cache', 'MISS');
+    res.status(r.status).type('application/json').send(text);
   } catch (e) { console.error('twelvedata proxy:', e.message); res.status(502).json({ error: 'Market-data upstream error.' }); }
+});
+
+// Lightweight cache observability (no secrets exposed).
+app.get('/api/market/cache-stats', (req, res) => {
+  const total = MKT_HITS + MKT_MISS;
+  res.json({
+    entries: MKT_CACHE.size,
+    approxBytes: MKT_BYTES,
+    approxMB: +(MKT_BYTES / 1048576).toFixed(1),
+    hits: MKT_HITS, misses: MKT_MISS,
+    hitRate: total ? +(MKT_HITS / total).toFixed(3) : 0,
+  });
 });
 
 // ── New-device sign-in alert ───────────────────────────────
