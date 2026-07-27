@@ -51,6 +51,8 @@ app.get('/', (_req, res) => res.json({
   version: 'ea-2',
   platforms: { mt5: true, mt4: true, mt5ea: true, tradelocker: true, dxtrade: true, ctrader: ctrader.configured() },
   email: email.configured(),
+  pesapal: require('./src/pesapal').configured(),
+  pesapalEnv: process.env.PESAPAL_ENV || 'live',
 }));
 
 async function requireAuth(req, res, next) {
