@@ -492,6 +492,164 @@ app.post('/api/mfa/verify', mfaLimiter, requireAuth, async (req, res) => {
   } catch (e) { console.error('mfa verify:', e.message); res.status(500).json({ ok: false, error: 'MFA error' }); }
 });
 
+// ══════════════════════════════════════════════════════════════
+//  SUBSCRIPTIONS (Pesapal)  —  server-side verify + grant only
+// ══════════════════════════════════════════════════════════════
+const pesapal = require('./src/pesapal');
+
+// ⚠️ EDIT THESE before going live. Amounts are in the charge currency's
+// major unit. M-Pesa settles in KES, so use KES here (not USD) unless your
+// Pesapal account is set up for another currency.
+// USD prices converted at 1 USD = 130 KES: Essential $5/$48, Pro $12/$120.
+const PLAN_PRICES = {
+  essential: { monthly: { amount: 650,  currency: 'KES' }, yearly: { amount: 6240,  currency: 'KES' } },
+  pro:       { monthly: { amount: 1560, currency: 'KES' }, yearly: { amount: 15600, currency: 'KES' } },
+};
+
+// ⚠️ TEMPORARY TEST MODE — charges 1 KES on every plan for a live end-to-end
+//    test. SET BACK TO false before launch so real prices apply.
+const TEST_PRICING = true;
+const PLAN_DAYS = { monthly: 31, yearly: 366 };
+
+// Free-forever comp accounts — always full access, never charged.
+const COMP_EMAILS = ['kelvinkiumbe589@gmail.com', 'ethereumwizard67@gmail.com'];
+const isComp = (email) => !!email && COMP_EMAILS.includes(String(email).toLowerCase());
+
+// The ONE place access is granted: sets the custom claim (source of truth for
+// Firestore rules + the frontend) and mirrors it to users/{uid}.subscription.
+async function grantSubscription(uid, plan, cycle, extra = {}) {
+  const days = PLAN_DAYS[cycle] || 31;
+  const expiresAt = Date.now() + days * 24 * 60 * 60 * 1000;
+  const user = await admin.auth().getUser(uid);
+  const claims = Object.assign({}, user.customClaims || {}, { subscribed: true, plan, expiresAt });
+  await admin.auth().setCustomUserClaims(uid, claims);
+  await db.collection('users').doc(uid).set(
+    { subscription: { plan, cycle, status: 'active', expiresAt, updatedAt: Date.now(), ...extra } },
+    { merge: true }
+  );
+  return expiresAt;
+}
+
+// Verify a Pesapal order and grant if it completed. Idempotent.
+async function settleOrder(orderTrackingId) {
+  const ref = db.collection('pendingOrders').doc(orderTrackingId);
+  const snap = await ref.get();
+  if (!snap.exists) return { ok: false, reason: 'unknown order' };
+  const o = snap.data();
+  if (o.status === 'COMPLETED') return { ok: true, already: true };
+  const st = await pesapal.getStatus(orderTrackingId);
+  const desc = String(st.payment_status_description || '').toLowerCase();
+  if (desc === 'completed' || st.status_code === 1) {
+    const expiresAt = await grantSubscription(o.uid, o.plan, o.cycle, { orderTrackingId, paymentMethod: st.payment_method || null });
+    await ref.set({ status: 'COMPLETED', paymentMethod: st.payment_method || null, settledAt: Date.now(), expiresAt }, { merge: true });
+    return { ok: true };
+  }
+  await ref.set({ status: (desc || 'pending').toUpperCase() }, { merge: true });
+  return { ok: false, reason: desc || 'pending' };
+}
+
+// Start a checkout. Requires auth so we bind the order to a real uid.
+app.post('/api/subscribe/create-order', authLimiter, requireAuth, async (req, res) => {
+  try {
+    if (!pesapal.configured()) return res.status(503).json({ error: 'Payments are not configured on the server.' });
+    const plan  = String((req.body && req.body.plan)  || '').toLowerCase();
+    const cycle = String((req.body && req.body.cycle) || 'monthly').toLowerCase();
+    const price = PLAN_PRICES[plan] && PLAN_PRICES[plan][cycle];
+    if (!price) return res.status(400).json({ error: 'Unknown plan or billing cycle.' });
+    const chargeAmount = TEST_PRICING ? 1 : price.amount;
+
+    const user = await admin.auth().getUser(req.uid);
+
+    // Comp accounts skip payment entirely.
+    if (isComp(user.email)) {
+      const expiresAt = await grantSubscription(req.uid, 'pro', 'yearly', { comp: true });
+      return res.json({ comp: true, expiresAt });
+    }
+
+    const publicBase = (process.env.PUBLIC_BACKEND_URL || (req.protocol + '://' + req.get('host'))).replace(/\/+$/, '');
+    const appBase    = (process.env.APP_BASE_URL || req.get('origin') || publicBase).replace(/\/+$/, '');
+    const ipnId   = await pesapal.ensureIpnId(db, publicBase + '/api/pesapal/ipn');
+    const orderId = 'sub_' + req.uid.slice(0, 8) + '_' + Date.now();
+    const nameParts = String(user.displayName || '').split(' ').filter(Boolean);
+
+    const order = await pesapal.submitOrder({
+      id: orderId,
+      amount: chargeAmount,
+      currency: price.currency,
+      description: 'ETW Journal — ' + plan + ' (' + cycle + ')',
+      callbackUrl: appBase + '/payment.html?paid=1',
+      notificationId: ipnId,
+      email: user.email,
+      firstName: nameParts[0] || 'ETW',
+      lastName: nameParts.slice(1).join(' ') || 'Trader',
+      phone: (req.body && req.body.phone) || '',
+    });
+    if (!order.redirect_url || !order.order_tracking_id) {
+      return res.status(502).json({ error: 'Pesapal did not return a checkout URL.', detail: order });
+    }
+
+    await db.collection('pendingOrders').doc(order.order_tracking_id).set({
+      uid: req.uid, plan, cycle, amount: chargeAmount, currency: price.currency, status: 'PENDING', createdAt: Date.now(),
+    });
+    res.json({ redirect_url: order.redirect_url, order_tracking_id: order.order_tracking_id });
+  } catch (e) {
+    console.error('subscribe/create-order:', e.message);
+    res.status(500).json({ error: 'Could not start checkout.' });
+  }
+});
+
+// Pesapal IPN (server-to-server notification). Registered as GET type.
+async function handleIpn(req, res) {
+  try {
+    const id = (req.query && req.query.OrderTrackingId) || (req.body && req.body.OrderTrackingId);
+    if (!id) return res.status(400).json({ error: 'missing OrderTrackingId' });
+    await settleOrder(id);
+    res.json({
+      orderNotificationType: (req.query && req.query.OrderNotificationType) || 'IPNCHANGE',
+      orderTrackingId: id,
+      orderMerchantReference: (req.query && req.query.OrderMerchantReference) || '',
+      status: 200,
+    });
+  } catch (e) {
+    console.error('pesapal ipn:', e.message);
+    res.status(200).json({ status: 500 });
+  }
+}
+app.get('/api/pesapal/ipn', handleIpn);
+app.post('/api/pesapal/ipn', handleIpn);
+
+// Client polls this after returning from the Pesapal sheet.
+app.get('/api/subscribe/status/:id', authLimiter, requireAuth, async (req, res) => {
+  try {
+    const snap = await db.collection('pendingOrders').doc(req.params.id).get();
+    if (snap.exists && snap.data().uid !== req.uid) return res.status(403).json({ error: 'Not your order.' });
+    const r = await settleOrder(req.params.id);
+    const o = snap.exists ? snap.data() : {};
+    res.json({ status: o.status || 'PENDING', settled: !!r.ok });
+  } catch (e) {
+    console.error('subscribe/status:', e.message);
+    res.status(500).json({ error: 'Status check failed.' });
+  }
+});
+
+// "What access do I have?" — also auto-grants comp accounts on first check.
+app.get('/api/subscribe/me', requireAuth, async (req, res) => {
+  try {
+    const user = await admin.auth().getUser(req.uid);
+    if (isComp(user.email)) {
+      const c = user.customClaims || {};
+      if (!c.subscribed) await grantSubscription(req.uid, 'pro', 'yearly', { comp: true });
+      return res.json({ access: true, comp: true, plan: 'pro' });
+    }
+    const c = user.customClaims || {};
+    const active = c.subscribed === true && (!c.expiresAt || Date.now() < c.expiresAt);
+    res.json({ access: active, plan: c.plan || null, expiresAt: c.expiresAt || null });
+  } catch (e) {
+    console.error('subscribe/me:', e.message);
+    res.status(500).json({ error: 'Lookup failed.' });
+  }
+});
+
 const port = process.env.PORT || 8080;
 app.listen(port, () => {
   console.log('etw-sync-backend listening on :' + port);
