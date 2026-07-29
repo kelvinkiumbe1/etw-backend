@@ -34,7 +34,25 @@ ctrader.init();
 
 const app = express();
 app.set('trust proxy', 1); // behind Render's proxy — needed for correct client IP in rate limiting
-app.use(cors({ origin: true }));
+// CORS allowlist. `origin: true` reflected ANY origin, so a pirated frontend on
+// someone else's domain could call this API straight from the browser. Server-side
+// clients ignore CORS entirely — this only closes the browser-based copy — but
+// that's the realistic piracy vector. Extra origins via CORS_ORIGINS (comma-sep).
+const ALLOWED_ORIGINS = [
+  'https://etwiz.space', 'https://www.etwiz.space',
+  ...String(process.env.CORS_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean),
+];
+const isDevOrigin = (o) => /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(o || '');
+app.use(cors({
+  origin(origin, cb) {
+    // No Origin header = same-origin, curl, the MT5 EA, or Pesapal's IPN. Allow:
+    // those paths are authenticated by token or sync key, not by origin.
+    if (!origin) return cb(null, true);
+    if (ALLOWED_ORIGINS.includes(origin) || isDevOrigin(origin)) return cb(null, true);
+    console.warn('[cors] blocked origin:', origin);
+    return cb(null, false);
+  },
+}));
 app.use('/api/ai/groq', express.json({ limit: '8mb' })); // AI vision payloads (base64 images) exceed 1mb
 app.use('/api/ai/transcribe', express.json({ limit: '25mb' })); // base64 voice audio
 app.use(express.json({ limit: '1mb' }));
@@ -54,6 +72,10 @@ app.get('/', (_req, res) => res.json({
   email: email.configured(),
   pesapal: require('./src/pesapal').configured(),
   pesapalEnv: process.env.PESAPAL_ENV || 'live',
+  // Surfaced so you can confirm at a glance that launch pricing is live —
+  // testPricing:true means every plan is charging 1 KES.
+  testPricing: String(process.env.TEST_PRICING || '').toLowerCase() === 'true',
+  appCheck: String(process.env.APPCHECK_ENFORCE || '').toLowerCase() === 'true',
 }));
 
 async function requireAuth(req, res, next) {
@@ -67,6 +89,42 @@ async function requireAuth(req, res, next) {
   }
   catch (e) { res.status(401).json({ error: 'Invalid or expired token' }); }
 }
+
+// ── App Check ──────────────────────────────────────────────
+// Proves the caller is our real frontend, not a copy of it running elsewhere.
+// OFF by default: turn on with APPCHECK_ENFORCE=true only AFTER the Firebase
+// console shows verified requests arriving, or you lock out your own users.
+// Firestore enforcement is a separate switch in the console — this covers the
+// Render API, which App Check can't police on its own.
+async function requireAppCheck(req, res, next) {
+  if (String(process.env.APPCHECK_ENFORCE || '').toLowerCase() !== 'true') return next();
+  const token = req.get('X-Firebase-AppCheck') || '';
+  if (!token) return res.status(401).json({ error: 'App Check token required.', code: 'appcheck_missing' });
+  try {
+    await admin.appCheck().verifyToken(token);
+    next();
+  } catch (e) {
+    console.warn('[appcheck] rejected:', e.message);
+    res.status(401).json({ error: 'App Check verification failed.', code: 'appcheck_invalid' });
+  }
+}
+
+// Applied to every /api route except the ones that physically cannot carry an
+// App Check token: Pesapal's server-to-server IPN, Spotware's OAuth redirect, the
+// MT5 Expert Advisor's push (authenticated by its sync key) and the cron sweep
+// (authenticated by CRON_SECRET).
+const APPCHECK_EXEMPT = [
+  /^\/api\/pesapal\/ipn/,
+  /^\/api\/ctrader\/callback/,
+  /^\/api\/mt5\/trades/,
+  /^\/api\/mt5-ea\/push/,
+  /^\/api\/cron\//,
+];
+app.use(function (req, res, next) {
+  if (!req.path.startsWith('/api/')) return next();
+  if (APPCHECK_EXEMPT.some((re) => re.test(req.path))) return next();
+  return requireAppCheck(req, res, next);
+});
 
 // ── Subscription gates ─────────────────────────────────────
 // Chain AFTER requireAuth. These are what make a copied frontend worthless:
@@ -177,6 +235,7 @@ app.post('/api/ai/groq', aiLimiter, requireAuth, requirePro, async (req, res) =>
   if (!key) return res.status(503).json({ error: 'AI is not configured on the server.' });
   const body = req.body || {};
   if (!Array.isArray(body.messages) || !body.messages.length) return res.status(400).json({ error: 'messages[] is required' });
+  const wantStream = body.stream === true;
   try {
     const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
@@ -187,11 +246,40 @@ app.post('/api/ai/groq', aiLimiter, requireAuth, requirePro, async (req, res) =>
         temperature: typeof body.temperature === 'number' ? body.temperature : 0.7,
         max_tokens: Math.min(Number(body.max_tokens) || 1024, 8192),
         ...(body.response_format ? { response_format: body.response_format } : {}),
+        ...(wantStream ? { stream: true } : {}),
       }),
     });
+
+    // ── Streaming: pipe Groq's SSE straight through to the browser ──
+    // no-transform + X-Accel-Buffering:no stop Render's proxy from buffering
+    // the stream, which would defeat the whole point (tokens arriving late).
+    if (wantStream) {
+      if (!r.ok) {
+        const t = await r.text().catch(() => '');
+        return res.status(r.status).type('application/json').send(t || '{"error":"AI upstream error."}');
+      }
+      res.status(200).set({
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+      if (res.flushHeaders) res.flushHeaders();
+      const { Readable } = require('stream');
+      const upstream = Readable.fromWeb(r.body);
+      req.on('close', () => { try { upstream.destroy(); } catch (_) {} });   // client left mid-answer
+      upstream.on('error', (e) => { console.warn('groq stream:', e.message); try { res.end(); } catch (_) {} });
+      upstream.pipe(res);
+      return;
+    }
+
     const data = await r.json().catch(() => ({}));
     res.status(r.status).json(data);
-  } catch (e) { console.error('groq proxy:', e.message); res.status(502).json({ error: 'AI upstream error.' }); }
+  } catch (e) {
+    console.error('groq proxy:', e.message);
+    if (res.headersSent) { try { res.end(); } catch (_) {} return; }
+    res.status(502).json({ error: 'AI upstream error.' });
+  }
 });
 
 // ── Speech-to-text proxy (Groq Whisper) ────────────────────
@@ -262,7 +350,10 @@ function mktSet(k, body, status, ttlMs) {
   }
 }
 
-app.get('/api/market/twelvedata', marketLimiter, async (req, res) => {
+// requireSub, not requirePro: this endpoint feeds BOTH Trade Replay (Pro) and
+// Backtesting (Essential). Gating it at all is what stops the open internet —
+// and a pirated frontend — from spending our Twelve Data credits.
+app.get('/api/market/twelvedata', marketLimiter, requireAuth, requireSub, async (req, res) => {
   const key = process.env.TWELVE_DATA_KEY || '';
   if (!key) return res.status(503).json({ error: 'Market data is not configured on the server.' });
   const q = req.query || {};
@@ -312,7 +403,9 @@ app.get('/api/market/cache-stats', (req, res) => {
 // Returns the user's own broker candles so Trade Replay / Backtesting line up with
 // their fills (vs Twelve Data/Binance which can differ for OTC forex/metals).
 // Requires the caller to be signed in AND to have a connected cTrader account.
-app.get('/api/market/ctrader-bars', marketLimiter, requireAuth, requireSub, async (req, res) => {
+// Broker-native candles are only used by Trade Replay, which is a Pro feature —
+// so this one can be Pro-gated without touching Backtesting.
+app.get('/api/market/ctrader-bars', marketLimiter, requireAuth, requirePro, async (req, res) => {
   if (!ctrader.configured()) return res.status(503).json({ error: 'cTrader is not configured on the server.' });
   const q = req.query || {};
   if (!q.symbol || !q.tf) return res.status(400).json({ error: 'symbol and tf are required' });
@@ -534,9 +627,13 @@ const PLAN_PRICES = {
   pro:       { monthly: { amount: 1560, currency: 'KES' }, yearly: { amount: 15600, currency: 'KES' } },
 };
 
-// ⚠️ TEMPORARY TEST MODE — charges 1 KES on every plan for a live end-to-end
-//    test. SET BACK TO false before launch so real prices apply.
-const TEST_PRICING = true;
+// Test mode: charge 1 KES on every plan so the full Pesapal -> M-Pesa -> IPN ->
+// claim chain can be exercised for a cent. Controlled by env so it can be flipped
+// on Render without a code deploy — and, critically, so it DEFAULTS TO OFF. Left
+// hardcoded, this is the single worst bug you can ship: Pro for 1 KES.
+// Turn on:  TEST_PRICING=true   (Render -> Environment)
+// Turn off: delete the variable, or set it to anything else.
+const TEST_PRICING = String(process.env.TEST_PRICING || '').toLowerCase() === 'true';
 const PLAN_DAYS = { monthly: 31, yearly: 366 };
 
 // Free-forever comp accounts — always full access, never charged.
@@ -564,12 +661,193 @@ async function grantSubscription(uid, plan, cycle, extra = {}, keepExpiresAt = 0
   const user = await admin.auth().getUser(uid);
   const claims = Object.assign({}, user.customClaims || {}, { subscribed: true, plan, expiresAt });
   await admin.auth().setCustomUserClaims(uid, claims);
+
+  // startedAt = when this subscriber first paid. Preserved across renewals and
+  // upgrades so the Settings card can show a real "Subscribed on" date instead
+  // of the most recent charge.
+  let startedAt = Date.now();
+  try {
+    const prev = await db.collection('users').doc(uid).get();
+    const prevStart = prev.exists && prev.data().subscription && prev.data().subscription.startedAt;
+    if (prevStart) startedAt = Number(prevStart);
+  } catch (e) { /* first-time subscriber, or read failed — today is correct enough */ }
+
   await db.collection('users').doc(uid).set(
-    { subscription: { plan, cycle, status: 'active', expiresAt, updatedAt: Date.now(), ...extra } },
+    { subscription: { plan, cycle, status: 'active', expiresAt, startedAt, updatedAt: Date.now(), ...extra } },
     { merge: true }
   );
   return expiresAt;
 }
+
+// ══════════════════════════════════════════════════════════════
+//  BREVO AUDIENCE SYNC + SUBSCRIPTION LIFECYCLE EMAILS
+// ══════════════════════════════════════════════════════════════
+const DAY_MS = 24 * 60 * 60 * 1000;
+const ymd = (ms) => (ms ? new Date(Number(ms)).toISOString().slice(0, 10) : '');
+
+// Mirror the user into Brevo with their live plan data, so campaigns can segment
+// on it ("all Essential users expiring this week") instead of a stale import.
+// Deduped by an attribute signature: this gets called on ordinary app loads, and
+// re-POSTing unchanged contacts would burn API quota for nothing.
+const BREVO_SYNC_TTL = 7 * DAY_MS;
+async function syncBrevoContact(uid, opts) {
+  const force = !!(opts && opts.force);
+  if (!email.configured()) return false;
+  // Contacts exist purely to power campaigns/segments. Transactional email (the
+  // receipt and expiry notices below) needs none of this, so the whole sync stays
+  // OFF until a BREVO_LIST_ID is configured.
+  if (!email.listIdsFromEnv().length) return false;
+  try {
+    const user = await admin.auth().getUser(uid);
+    if (!user.email) return false;
+    const ref = db.collection('users').doc(uid);
+    const snap = await ref.get();
+    const d = snap.exists ? snap.data() : {};
+    const sub = d.subscription || {};
+    const a = await access.accessFor(uid, null);
+    const name = String(user.displayName || '').trim();
+
+    const attributes = {
+      FIRSTNAME: name.split(' ')[0] || '',
+      LASTNAME: name.split(' ').slice(1).join(' '),
+      PLAN: a.active ? (a.plan || 'essential') : 'none',
+      STATUS: a.active ? 'active' : 'inactive',
+      CYCLE: sub.cycle || '',
+      EXPIRES_AT: ymd(a.expiresAt || sub.expiresAt),
+      SUBSCRIBED_ON: ymd(sub.startedAt),
+      COMP: !!sub.comp,
+    };
+    const sig = JSON.stringify(attributes);
+    const last = d.brevo || {};
+    if (!force && last.sig === sig && Date.now() - Number(last.at || 0) < BREVO_SYNC_TTL) return false;
+
+    const ok = await email.upsertContact({ email: user.email, attributes });
+    if (ok) await ref.set({ brevo: { sig, at: Date.now() } }, { merge: true });
+    return ok;
+  } catch (e) {
+    console.warn('brevo sync:', e.message);
+    return false;
+  }
+}
+
+const money = (amount, currency) => (currency || 'KES') + ' ' + Number(amount || 0).toLocaleString('en-KE');
+const nice = (ms) => (ms ? new Date(Number(ms)).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }) : '—');
+
+// Receipt after a settled payment. Fire-and-forget: a failed email must never
+// break the payment path — the subscription is already granted at this point.
+async function sendReceiptEmail(uid, order, expiresAt) {
+  try {
+    const user = await admin.auth().getUser(uid);
+    if (!user.email) return;
+    const isUpgrade = order.kind === 'upgrade';
+    const planName = (order.plan === 'pro' ? 'Pro' : 'Essential');
+    const body = isUpgrade
+      ? `<p>You're on <b>Pro</b> — Mentor mode, ETW AI and Trade Replay are unlocked right now.</p>
+         <p>You paid only the difference (<b>${money(order.amount, order.currency)}</b>), and your renewal date is unchanged: <b>${nice(expiresAt)}</b>.</p>`
+      : `<p>Thanks — your payment of <b>${money(order.amount, order.currency)}</b> went through and your <b>${planName}</b> plan is active.</p>
+         <table style="border-collapse:collapse;margin:14px 0;font-size:14px">
+           <tr><td style="padding:4px 14px 4px 0;color:#666">Plan</td><td><b>${planName}</b> (${order.cycle === 'yearly' ? 'yearly' : 'monthly'})</td></tr>
+           <tr><td style="padding:4px 14px 4px 0;color:#666">Amount</td><td>${money(order.amount, order.currency)}</td></tr>
+           <tr><td style="padding:4px 14px 4px 0;color:#666">Renews</td><td>${nice(expiresAt)}</td></tr>
+         </table>`;
+    await email.sendEmail({
+      to: user.email, toName: user.displayName || '',
+      subject: isUpgrade ? "You're on ETW Journal Pro" : 'Payment received — ETW Journal ' + planName,
+      html: emailShell(isUpgrade ? 'Welcome to Pro' : 'Payment received', body, 'Open your journal', APP_URL + '/journal.html'),
+    });
+  } catch (e) { console.warn('receipt email:', e.message); }
+}
+
+// Mark a lapsed subscription expired and email the owner — exactly once. The
+// status flip IS the dedupe, so this is safe to call from anywhere (the daily
+// sweep, or lazily when the user next opens the app).
+async function notifyExpired(uid, ref, sub) {
+  if (!sub || sub.comp || sub.status !== 'active') return false;
+  if (!Number(sub.expiresAt) || Number(sub.expiresAt) >= Date.now()) return false;
+  await ref.set({ subscription: { status: 'expired', expiredAt: Date.now() } }, { merge: true });
+  try {
+    const user = await admin.auth().getUser(uid);
+    if (user.email) {
+      await email.sendEmail({
+        to: user.email, toName: user.displayName || '',
+        subject: 'Your ETW Journal subscription has ended',
+        html: emailShell('Your subscription has ended',
+          `<p>Your <b>${sub.plan === 'pro' ? 'Pro' : 'Essential'}</b> plan ended on <b>${nice(sub.expiresAt)}</b>, so journalling, broker sync and analytics are locked for now.</p>
+           <p><b>Nothing has been deleted.</b> Every trade, note and playbook is exactly where you left it and comes straight back the moment you resubscribe.</p>`,
+          'Reactivate my plan', APP_URL + '/payment.html'),
+      });
+    }
+  } catch (e) { console.warn('expiry email ' + uid + ':', e.message); }
+  syncBrevoContact(uid, { force: true }).catch(() => {});   // no-op unless a list is configured
+  return true;
+}
+
+// Daily sweep: warn before a plan lapses, and confirm once it has. Render's free
+// tier has no scheduler, so this is an endpoint for an external cron (cron-job.org,
+// GitHub Actions, UptimeRobot) to hit once a day. Guarded by CRON_SECRET — with no
+// secret set it refuses to run rather than sitting open.
+const REMIND_DAYS = 3;
+async function sweepSubscriptions() {
+  const now = Date.now();
+  const out = { warned: 0, expired: 0, skipped: 0 };
+
+  // Expiring within the window. Two range filters on ONE field, so the automatic
+  // single-field index covers it — no composite index to create.
+  const soon = await db.collection('users')
+    .where('subscription.expiresAt', '>=', now)
+    .where('subscription.expiresAt', '<=', now + REMIND_DAYS * DAY_MS)
+    .limit(300).get();
+
+  for (const doc of soon.docs) {
+    const sub = doc.data().subscription || {};
+    if (sub.comp || sub.status !== 'active') { out.skipped++; continue; }
+    if (Number(sub.remindedFor || 0) === Number(sub.expiresAt)) { out.skipped++; continue; }  // once per period
+    try {
+      const user = await admin.auth().getUser(doc.id);
+      if (!user.email) { out.skipped++; continue; }
+      const left = Math.max(1, Math.ceil((Number(sub.expiresAt) - now) / DAY_MS));
+      await email.sendEmail({
+        to: user.email, toName: user.displayName || '',
+        subject: 'Your ETW Journal plan ends in ' + left + ' day' + (left === 1 ? '' : 's'),
+        html: emailShell('Your plan is about to end',
+          `<p>Your <b>${sub.plan === 'pro' ? 'Pro' : 'Essential'}</b> plan ends on <b>${nice(sub.expiresAt)}</b> — that's ${left} day${left === 1 ? '' : 's'} away.</p>
+           <p>Renew before then and nothing changes. Your trades stay exactly where they are either way; they just become read-only until you're back.</p>`,
+          'Renew my plan', APP_URL + '/payment.html'),
+      });
+      await doc.ref.set({ subscription: { remindedFor: Number(sub.expiresAt) } }, { merge: true });
+      out.warned++;
+    } catch (e) { console.warn('sweep warn ' + doc.id + ':', e.message); }
+  }
+
+  // Recently lapsed. Bounded to the last 14 days so this never re-scans years of
+  // old records.
+  const gone = await db.collection('users')
+    .where('subscription.expiresAt', '>=', now - 14 * DAY_MS)
+    .where('subscription.expiresAt', '<', now)
+    .limit(300).get();
+
+  for (const doc of gone.docs) {
+    try {
+      if (await notifyExpired(doc.id, doc.ref, doc.data().subscription || {})) out.expired++;
+      else out.skipped++;
+    } catch (e) { console.warn('sweep expire ' + doc.id + ':', e.message); }
+  }
+  return out;
+}
+
+app.all('/api/cron/subscriptions', authLimiter, async (req, res) => {
+  const secret = process.env.CRON_SECRET || '';
+  if (!secret) return res.status(503).json({ error: 'CRON_SECRET is not set on the server.' });
+  const given = req.get('X-Cron-Key') || (req.query && req.query.key) || '';
+  if (given !== secret) return res.status(403).json({ error: 'forbidden' });
+  try {
+    const r = await sweepSubscriptions();
+    res.json({ ok: true, ...r });
+  } catch (e) {
+    console.error('cron/subscriptions:', e.message);
+    res.status(500).json({ error: 'sweep failed' });
+  }
+});
 
 // Verify a Pesapal order and grant if it completed. Idempotent.
 async function settleOrder(orderTrackingId) {
@@ -587,6 +865,10 @@ async function settleOrder(orderTrackingId) {
       o.kind === 'upgrade' ? o.keepExpiresAt : 0,
     );
     await ref.set({ status: 'COMPLETED', paymentMethod: st.payment_method || null, settledAt: Date.now(), expiresAt }, { merge: true });
+    // Receipt + audience sync are fire-and-forget: access is already granted, and
+    // a Brevo hiccup must never turn a successful payment into an error.
+    sendReceiptEmail(o.uid, o, expiresAt).catch(() => {});
+    syncBrevoContact(o.uid, { force: true }).catch(() => {});
     return { ok: true };
   }
   await ref.set({ status: (desc || 'pending').toUpperCase() }, { merge: true });
@@ -653,6 +935,12 @@ app.post('/api/subscribe/create-order', authLimiter, requireAuth, async (req, re
       phone: (req.body && req.body.phone) || '',
     });
     if (!order.redirect_url || !order.order_tracking_id) {
+      // Log the whole upstream reply — Pesapal's reason (bad callback_url, stale
+      // notification_id, amount below minimum, currency not enabled) only exists
+      // here, and without it this is undebuggable from the client side.
+      console.error('[pesapal] SubmitOrder rejected:', JSON.stringify(order),
+        '| callback:', appBase + '/payment.html?paid=1', '| ipn:', ipnId,
+        '| amount:', chargeAmount, price.currency);
       return res.status(502).json({ error: 'Pesapal did not return a checkout URL.', detail: order });
     }
 
@@ -712,6 +1000,21 @@ app.get('/api/subscribe/me', requireAuth, async (req, res) => {
     }
     const a = await access.accessFor(req.uid, null);   // null = always read fresh claims
     const out = { access: a.active, plan: a.plan || null, pro: access.isPro(a), expiresAt: a.expiresAt || null };
+
+    // Keep the Brevo audience current (no-op unless BREVO_LIST_ID is set).
+    syncBrevoContact(req.uid).catch(() => {});
+
+    // Lazy expiry notice: if their plan has lapsed, send the "subscription has
+    // ended" email the next time they open the app. This is what makes the
+    // expiry email work with NO cron configured at all — the daily sweep just
+    // catches the people who never come back.
+    if (!a.active) {
+      (async () => {
+        const ref = db.collection('users').doc(req.uid);
+        const s = await ref.get();
+        if (s.exists) await notifyExpired(req.uid, ref, s.data().subscription || {});
+      })().catch(() => {});
+    }
 
     // Active Essential? Quote the mid-cycle upgrade so the UI can price the button.
     if (a.active && !access.isPro(a)) {

@@ -46,14 +46,27 @@ async function api(path, body, method = 'POST') {
 }
 
 // Register an IPN URL once and cache its id in Firestore (config/pesapal).
+// The cache is keyed by URL *and* by which merchant registered it: IPN ids are
+// account-scoped, so after swapping PESAPAL_CONSUMER_KEY a cached id from the
+// previous merchant would be silently reused and SubmitOrder would reject every
+// order with an invalid notification_id. Fingerprint (not the key itself) so the
+// credential never lands in Firestore.
+function keyFingerprint() {
+  return require('crypto').createHash('sha256')
+    .update(String(process.env.PESAPAL_CONSUMER_KEY || '')).digest('hex').slice(0, 16);
+}
+
 async function ensureIpnId(db, ipnUrl) {
   const ref = db.collection('config').doc('pesapal');
   const snap = await ref.get();
   const saved = snap.exists ? snap.data() : {};
-  if (saved.ipnId && saved.ipnUrl === ipnUrl) return saved.ipnId;
+  const fp = keyFingerprint();
+  const envName = String(process.env.PESAPAL_ENV || 'live').toLowerCase();
+  if (saved.ipnId && saved.ipnUrl === ipnUrl && saved.keyFp === fp && saved.env === envName) return saved.ipnId;
   const d = await api('/api/URLSetup/RegisterIPN', { url: ipnUrl, ipn_notification_type: 'GET' });
   if (!d.ipn_id) throw new Error('Pesapal RegisterIPN failed: ' + JSON.stringify(d));
-  await ref.set({ ipnId: d.ipn_id, ipnUrl }, { merge: true });
+  await ref.set({ ipnId: d.ipn_id, ipnUrl, keyFp: fp, env: envName, registeredAt: Date.now() }, { merge: true });
+  console.log('[pesapal] registered IPN', d.ipn_id, 'for', ipnUrl, '(' + envName + ')');
   return d.ipn_id;
 }
 
