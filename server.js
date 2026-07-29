@@ -993,6 +993,37 @@ app.post('/api/admin/revoke', authLimiter, requireAdmin, async (req, res) => {
   }
 });
 
+// Diagnostic: attempt a Pesapal order at an arbitrary amount and hand back the
+// RAW upstream reply. Submitting an order only creates a checkout session — no
+// money moves unless somebody actually pays it — so this is a safe way to find
+// out why one amount is accepted and another rejected (per-transaction caps,
+// currency not enabled, stale IPN id) without digging through logs.
+app.get('/api/admin/pesapal-probe', authLimiter, requireAdmin, async (req, res) => {
+  try {
+    if (!pesapal.configured()) return res.status(503).json({ error: 'Pesapal is not configured.' });
+    const amount = Number(req.query.amount || 650);
+    const currency = String(req.query.currency || 'KES').toUpperCase();
+    const publicBase = (process.env.PUBLIC_BACKEND_URL || (req.protocol + '://' + req.get('host'))).replace(/\/+$/, '');
+    const ipnId = await pesapal.ensureIpnId(db, publicBase + '/api/pesapal/ipn');
+    const order = await pesapal.submitOrder({
+      id: 'probe_' + Date.now(),
+      amount, currency,
+      description: 'ETW Journal probe ' + amount + ' ' + currency,
+      callbackUrl: APP_URL + '/payment.html?probe=1',
+      notificationId: ipnId,
+      email: 'probe@' + (process.env.BREVO_SENDER || 'ethwiz.space').split('@').pop(),
+      firstName: 'ETW', lastName: 'Probe', phone: '',
+    });
+    res.json({
+      sent: { amount, currency, ipnId, callbackUrl: APP_URL + '/payment.html?probe=1', env: process.env.PESAPAL_ENV || 'live' },
+      accepted: !!(order && order.redirect_url),
+      raw: order,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Support lookup: what access does this person actually have?
 app.get('/api/admin/user', authLimiter, requireAdmin, async (req, res) => {
   try {
