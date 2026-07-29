@@ -1083,6 +1083,22 @@ app.post('/api/subscribe/create-order', authLimiter, requireAuth, async (req, re
     }
     const chargeAmount = TEST_PRICING ? 1 : amount;
 
+    // Pesapal enforces a per-transaction cap per merchant contract; ours currently
+    // sits near 2,000 KES, which the yearly prices (6,240 / 15,600) exceed. Pesapal
+    // answers amount_exceeds_default_limit, which surfaced to users as the useless
+    // "did not return a checkout URL". Catch it here and say something actionable.
+    // Raise PESAPAL_MAX_AMOUNT (or unset it) once Pesapal lifts the limit.
+    const maxAmount = Number(process.env.PESAPAL_MAX_AMOUNT || 2000);
+    if (maxAmount > 0 && chargeAmount > maxAmount) {
+      console.warn('[pesapal] refusing ' + chargeAmount + ' ' + price.currency + ' — above cap ' + maxAmount);
+      return res.status(400).json({
+        error: cycle === 'yearly'
+          ? 'Yearly billing is not available yet — please choose the monthly plan.'
+          : 'That amount is above the limit our payment provider currently allows.',
+        code: 'amount_above_cap', max: maxAmount, currency: price.currency,
+      });
+    }
+
     const publicBase = (process.env.PUBLIC_BACKEND_URL || (req.protocol + '://' + req.get('host'))).replace(/\/+$/, '');
     const appBase    = (process.env.APP_BASE_URL || req.get('origin') || publicBase).replace(/\/+$/, '');
     const ipnId   = await pesapal.ensureIpnId(db, publicBase + '/api/pesapal/ipn');
