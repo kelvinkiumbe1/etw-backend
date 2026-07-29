@@ -119,6 +119,9 @@ const APPCHECK_EXEMPT = [
   /^\/api\/mt5\/trades/,
   /^\/api\/mt5-ea\/push/,
   /^\/api\/cron\//,
+  // Admin routes carry their own stronger auth (admin uid or ADMIN_SECRET) and
+  // must stay callable from a terminal, where no App Check token exists.
+  /^\/api\/admin\//,
 ];
 app.use(function (req, res, next) {
   if (!req.path.startsWith('/api/')) return next();
@@ -875,6 +878,123 @@ async function settleOrder(orderTrackingId) {
   return { ok: false, reason: desc || 'pending' };
 }
 
+// ══════════════════════════════════════════════════════════════
+//  ADMIN: grant / revoke access without a payment
+// ══════════════════════════════════════════════════════════════
+// For trials, influencers, goodwill after a support issue, and refunds. Unlike
+// COMP_EMAILS these grants EXPIRE on their own and can be revoked, which is why
+// comp should stay reserved for your own accounts.
+//
+// Two ways to authenticate, so this works from the app AND from a terminal:
+//   * a Firebase token whose uid exists in the `admins` collection, or
+//   * header  X-Admin-Secret: <ADMIN_SECRET>
+async function requireAdmin(req, res, next) {
+  const secret = process.env.ADMIN_SECRET || '';
+  if (secret && req.get('X-Admin-Secret') === secret) { req.adminBy = 'secret'; return next(); }
+  const m = (req.headers.authorization || '').match(/^Bearer (.+)$/);
+  if (!m) return res.status(401).json({ error: 'Admin auth required.' });
+  try {
+    const decoded = await admin.auth().verifyIdToken(m[1]);
+    const isAdmin = (await db.collection('admins').doc(decoded.uid).get()).exists;
+    if (!isAdmin) return res.status(403).json({ error: 'Not an admin.' });
+    req.uid = decoded.uid; req.adminBy = decoded.email || decoded.uid;
+    next();
+  } catch (e) { res.status(401).json({ error: 'Invalid token.' }); }
+}
+
+// Accept either an email or a uid, so support can act on what they actually have.
+async function resolveTarget(body) {
+  const emailAddr = String((body && body.email) || '').trim();
+  const uid = String((body && body.uid) || '').trim();
+  if (uid) return await admin.auth().getUser(uid);
+  if (emailAddr) return await admin.auth().getUserByEmail(emailAddr);
+  const e = new Error('email or uid is required'); e.status = 400; throw e;
+}
+
+app.post('/api/admin/grant', authLimiter, requireAdmin, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const plan = String(b.plan || 'pro').toLowerCase();
+    if (plan !== 'pro' && plan !== 'essential') return res.status(400).json({ error: "plan must be 'pro' or 'essential'" });
+    const days = Math.max(1, Math.min(3650, parseInt(b.days, 10) || 30));
+    const user = await resolveTarget(b);
+
+    // keepExpiresAt doubles as an explicit expiry override, so an admin grant is
+    // an ordinary subscription with a custom end date — nothing special to
+    // special-case anywhere else.
+    const expiresAt = Date.now() + days * DAY_MS;
+    const cycle = days > 200 ? 'yearly' : 'monthly';
+    await grantSubscription(user.uid, plan, cycle, {
+      source: 'admin', grantedBy: req.adminBy || 'admin', grantedAt: Date.now(),
+      note: String(b.note || '').slice(0, 300), paid: false,
+    }, expiresAt);
+
+    syncBrevoContact(user.uid, { force: true }).catch(() => {});
+    if (b.notify !== false && user.email) {
+      email.sendEmail({
+        to: user.email, toName: user.displayName || '',
+        subject: 'Your ETW Journal access is active',
+        html: emailShell('You’re in',
+          `<p>Your <b>${plan === 'pro' ? 'Pro' : 'Essential'}</b> access to ETW Journal is active until <b>${nice(expiresAt)}</b>.</p>
+           <p>Nothing to pay — just sign in and start journalling.</p>`,
+          'Open ETW Journal', APP_URL + '/journal.html'),
+      }).catch(() => {});
+    }
+    console.log('[admin] granted', plan, days + 'd to', user.email || user.uid, 'by', req.adminBy);
+    res.json({ ok: true, uid: user.uid, email: user.email || null, plan, days, expiresAt, expiresOn: ymd(expiresAt) });
+  } catch (e) {
+    console.error('admin/grant:', e.message);
+    res.status(e.status || 500).json({ error: e.message || 'grant failed' });
+  }
+});
+
+app.post('/api/admin/revoke', authLimiter, requireAdmin, async (req, res) => {
+  try {
+    const user = await resolveTarget(req.body || {});
+    const claims = Object.assign({}, user.customClaims || {});
+    delete claims.subscribed; delete claims.plan; delete claims.expiresAt;
+    await admin.auth().setCustomUserClaims(user.uid, claims);
+    // Kills the refresh token as well, otherwise the cached ID token keeps its
+    // old claim until it expires (up to an hour).
+    await admin.auth().revokeRefreshTokens(user.uid);
+    await db.collection('users').doc(user.uid).set(
+      { subscription: { status: 'revoked', revokedAt: Date.now(), revokedBy: req.adminBy || 'admin' } },
+      { merge: true }
+    );
+    syncBrevoContact(user.uid, { force: true }).catch(() => {});
+    console.log('[admin] revoked', user.email || user.uid, 'by', req.adminBy);
+    res.json({
+      ok: true, uid: user.uid, email: user.email || null,
+      // Revoking a comp address achieves nothing: /api/subscribe/me re-grants it
+      // on their next app load. Say so instead of reporting a hollow success.
+      warning: access.isComp(user.email) ? 'This email is in COMP_EMAILS — it will be re-granted on next sign-in. Remove it there first.' : undefined,
+    });
+  } catch (e) {
+    console.error('admin/revoke:', e.message);
+    res.status(e.status || 500).json({ error: e.message || 'revoke failed' });
+  }
+});
+
+// Support lookup: what access does this person actually have?
+app.get('/api/admin/user', authLimiter, requireAdmin, async (req, res) => {
+  try {
+    const user = await resolveTarget({ email: req.query.email, uid: req.query.uid });
+    const a = await access.accessFor(user.uid, null);
+    const snap = await db.collection('users').doc(user.uid).get();
+    const sub = (snap.exists && snap.data().subscription) || null;
+    res.json({
+      uid: user.uid, email: user.email || null, displayName: user.displayName || null,
+      emailVerified: user.emailVerified, disabled: user.disabled,
+      comp: access.isComp(user.email),
+      access: a.active, plan: a.plan || null, pro: access.isPro(a),
+      expiresAt: a.expiresAt || null, expiresOn: ymd(a.expiresAt),
+      subscription: sub,
+    });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message || 'lookup failed' });
+  }
+});
+
 // Start a checkout. Requires auth so we bind the order to a real uid.
 app.post('/api/subscribe/create-order', authLimiter, requireAuth, async (req, res) => {
   try {
@@ -995,7 +1115,13 @@ app.get('/api/subscribe/me', requireAuth, async (req, res) => {
     const user = await admin.auth().getUser(req.uid);
     if (isComp(user.email)) {
       const c = user.customClaims || {};
-      if (!c.subscribed) await grantSubscription(req.uid, 'pro', 'yearly', { comp: true });
+      // Re-grant when the claim is MISSING **or EXPIRED**. Checking only
+      // !c.subscribed left comp accounts stranded after a year: the claim keeps
+      // subscribed:true with a past expiresAt, so nothing re-granted while
+      // Firestore rules — which read expiresAt from the token — denied every
+      // read. The backend would still let them in; only their data vanished.
+      const stale = !c.subscribed || (c.expiresAt && Date.now() > Number(c.expiresAt) - 7 * DAY_MS);
+      if (stale) await grantSubscription(req.uid, 'pro', 'yearly', { comp: true });
       return res.json({ access: true, comp: true, plan: 'pro', pro: true });
     }
     const a = await access.accessFor(req.uid, null);   // null = always read fresh claims
