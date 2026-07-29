@@ -24,6 +24,7 @@ const dxtrade = require('./src/connectors/dxtrade');
 const ctrader = require('./src/connectors/ctrader');
 const mt5ea = require('./src/connectors/mt5ea');
 const email = require('./src/email');
+const access = require('./src/access');
 
 initFirebase();
 const db = admin.firestore();
@@ -58,12 +59,37 @@ app.get('/', (_req, res) => res.json({
 async function requireAuth(req, res, next) {
   const m = (req.headers.authorization || '').match(/^Bearer (.+)$/);
   if (!m) return res.status(401).json({ error: 'Missing Authorization: Bearer <idToken>' });
-  try { req.uid = (await admin.auth().verifyIdToken(m[1])).uid; next(); }
+  try {
+    const decoded = await admin.auth().verifyIdToken(m[1]);
+    req.uid = decoded.uid;
+    req.token = decoded;              // carries the subscription claim for the gates below
+    next();
+  }
   catch (e) { res.status(401).json({ error: 'Invalid or expired token' }); }
 }
 
+// ── Subscription gates ─────────────────────────────────────
+// Chain AFTER requireAuth. These are what make a copied frontend worthless:
+// the value lives behind these routes, and only a real claim opens them.
+// 402 = "payment required" — the client turns that into the paywall.
+async function requireSub(req, res, next) {
+  try {
+    const a = await access.accessFor(req.uid, req.token);
+    if (!a.active) return res.status(402).json({ error: 'A subscription is required to use this feature.', code: 'subscription_required' });
+    req.access = a; next();
+  } catch (e) { console.error('requireSub:', e.message); res.status(500).json({ error: 'Access check failed.' }); }
+}
+async function requirePro(req, res, next) {
+  try {
+    const a = await access.accessFor(req.uid, req.token);
+    if (!a.active) return res.status(402).json({ error: 'A subscription is required to use this feature.', code: 'subscription_required' });
+    if (!access.isPro(a)) return res.status(402).json({ error: 'This feature is on the Pro plan.', code: 'pro_required', plan: a.plan || null });
+    req.access = a; next();
+  } catch (e) { console.error('requirePro:', e.message); res.status(500).json({ error: 'Access check failed.' }); }
+}
+
 // ── MT5 / MT4 ──────────────────────────────────────────────
-app.post('/api/mt5-direct/connect', authLimiter, requireAuth, async (req, res) => {
+app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requireSub, async (req, res) => {
   const { login, password, server, platform, journalAccountId } = req.body || {};
   if (!login || !password || !server) return res.status(400).json({ error: 'login, password and server are required' });
   await mt5.setStatus(req.uid, { status: 'connecting', platform: platform || 'mt5', login: String(login), server, error: null });
@@ -79,7 +105,7 @@ app.post('/api/mt5-direct/disconnect', requireAuth, async (req, res) => {
 
 // ── MT5 EA (FREE — no MetaApi) ─────────────────────────────
 // register: Firebase-auth'd, mints a key for the active account.
-app.post('/api/mt5-ea/register', authLimiter, requireAuth, async (req, res) => {
+app.post('/api/mt5-ea/register', authLimiter, requireAuth, requireSub, async (req, res) => {
   try {
     const key = await mt5ea.register(req.uid, (req.body && req.body.journalAccountId) || '');
     res.json({ ok: true, key });
@@ -96,7 +122,7 @@ app.post('/api/mt5/trades', eaLimiter, eaPush);   // matches the EA's default Se
 app.post('/api/mt5-ea/push', eaLimiter, eaPush);
 
 // ── TradeLocker ────────────────────────────────────────────
-app.post('/api/tradelocker/connect', authLimiter, requireAuth, async (req, res) => {
+app.post('/api/tradelocker/connect', authLimiter, requireAuth, requireSub, async (req, res) => {
   const { email, password, server, env, journalAccountId } = req.body || {};
   if (!email || !password || !server) return res.status(400).json({ error: 'email, password and server are required' });
   await store.setStatus(req.uid, 'tradelocker', { status: 'connecting', server: env || 'demo', error: null });
@@ -111,7 +137,7 @@ app.post('/api/tradelocker/disconnect', requireAuth, async (req, res) => {
 });
 
 // ── DXtrade ────────────────────────────────────────────────
-app.post('/api/dxtrade/connect', authLimiter, requireAuth, async (req, res) => {
+app.post('/api/dxtrade/connect', authLimiter, requireAuth, requireSub, async (req, res) => {
   const { webUrl, username, password, domain, journalAccountId } = req.body || {};
   if (!webUrl || !username || !password) return res.status(400).json({ error: 'webUrl, username and password are required' });
   await store.setStatus(req.uid, 'dxtrade', { status: 'connecting', error: null });
@@ -126,7 +152,7 @@ app.post('/api/dxtrade/disconnect', requireAuth, async (req, res) => {
 });
 
 // ── cTrader (OAuth) ────────────────────────────────────────
-app.get('/api/ctrader/auth', authLimiter, requireAuth, async (req, res) => {
+app.get('/api/ctrader/auth', authLimiter, requireAuth, requireSub, async (req, res) => {
   try { res.json({ ok: true, url: ctrader.createAuthUrl(req.uid, (req.query && req.query.journalAccountId) || '') }); }
   catch (e) { res.status(400).json({ error: ctrader.friendlyError(e) }); }
 });
@@ -146,7 +172,7 @@ app.post('/api/ctrader/disconnect', requireAuth, async (req, res) => {
 // ── AI proxy (Groq) ────────────────────────────────────────
 // Keeps the Groq key server-side (was hardcoded in the client). Firebase-auth'd
 // + rate-limited. Transparent pass-through of the OpenAI-style chat body.
-app.post('/api/ai/groq', aiLimiter, requireAuth, async (req, res) => {
+app.post('/api/ai/groq', aiLimiter, requireAuth, requirePro, async (req, res) => {
   const key = process.env.GROQ_API_KEY || '';
   if (!key) return res.status(503).json({ error: 'AI is not configured on the server.' });
   const body = req.body || {};
@@ -171,7 +197,7 @@ app.post('/api/ai/groq', aiLimiter, requireAuth, async (req, res) => {
 // ── Speech-to-text proxy (Groq Whisper) ────────────────────
 // Accepts base64 audio from the browser (the in-browser Google speech service
 // is blocked on some networks) and returns { text }. Reuses the Groq key.
-app.post('/api/ai/transcribe', aiLimiter, requireAuth, async (req, res) => {
+app.post('/api/ai/transcribe', aiLimiter, requireAuth, requirePro, async (req, res) => {
   const key = process.env.GROQ_API_KEY || '';
   if (!key) return res.status(503).json({ error: 'AI is not configured on the server.' });
   const b = req.body || {};
@@ -286,7 +312,7 @@ app.get('/api/market/cache-stats', (req, res) => {
 // Returns the user's own broker candles so Trade Replay / Backtesting line up with
 // their fills (vs Twelve Data/Binance which can differ for OTC forex/metals).
 // Requires the caller to be signed in AND to have a connected cTrader account.
-app.get('/api/market/ctrader-bars', marketLimiter, requireAuth, async (req, res) => {
+app.get('/api/market/ctrader-bars', marketLimiter, requireAuth, requireSub, async (req, res) => {
   if (!ctrader.configured()) return res.status(503).json({ error: 'cTrader is not configured on the server.' });
   const q = req.query || {};
   if (!q.symbol || !q.tf) return res.status(400).json({ error: 'symbol and tf are required' });
@@ -514,14 +540,27 @@ const TEST_PRICING = true;
 const PLAN_DAYS = { monthly: 31, yearly: 366 };
 
 // Free-forever comp accounts — always full access, never charged.
-const COMP_EMAILS = ['kelvinkiumbe589@gmail.com', 'ethereumwizard67@gmail.com'];
-const isComp = (email) => !!email && COMP_EMAILS.includes(String(email).toLowerCase());
+// Defined once in src/access.js so the gates and the grant path agree.
+const isComp = access.isComp;
+
+// Mid-cycle Essential → Pro upgrade: charge only the price difference and KEEP
+// the existing expiry date, so nobody has to wait for the period to end.
+const UPGRADE_DELTA = {
+  monthly: PLAN_PRICES.pro.monthly.amount - PLAN_PRICES.essential.monthly.amount,  //  910 KES ≈ $7
+  yearly:  PLAN_PRICES.pro.yearly.amount  - PLAN_PRICES.essential.yearly.amount,   // 9360 KES ≈ $72
+};
+// false = flat difference (what a customer expects: "+$7 and I'm Pro").
+// true  = bill only the unused portion of the period (fairer if they upgrade on day 28).
+const PRORATE_UPGRADE = false;
 
 // The ONE place access is granted: sets the custom claim (source of truth for
 // Firestore rules + the frontend) and mirrors it to users/{uid}.subscription.
-async function grantSubscription(uid, plan, cycle, extra = {}) {
+// keepExpiresAt preserves an existing period (used by mid-cycle upgrades).
+async function grantSubscription(uid, plan, cycle, extra = {}, keepExpiresAt = 0) {
   const days = PLAN_DAYS[cycle] || 31;
-  const expiresAt = Date.now() + days * 24 * 60 * 60 * 1000;
+  const expiresAt = Number(keepExpiresAt) > Date.now()
+    ? Number(keepExpiresAt)
+    : Date.now() + days * 24 * 60 * 60 * 1000;
   const user = await admin.auth().getUser(uid);
   const claims = Object.assign({}, user.customClaims || {}, { subscribed: true, plan, expiresAt });
   await admin.auth().setCustomUserClaims(uid, claims);
@@ -542,7 +581,11 @@ async function settleOrder(orderTrackingId) {
   const st = await pesapal.getStatus(orderTrackingId);
   const desc = String(st.payment_status_description || '').toLowerCase();
   if (desc === 'completed' || st.status_code === 1) {
-    const expiresAt = await grantSubscription(o.uid, o.plan, o.cycle, { orderTrackingId, paymentMethod: st.payment_method || null });
+    const expiresAt = await grantSubscription(
+      o.uid, o.plan, o.cycle,
+      { orderTrackingId, paymentMethod: st.payment_method || null, ...(o.kind === 'upgrade' ? { upgradedAt: Date.now() } : {}) },
+      o.kind === 'upgrade' ? o.keepExpiresAt : 0,
+    );
     await ref.set({ status: 'COMPLETED', paymentMethod: st.payment_method || null, settledAt: Date.now(), expiresAt }, { merge: true });
     return { ok: true };
   }
@@ -555,10 +598,9 @@ app.post('/api/subscribe/create-order', authLimiter, requireAuth, async (req, re
   try {
     if (!pesapal.configured()) return res.status(503).json({ error: 'Payments are not configured on the server.' });
     const plan  = String((req.body && req.body.plan)  || '').toLowerCase();
-    const cycle = String((req.body && req.body.cycle) || 'monthly').toLowerCase();
+    let   cycle = String((req.body && req.body.cycle) || 'monthly').toLowerCase();
     const price = PLAN_PRICES[plan] && PLAN_PRICES[plan][cycle];
     if (!price) return res.status(400).json({ error: 'Unknown plan or billing cycle.' });
-    const chargeAmount = TEST_PRICING ? 1 : price.amount;
 
     const user = await admin.auth().getUser(req.uid);
 
@@ -567,6 +609,28 @@ app.post('/api/subscribe/create-order', authLimiter, requireAuth, async (req, re
       const expiresAt = await grantSubscription(req.uid, 'pro', 'yearly', { comp: true });
       return res.json({ comp: true, expiresAt });
     }
+
+    // ── Mid-cycle upgrade: Essential → Pro for the price difference ──
+    // Keeps the current expiry date, so the remaining days simply become Pro days.
+    let kind = 'new', keepExpiresAt = 0, amount = price.amount;
+    if (req.body && req.body.upgrade) {
+      const cur = await access.accessFor(req.uid, null);
+      if (!cur.active)      return res.status(400).json({ error: 'No active subscription to upgrade.', code: 'no_subscription' });
+      if (access.isPro(cur)) return res.status(400).json({ error: "You're already on the Pro plan.", code: 'already_pro' });
+      if (plan !== 'pro')    return res.status(400).json({ error: 'Upgrades target the Pro plan.' });
+
+      const snap = await db.collection('users').doc(req.uid).get();
+      const sub  = (snap.exists && snap.data().subscription) || {};
+      cycle = PLAN_DAYS[sub.cycle] ? sub.cycle : 'monthly';   // bill the delta on THEIR cycle
+      amount = UPGRADE_DELTA[cycle];
+      if (PRORATE_UPGRADE && cur.expiresAt) {
+        const frac = Math.max(0, Math.min(1, (Number(cur.expiresAt) - Date.now()) / (PLAN_DAYS[cycle] * 86400000)));
+        amount = Math.max(1, Math.round(amount * frac));
+      }
+      kind = 'upgrade';
+      keepExpiresAt = Number(cur.expiresAt) || 0;
+    }
+    const chargeAmount = TEST_PRICING ? 1 : amount;
 
     const publicBase = (process.env.PUBLIC_BACKEND_URL || (req.protocol + '://' + req.get('host'))).replace(/\/+$/, '');
     const appBase    = (process.env.APP_BASE_URL || req.get('origin') || publicBase).replace(/\/+$/, '');
@@ -578,7 +642,9 @@ app.post('/api/subscribe/create-order', authLimiter, requireAuth, async (req, re
       id: orderId,
       amount: chargeAmount,
       currency: price.currency,
-      description: 'ETW Journal — ' + plan + ' (' + cycle + ')',
+      description: kind === 'upgrade'
+        ? 'ETW Journal — upgrade to Pro (' + cycle + ', rest of period)'
+        : 'ETW Journal — ' + plan + ' (' + cycle + ')',
       callbackUrl: appBase + '/payment.html?paid=1',
       notificationId: ipnId,
       email: user.email,
@@ -591,9 +657,10 @@ app.post('/api/subscribe/create-order', authLimiter, requireAuth, async (req, re
     }
 
     await db.collection('pendingOrders').doc(order.order_tracking_id).set({
-      uid: req.uid, plan, cycle, amount: chargeAmount, currency: price.currency, status: 'PENDING', createdAt: Date.now(),
+      uid: req.uid, plan, cycle, amount: chargeAmount, currency: price.currency,
+      kind, keepExpiresAt, status: 'PENDING', createdAt: Date.now(),
     });
-    res.json({ redirect_url: order.redirect_url, order_tracking_id: order.order_tracking_id });
+    res.json({ redirect_url: order.redirect_url, order_tracking_id: order.order_tracking_id, kind, amount: chargeAmount, currency: price.currency });
   } catch (e) {
     console.error('subscribe/create-order:', e.message);
     res.status(500).json({ error: 'Could not start checkout.' });
@@ -641,11 +708,24 @@ app.get('/api/subscribe/me', requireAuth, async (req, res) => {
     if (isComp(user.email)) {
       const c = user.customClaims || {};
       if (!c.subscribed) await grantSubscription(req.uid, 'pro', 'yearly', { comp: true });
-      return res.json({ access: true, comp: true, plan: 'pro' });
+      return res.json({ access: true, comp: true, plan: 'pro', pro: true });
     }
-    const c = user.customClaims || {};
-    const active = c.subscribed === true && (!c.expiresAt || Date.now() < c.expiresAt);
-    res.json({ access: active, plan: c.plan || null, expiresAt: c.expiresAt || null });
+    const a = await access.accessFor(req.uid, null);   // null = always read fresh claims
+    const out = { access: a.active, plan: a.plan || null, pro: access.isPro(a), expiresAt: a.expiresAt || null };
+
+    // Active Essential? Quote the mid-cycle upgrade so the UI can price the button.
+    if (a.active && !access.isPro(a)) {
+      const snap = await db.collection('users').doc(req.uid).get();
+      const sub  = (snap.exists && snap.data().subscription) || {};
+      const cyc  = PLAN_DAYS[sub.cycle] ? sub.cycle : 'monthly';
+      let amt = UPGRADE_DELTA[cyc];
+      if (PRORATE_UPGRADE && a.expiresAt) {
+        const frac = Math.max(0, Math.min(1, (Number(a.expiresAt) - Date.now()) / (PLAN_DAYS[cyc] * 86400000)));
+        amt = Math.max(1, Math.round(amt * frac));
+      }
+      out.upgrade = { cycle: cyc, amount: TEST_PRICING ? 1 : amt, currency: PLAN_PRICES.pro[cyc].currency, keepsExpiry: true };
+    }
+    res.json(out);
   } catch (e) {
     console.error('subscribe/me:', e.message);
     res.status(500).json({ error: 'Lookup failed.' });

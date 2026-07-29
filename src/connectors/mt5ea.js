@@ -47,6 +47,9 @@ async function push(key, trades) {
   const doc = await store.db.collection('eaKeys').doc(key).get();
   if (!doc.exists) { const e = new Error('Invalid sync key'); e.status = 401; throw e; }
   const { uid, accountId } = doc.data();
+  // The key outlives the subscription, so re-check the owner's access on every
+  // push — otherwise a lapsed account's EA would keep syncing forever.
+  await require('../access').assertAccess(uid);
   const written = await store.existingTickets(uid, 'mt5-ea', accountId);
   const docs = (trades || [])
     .map(t => normalize(t, uid, accountId))
