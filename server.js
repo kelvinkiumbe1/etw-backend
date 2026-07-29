@@ -746,12 +746,13 @@ async function sendReceiptEmail(uid, order, expiresAt) {
     const planName = (order.plan === 'pro' ? 'Pro' : 'Essential');
     const body = isUpgrade
       ? `<p>You're on <b>Pro</b> — Mentor mode, ETW AI and Trade Replay are unlocked right now.</p>
-         <p>You paid only the difference (<b>${money(order.amount, order.currency)}</b>), and your renewal date is unchanged: <b>${nice(expiresAt)}</b>.</p>`
+         <p>You paid only the difference (<b>${money(order.amount, order.currency)}</b>), and your end date is unchanged: <b>${nice(expiresAt)}</b>.</p>`
       : `<p>Thanks — your payment of <b>${money(order.amount, order.currency)}</b> went through and your <b>${planName}</b> plan is active.</p>
          <table style="border-collapse:collapse;margin:14px 0;font-size:14px">
            <tr><td style="padding:4px 14px 4px 0;color:#666">Plan</td><td><b>${planName}</b> (${order.cycle === 'yearly' ? 'yearly' : 'monthly'})</td></tr>
            <tr><td style="padding:4px 14px 4px 0;color:#666">Amount</td><td>${money(order.amount, order.currency)}</td></tr>
-           <tr><td style="padding:4px 14px 4px 0;color:#666">Renews</td><td>${nice(expiresAt)}</td></tr>
+           <tr><td style="padding:4px 14px 4px 0;color:#666">Access until</td><td>${nice(expiresAt)}</td></tr>
+           <tr><td style="padding:4px 14px 4px 0;color:#666">Auto-renew</td><td>No — nothing is charged automatically</td></tr>
          </table>`;
     await email.sendEmail({
       to: user.email, toName: user.displayName || '',
@@ -814,8 +815,8 @@ async function sweepSubscriptions() {
         subject: 'Your ETW Journal plan ends in ' + left + ' day' + (left === 1 ? '' : 's'),
         html: emailShell('Your plan is about to end',
           `<p>Your <b>${sub.plan === 'pro' ? 'Pro' : 'Essential'}</b> plan ends on <b>${nice(sub.expiresAt)}</b> — that's ${left} day${left === 1 ? '' : 's'} away.</p>
-           <p>Renew before then and nothing changes. Your trades stay exactly where they are either way; they just become read-only until you're back.</p>`,
-          'Renew my plan', APP_URL + '/payment.html'),
+           <p>Nothing renews automatically, so pay again before then to keep going. Your trades stay exactly where they are either way; they just become read-only until you're back.</p>`,
+          'Pay for another period', APP_URL + '/payment.html'),
       });
       await doc.ref.set({ subscription: { remindedFor: Number(sub.expiresAt) } }, { merge: true });
       out.warned++;
@@ -950,7 +951,8 @@ app.post('/api/admin/grant', authLimiter, requireAdmin, async (req, res) => {
 
 app.post('/api/admin/revoke', authLimiter, requireAdmin, async (req, res) => {
   try {
-    const user = await resolveTarget(req.body || {});
+    const b = req.body || {};
+    const user = await resolveTarget(b);
     const claims = Object.assign({}, user.customClaims || {});
     delete claims.subscribed; delete claims.plan; delete claims.expiresAt;
     await admin.auth().setCustomUserClaims(user.uid, claims);
@@ -962,7 +964,23 @@ app.post('/api/admin/revoke', authLimiter, requireAdmin, async (req, res) => {
       { merge: true }
     );
     syncBrevoContact(user.uid, { force: true }).catch(() => {});
-    console.log('[admin] revoked', user.email || user.uid, 'by', req.adminBy);
+
+    // Silent by default: revocations follow refunds, chargebacks and abuse, where
+    // announcing it is rarely wanted. Opt in with notify:true, and pass a reason
+    // to have it shown to them.
+    if (b.notify === true && user.email) {
+      const reason = String(b.reason || '').slice(0, 300);
+      email.sendEmail({
+        to: user.email, toName: user.displayName || '',
+        subject: 'Your ETW Journal access has ended',
+        html: emailShell('Your access has ended',
+          `<p>Your ETW Journal subscription has been closed, so journalling, broker sync and analytics are locked.</p>`
+          + (reason ? `<p><b>Reason:</b> ${escapeHtml(reason)}</p>` : '')
+          + `<p><b>Nothing has been deleted.</b> Every trade, note and playbook is exactly where you left it and comes straight back if you subscribe again.</p>`,
+          'View plans', APP_URL + '/payment.html'),
+      }).catch(() => {});
+    }
+    console.log('[admin] revoked', user.email || user.uid, 'by', req.adminBy, b.notify === true ? '(notified)' : '(silent)');
     res.json({
       ok: true, uid: user.uid, email: user.email || null,
       // Revoking a comp address achieves nothing: /api/subscribe/me re-grants it
