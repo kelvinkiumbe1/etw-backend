@@ -70,6 +70,7 @@ app.get('/', (_req, res) => res.json({
   version: 'ea-2',
   platforms: { mt5: true, mt4: true, mt5ea: true, tradelocker: true, dxtrade: true, ctrader: ctrader.configured() },
   email: email.configured(),
+  eodhd: require('./src/eodhd').configured(),
   pesapal: require('./src/pesapal').configured(),
   pesapalEnv: process.env.PESAPAL_ENV || 'live',
   // Surfaced so you can confirm at a glance that launch pricing is live —
@@ -408,6 +409,51 @@ app.get('/api/market/cache-stats', (req, res) => {
 // Requires the caller to be signed in AND to have a connected cTrader account.
 // Broker-native candles are only used by Trade Replay, which is a Pro feature —
 // so this one can be Pro-gated without touching Backtesting.
+// ── EODHD: real index data (Twelve Data carries no US indices) ─────────
+// Same gate as the Twelve Data proxy so every subscriber gets it, rather than
+// the Pro-only cTrader path.
+app.get('/api/market/eodhd', marketLimiter, requireAuth, requireSub, async (req, res) => {
+  const eodhd = require('./src/eodhd');
+  if (!eodhd.configured()) return res.status(503).json({ error: 'EODHD is not configured on the server.' });
+  const q = req.query || {};
+  if (!q.symbol || !q.interval) return res.status(400).json({ error: 'symbol and interval are required' });
+  const from = Number(q.from) || 0, to = Number(q.to) || Date.now();
+  const cacheKey = 'eod:' + q.symbol + ':' + q.interval + ':' + from + ':' + to;
+  const hit = mktGet(cacheKey);
+  if (hit) { MKT_HITS++; res.set('X-Cache', 'HIT'); return res.status(hit.status).type('application/json').send(hit.body); }
+  MKT_MISS++;
+  try {
+    const out = await eodhd.getCandles({ symbol: q.symbol, interval: q.interval, from, to });
+    const body = JSON.stringify(out);
+    if (out.candles.length) {
+      const isPast = to && to < Date.now() - 2 * 60 * 1000;
+      mktSet(cacheKey, body, 200, isPast ? 30 * 24 * 3600 * 1000 : 60 * 1000);
+    }
+    res.set('X-Cache', 'MISS').type('application/json').send(body);
+  } catch (e) {
+    // Verbatim, so a wrong symbol or an out-of-plan interval is obvious.
+    console.error('eodhd:', e.message);
+    res.status(e.status || 502).json({ error: e.message });
+  }
+});
+
+// Confirm an index/ticker code in one call instead of guessing at the mapping.
+// Admin-gated: it is a symbol lookup used from a terminal, so the admin secret
+// is a better fit than making someone extract a Firebase ID token from devtools.
+app.get('/api/market/eodhd-search', authLimiter, requireAdmin, async (req, res) => {
+  const eodhd = require('./src/eodhd');
+  if (!eodhd.configured()) return res.status(503).json({ error: 'EODHD is not configured on the server.' });
+  const q = String((req.query || {}).q || '').trim();
+  if (!q) return res.status(400).json({ error: 'pass ?q=<name or code>' });
+  try {
+    const rows = await eodhd.search(q);
+    res.json((Array.isArray(rows) ? rows : []).map((r) => ({
+      code: r.Code, exchange: r.Exchange, name: r.Name, country: r.Country, type: r.Type,
+      symbol: r.Code + '.' + r.Exchange,
+    })));
+  } catch (e) { res.status(e.status || 502).json({ error: e.message }); }
+});
+
 app.get('/api/market/ctrader-bars', marketLimiter, requireAuth, requirePro, async (req, res) => {
   if (!ctrader.configured()) return res.status(503).json({ error: 'cTrader is not configured on the server.' });
   const q = req.query || {};
