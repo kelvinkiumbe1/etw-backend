@@ -907,9 +907,18 @@ async function requireAdmin(req, res, next) {
 async function resolveTarget(body) {
   const emailAddr = String((body && body.email) || '').trim();
   const uid = String((body && body.uid) || '').trim();
-  if (uid) return await admin.auth().getUser(uid);
-  if (emailAddr) return await admin.auth().getUserByEmail(emailAddr);
-  const e = new Error('email or uid is required'); e.status = 400; throw e;
+  if (!uid && !emailAddr) { const e = new Error('email or uid is required'); e.status = 400; throw e; }
+  try {
+    return uid ? await admin.auth().getUser(uid) : await admin.auth().getUserByEmail(emailAddr);
+  } catch (err) {
+    // Firebase's "no user record" surfaced as a bare 500, which reads like a
+    // server fault rather than "this person hasn't signed up yet".
+    if (String(err.code || '') === 'auth/user-not-found' || /no user record/i.test(err.message || '')) {
+      const e = new Error('No ETW account exists for ' + (emailAddr || uid) + ' — they need to sign up first, then run this again.');
+      e.status = 404; e.code = 'user_not_found'; throw e;
+    }
+    throw err;
+  }
 }
 
 app.post('/api/admin/grant', authLimiter, requireAdmin, async (req, res) => {
