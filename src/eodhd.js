@@ -87,6 +87,13 @@ function normalise(rows, isDaily) {
 
 // Throws an Error carrying EODHD's own status and body, so a bad symbol or an
 // out-of-plan interval is reported rather than swallowed.
+// A free EODHD plan rejects every intraday request with 403 'Only EOD data
+// allowed'. Without this, each chart load pays a doomed round-trip before falling
+// back. Remembering the refusal for a while skips that, and because it expires the
+// moment the window passes, upgrading the plan starts working on its own.
+let _noIntradayUntil = 0;
+const NO_INTRADAY_MS = 6 * 3600 * 1000;
+
 async function getCandles({ symbol, interval, from, to }) {
   if (!configured()) throw Object.assign(new Error('EODHD_API_KEY is not set'), { status: 503 });
   const sym = String(symbol || '').trim();
@@ -99,6 +106,9 @@ async function getCandles({ symbol, interval, from, to }) {
 
   const key = process.env.EODHD_API_KEY;
   const isDaily = plan.native === '1d';
+  if (!isDaily && Date.now() < _noIntradayUntil) {
+    throw Object.assign(new Error('EODHD plan is end-of-day only (intraday refused recently)'), { status: 403 });
+  }
   let url;
   if (isDaily) {
     url = BASE + '/eod/' + encodeURIComponent(sym) + '?period=d&fmt=json&api_token=' + encodeURIComponent(key);
@@ -114,7 +124,11 @@ async function getCandles({ symbol, interval, from, to }) {
   const text = await r.text();
   if (!r.ok) {
     // Never echo the URL back — it carries the API key.
-    throw Object.assign(new Error('EODHD ' + r.status + ': ' + text.slice(0, 200)), { status: 502 });
+    if (r.status === 403 && !isDaily && /only eod/i.test(text)) {
+      _noIntradayUntil = Date.now() + NO_INTRADAY_MS;
+      console.warn('[eodhd] plan is EOD-only; skipping intraday requests for 6h');
+    }
+    throw Object.assign(new Error('EODHD ' + r.status + ': ' + text.slice(0, 200)), { status: r.status === 403 || r.status === 404 ? r.status : 502 });
   }
   let rows;
   try { rows = JSON.parse(text); }
@@ -150,4 +164,10 @@ async function search(q) {
   catch (e) { throw Object.assign(new Error('EODHD returned non-JSON: ' + text.slice(0, 200)), { status: 502 }); }
 }
 
-module.exports = { configured, getCandles, search, PLAN };
+// True while this plan has recently refused intraday. Charts use it to avoid
+// serving daily EODHD bars for an instrument whose intraday bars come from a
+// different source — one session must have one price scale, or drawings and
+// saved entry prices stop matching the chart.
+function intradayBlocked() { return Date.now() < _noIntradayUntil; }
+
+module.exports = { configured, getCandles, search, PLAN, intradayBlocked };

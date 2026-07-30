@@ -417,6 +417,9 @@ app.get('/api/market/eodhd', marketLimiter, requireAuth, requireSub, async (req,
   if (!eodhd.configured()) return res.status(503).json({ error: 'EODHD is not configured on the server.' });
   const q = req.query || {};
   if (!q.symbol || !q.interval) return res.status(400).json({ error: 'symbol and interval are required' });
+  // Refuse daily too when intraday is blocked: mixing EODHD's real index level
+  // with the proxy's level inside one session would corrupt drawings and entries.
+  if (eodhd.intradayBlocked()) return res.status(403).json({ error: 'EODHD plan is end-of-day only; charts need one consistent source.' });
   const from = Number(q.from) || 0, to = Number(q.to) || Date.now();
   const cacheKey = 'eod:' + q.symbol + ':' + q.interval + ':' + from + ':' + to;
   const hit = mktGet(cacheKey);
