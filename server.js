@@ -22,6 +22,7 @@ const mt5 = require('./src/mt5sync');
 const tradelocker = require('./src/connectors/tradelocker');
 const dxtrade = require('./src/connectors/dxtrade');
 const ctrader = require('./src/connectors/ctrader');
+const intasend = require('./src/intasend');
 const mt5ea = require('./src/connectors/mt5ea');
 const email = require('./src/email');
 const access = require('./src/access');
@@ -72,6 +73,9 @@ app.get('/', (_req, res) => res.json({
   email: email.configured(),
   eodhd: require('./src/eodhd').configured(),
   pesapal: require('./src/pesapal').configured(),
+  intasend: intasend.configured(),
+  intasendEnv: intasend.env(),
+  paymentProvider: String(process.env.PAYMENT_PROVIDER || 'pesapal').toLowerCase(),
   pesapalEnv: process.env.PESAPAL_ENV || 'live',
   // Surfaced so you can confirm at a glance that launch pricing is live —
   // testPricing:true means every plan is charging 1 KES.
@@ -116,6 +120,7 @@ async function requireAppCheck(req, res, next) {
 // (authenticated by CRON_SECRET).
 const APPCHECK_EXEMPT = [
   /^\/api\/pesapal\/ipn/,
+  /^\/api\/intasend\/ipn/,
   /^\/api\/ctrader\/callback/,
   /^\/api\/mt5\/trades/,
   /^\/api\/mt5-ea\/push/,
@@ -933,15 +938,28 @@ async function settleOrder(orderTrackingId) {
   if (!snap.exists) return { ok: false, reason: 'unknown order' };
   const o = snap.data();
   if (o.status === 'COMPLETED') return { ok: true, already: true };
-  const st = await pesapal.getStatus(orderTrackingId);
-  const desc = String(st.payment_status_description || '').toLowerCase();
-  if (desc === 'completed' || st.status_code === 1) {
+
+  // Orders created before IntaSend existed carry no provider field.
+  const provider = String(o.provider || 'pesapal').toLowerCase();
+  let paid = false, method = null, desc = '';
+  if (provider === 'intasend') {
+    const iv = await intasend.getStatus(o.invoiceId || orderTrackingId);
+    desc = (iv.state || '').toLowerCase();
+    paid = intasend.isPaid(iv.state);
+    method = iv.provider || null;
+  } else {
+    const st = await pesapal.getStatus(orderTrackingId);
+    desc = String(st.payment_status_description || '').toLowerCase();
+    paid = desc === 'completed' || st.status_code === 1;
+    method = st.payment_method || null;
+  }
+  if (paid) {
     const expiresAt = await grantSubscription(
       o.uid, o.plan, o.cycle,
-      { orderTrackingId, paymentMethod: st.payment_method || null, ...(o.kind === 'upgrade' ? { upgradedAt: Date.now() } : {}) },
+      { orderTrackingId, provider, paymentMethod: method, ...(o.kind === 'upgrade' ? { upgradedAt: Date.now() } : {}) },
       o.kind === 'upgrade' ? o.keepExpiresAt : 0,
     );
-    await ref.set({ status: 'COMPLETED', paymentMethod: st.payment_method || null, settledAt: Date.now(), expiresAt }, { merge: true });
+    await ref.set({ status: 'COMPLETED', paymentMethod: method, settledAt: Date.now(), expiresAt }, { merge: true });
     // Receipt + audience sync are fire-and-forget: access is already granted, and
     // a Brevo hiccup must never turn a successful payment into an error.
     sendReceiptEmail(o.uid, o, expiresAt).catch(() => {});
@@ -1160,7 +1178,12 @@ app.get('/api/admin/user', authLimiter, requireAdmin, async (req, res) => {
 // Start a checkout. Requires auth so we bind the order to a real uid.
 app.post('/api/subscribe/create-order', authLimiter, requireAuth, async (req, res) => {
   try {
-    if (!pesapal.configured()) return res.status(503).json({ error: 'Payments are not configured on the server.' });
+    // Provider comes from the request, falling back to PAYMENT_PROVIDER then Pesapal.
+    // Both can be live at once; the client chooses per checkout.
+    const wanted = String((req.body && req.body.provider) || process.env.PAYMENT_PROVIDER || 'pesapal').toLowerCase();
+    const provider = wanted === 'intasend' ? 'intasend' : 'pesapal';
+    if (provider === 'intasend' && !intasend.configured()) return res.status(503).json({ error: 'IntaSend is not configured on the server.' });
+    if (provider === 'pesapal' && !pesapal.configured()) return res.status(503).json({ error: 'Payments are not configured on the server.' });
     const plan  = String((req.body && req.body.plan)  || '').toLowerCase();
     let   cycle = String((req.body && req.body.cycle) || 'monthly').toLowerCase();
     const price = PLAN_PRICES[plan] && PLAN_PRICES[plan][cycle];
@@ -1201,7 +1224,7 @@ app.post('/api/subscribe/create-order', authLimiter, requireAuth, async (req, re
     // answers amount_exceeds_default_limit, which surfaced to users as the useless
     // "did not return a checkout URL". Catch it here and say something actionable.
     // Raise PESAPAL_MAX_AMOUNT (or unset it) once Pesapal lifts the limit.
-    const maxAmount = Number(process.env.PESAPAL_MAX_AMOUNT || 2000);
+    const maxAmount = provider === 'pesapal' ? Number(process.env.PESAPAL_MAX_AMOUNT || 2000) : 0;
     if (maxAmount > 0 && chargeAmount > maxAmount) {
       console.warn('[pesapal] refusing ' + chargeAmount + ' ' + price.currency + ' — above cap ' + maxAmount);
       return res.status(400).json({
@@ -1217,6 +1240,37 @@ app.post('/api/subscribe/create-order', authLimiter, requireAuth, async (req, re
     const ipnId   = await pesapal.ensureIpnId(db, publicBase + '/api/pesapal/ipn');
     const orderId = 'sub_' + req.uid.slice(0, 8) + '_' + Date.now();
     const nameParts = String(user.displayName || '').split(' ').filter(Boolean);
+
+    if (provider === 'intasend') {
+      const co = await intasend.createCheckout({
+        apiRef: orderId,
+        amount: chargeAmount,
+        currency: price.currency,
+        email: user.email,
+        firstName: nameParts[0] || 'ETW',
+        lastName: nameParts.slice(1).join(' ') || 'Trader',
+        phone: (req.body && req.body.phone) || '',
+        redirectUrl: appBase + '/payment.html?paid=1',
+        comment: kind === 'upgrade'
+          ? 'ETW Journal — upgrade to Pro (' + cycle + ', rest of period)'
+          : 'ETW Journal — ' + plan + ' (' + cycle + ')',
+      });
+      if (!co.url) {
+        console.error('[intasend] checkout rejected:', JSON.stringify(co.raw).slice(0, 400));
+        return res.status(502).json({ error: 'IntaSend did not return a checkout URL.', detail: co.raw });
+      }
+      // Keyed by our own order id: IntaSend may not return an invoice id until the
+      // payment starts, and api_ref is what the webhook carries back.
+      await db.collection('pendingOrders').doc(orderId).set({
+        uid: req.uid, plan, cycle, amount: chargeAmount, currency: price.currency,
+        kind, keepExpiresAt, status: 'PENDING', createdAt: Date.now(),
+        provider: 'intasend', invoiceId: co.invoiceId || null,
+      });
+      return res.json({
+        provider: 'intasend', redirect_url: co.url, order_tracking_id: orderId,
+        kind, amount: chargeAmount, currency: price.currency,
+      });
+    }
 
     const order = await pesapal.submitOrder({
       id: orderId,
@@ -1244,9 +1298,9 @@ app.post('/api/subscribe/create-order', authLimiter, requireAuth, async (req, re
 
     await db.collection('pendingOrders').doc(order.order_tracking_id).set({
       uid: req.uid, plan, cycle, amount: chargeAmount, currency: price.currency,
-      kind, keepExpiresAt, status: 'PENDING', createdAt: Date.now(),
+      kind, keepExpiresAt, status: 'PENDING', createdAt: Date.now(), provider: 'pesapal',
     });
-    res.json({ redirect_url: order.redirect_url, order_tracking_id: order.order_tracking_id, kind, amount: chargeAmount, currency: price.currency });
+    res.json({ provider: 'pesapal', redirect_url: order.redirect_url, order_tracking_id: order.order_tracking_id, kind, amount: chargeAmount, currency: price.currency });
   } catch (e) {
     console.error('subscribe/create-order:', e.message);
     res.status(500).json({ error: 'Could not start checkout.' });
@@ -1270,6 +1324,47 @@ async function handleIpn(req, res) {
     res.status(200).json({ status: 500 });
   }
 }
+// IntaSend webhook. The challenge only tells us the call is genuine; the amount
+// and state always come from a status lookup, so a spoofed body cannot grant
+// access. Always 200 — a retry storm helps nobody.
+app.post('/api/intasend/ipn', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const v = intasend.verifyChallenge(b);
+    if (!v.ok) console.warn('[intasend] webhook challenge', v.reason, '— settling by lookup anyway');
+    const ref = b.api_ref || b.apiRef || null;
+    const invoiceId = b.invoice_id || b.invoiceId || null;
+    if (!ref && !invoiceId) return res.status(200).json({ status: 'ignored', reason: 'no api_ref or invoice_id' });
+    // api_ref is our pendingOrders doc id. Record the invoice id the first time we
+    // see it, since checkout creation may not have returned one.
+    if (ref && invoiceId) {
+      await db.collection('pendingOrders').doc(String(ref)).set({ invoiceId: String(invoiceId) }, { merge: true }).catch(() => {});
+    }
+    await settleOrder(String(ref || invoiceId));
+    res.status(200).json({ status: 'ok' });
+  } catch (e) {
+    console.error('intasend ipn:', e.message);
+    res.status(200).json({ status: 'error' });
+  }
+});
+
+// Config + a live auth check, without creating a real invoice.
+app.get('/api/intasend/probe', authLimiter, requireAdmin, async (req, res) => {
+  const out = { configured: intasend.configured(), env: intasend.env(), base: intasend.base(),
+    challengeSet: !!process.env.INTASEND_WEBHOOK_CHALLENGE,
+    publicKeySet: !!process.env.INTASEND_PUBLIC_KEY, secretKeySet: !!process.env.INTASEND_SECRET_KEY };
+  if (!out.configured) return res.status(503).json(out);
+  try {
+    // A deliberately absent invoice: a 4xx with IntaSend's own body proves the keys
+    // authenticate, whereas 401/403 means they do not.
+    await intasend.getStatus('etw-probe-nonexistent');
+    res.json({ ...out, auth: 'ok', note: 'status lookup unexpectedly succeeded' });
+  } catch (e) {
+    const authOk = e.status !== 401 && e.status !== 403;
+    res.status(authOk ? 200 : 502).json({ ...out, auth: authOk ? 'ok' : 'rejected', upstreamStatus: e.status, upstream: e.upstream || e.message });
+  }
+});
+
 app.get('/api/pesapal/ipn', handleIpn);
 app.post('/api/pesapal/ipn', handleIpn);
 
