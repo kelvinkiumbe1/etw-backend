@@ -940,22 +940,49 @@ app.post('/api/admin/grant', authLimiter, requireAdmin, async (req, res) => {
     }, expiresAt);
 
     syncBrevoContact(user.uid, { force: true }).catch(() => {});
+    // Awaited, and the outcome goes back in the response: a silent fire-and-forget
+    // send made a rejected email look identical to a delivered one.
+    let notified = null, notifyError = null;
     if (b.notify !== false && user.email) {
-      email.sendEmail({
+      const sent = await email.sendEmailVerbose({
         to: user.email, toName: user.displayName || '',
         subject: 'Your ETW Journal access is active',
         html: emailShell('You’re in',
           `<p>Your <b>${plan === 'pro' ? 'Pro' : 'Essential'}</b> access to ETW Journal is active until <b>${nice(expiresAt)}</b>.</p>
            <p>Nothing to pay — just sign in and start journalling.</p>`,
           'Open ETW Journal', APP_URL + '/journal.html'),
-      }).catch(() => {});
+      }).catch((e) => ({ ok: false, reason: 'threw', body: e.message }));
+      notified = !!sent.ok;
+      if (!sent.ok) notifyError = [sent.reason, sent.status, sent.body].filter(Boolean).join(' ');
+    } else if (!user.email) {
+      notifyError = 'account has no email address';
     }
     console.log('[admin] granted', plan, days + 'd to', user.email || user.uid, 'by', req.adminBy);
-    res.json({ ok: true, uid: user.uid, email: user.email || null, plan, days, expiresAt, expiresOn: ymd(expiresAt) });
+    res.json({ ok: true, uid: user.uid, email: user.email || null, plan, days, expiresAt, expiresOn: ymd(expiresAt), notified, notifyError });
   } catch (e) {
     console.error('admin/grant:', e.message);
     res.status(e.status || 500).json({ error: e.message || 'grant failed' });
   }
+});
+
+// Send a test email and hand back exactly what Brevo said. Turns "why aren't
+// emails arriving?" into one command instead of digging through Render logs.
+app.post('/api/admin/email-test', authLimiter, requireAdmin, async (req, res) => {
+  const to = String((req.body || {}).to || '').trim();
+  if (!to) return res.status(400).json({ error: 'pass {"to":"someone@example.com"}' });
+  const r = await email.sendEmailVerbose({
+    to, toName: 'ETW test',
+    subject: 'ETW Journal — email delivery test',
+    html: emailShell('Delivery test',
+      '<p>If you can read this, transactional email from the ETW backend is working.</p>',
+      'Open ETW Journal', APP_URL + '/journal.html'),
+  });
+  res.status(r.ok ? 200 : 502).json({
+    configured: email.configured(),
+    sender: process.env.BREVO_SENDER || null,
+    senderName: process.env.BREVO_SENDER_NAME || 'ETW Journal',
+    to, ...r,
+  });
 });
 
 app.post('/api/admin/revoke', authLimiter, requireAdmin, async (req, res) => {
@@ -977,9 +1004,10 @@ app.post('/api/admin/revoke', authLimiter, requireAdmin, async (req, res) => {
     // Silent by default: revocations follow refunds, chargebacks and abuse, where
     // announcing it is rarely wanted. Opt in with notify:true, and pass a reason
     // to have it shown to them.
+    let notified = null, notifyError = null;
     if (b.notify === true && user.email) {
       const reason = String(b.reason || '').slice(0, 300);
-      email.sendEmail({
+      const sent = await email.sendEmailVerbose({
         to: user.email, toName: user.displayName || '',
         subject: 'Your ETW Journal access has ended',
         html: emailShell('Your access has ended',
@@ -987,7 +1015,9 @@ app.post('/api/admin/revoke', authLimiter, requireAdmin, async (req, res) => {
           + (reason ? `<p><b>Reason:</b> ${escapeHtml(reason)}</p>` : '')
           + `<p><b>Nothing has been deleted.</b> Every trade, note and playbook is exactly where you left it and comes straight back if you subscribe again.</p>`,
           'View plans', APP_URL + '/payment.html'),
-      }).catch(() => {});
+      }).catch((e) => ({ ok: false, reason: 'threw', body: e.message }));
+      notified = !!sent.ok;
+      if (!sent.ok) notifyError = [sent.reason, sent.status, sent.body].filter(Boolean).join(' ');
     }
     console.log('[admin] revoked', user.email || user.uid, 'by', req.adminBy, b.notify === true ? '(notified)' : '(silent)');
     res.json({
@@ -995,6 +1025,7 @@ app.post('/api/admin/revoke', authLimiter, requireAdmin, async (req, res) => {
       // Revoking a comp address achieves nothing: /api/subscribe/me re-grants it
       // on their next app load. Say so instead of reporting a hollow success.
       warning: access.isComp(user.email) ? 'This email is in COMP_EMAILS — it will be re-granted on next sign-in. Remove it there first.' : undefined,
+      notified, notifyError,
     });
   } catch (e) {
     console.error('admin/revoke:', e.message);

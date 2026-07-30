@@ -8,12 +8,14 @@ function configured() {
   return !!(process.env.BREVO_API_KEY && process.env.BREVO_SENDER);
 }
 
-async function sendEmail({ to, toName, subject, html }) {
+// Returns { ok, reason, status, body, messageId } so callers can report *why* a
+// send failed. sendEmail() below keeps the plain boolean contract.
+async function sendEmailVerbose({ to, toName, subject, html }) {
   if (!configured()) {
     console.log('[email] BREVO not configured — skipping send:', subject);
-    return false;
+    return { ok: false, reason: 'not_configured' };
   }
-  if (!to) return false;
+  if (!to) return { ok: false, reason: 'no_recipient' };
   try {
     const r = await fetch(API_URL, {
       method: 'POST',
@@ -29,16 +31,26 @@ async function sendEmail({ to, toName, subject, html }) {
         htmlContent: html,
       }),
     });
+    const body = await r.text().catch(() => '');
     if (!r.ok) {
-      const t = await r.text().catch(() => '');
-      console.error('[email] Brevo error', r.status, t.slice(0, 200));
-      return false;
+      console.error('[email] Brevo error', r.status, body.slice(0, 300));
+      return { ok: false, reason: 'brevo_rejected', status: r.status, body: body.slice(0, 300) };
     }
-    return true;
+    // Brevo hands back a messageId on success — worth logging so a send can be
+    // traced in their dashboard when the recipient still reports nothing.
+    let messageId = null;
+    try { messageId = (JSON.parse(body) || {}).messageId || null; } catch (e) {}
+    console.log('[email] sent to', to, '| subject:', subject, '| messageId:', messageId || '(none)');
+    return { ok: true, status: r.status, messageId };
   } catch (e) {
     console.error('[email] send failed:', e.message);
-    return false;
+    return { ok: false, reason: 'network', body: e.message };
   }
+}
+
+async function sendEmail(opts) {
+  const r = await sendEmailVerbose(opts);
+  return !!r.ok;
 }
 
 // ── Contacts (for campaigns / segments) ────────────────────────────────
@@ -87,4 +99,4 @@ async function upsertContact({ email: addr, attributes, listIds }) {
   }
 }
 
-module.exports = { sendEmail, configured, upsertContact, listIdsFromEnv };
+module.exports = { sendEmail, sendEmailVerbose, configured, upsertContact, listIdsFromEnv };
