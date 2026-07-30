@@ -437,6 +437,30 @@ app.get('/api/market/eodhd', marketLimiter, requireAuth, requireSub, async (req,
   }
 });
 
+// Definitive check for one symbol: actually fetch candles and report what EODHD
+// said. Search matches on name and is unreliable for index codes, and a plan
+// without the .INDX entitlement fails only at fetch time — this distinguishes
+// 'wrong symbol' from 'not in your plan' rather than leaving us to guess.
+app.get('/api/market/eodhd-probe', authLimiter, requireAdmin, async (req, res) => {
+  const eodhd = require('./src/eodhd');
+  if (!eodhd.configured()) return res.status(503).json({ error: 'EODHD is not configured on the server.' });
+  const q = req.query || {};
+  const symbol = String(q.symbol || '').trim();
+  if (!symbol) return res.status(400).json({ error: 'pass ?symbol=GSPC.INDX (&interval=1d)' });
+  const interval = String(q.interval || '1d');
+  const to = Date.now(), from = to - 30 * 24 * 3600 * 1000;
+  try {
+    const out = await eodhd.getCandles({ symbol, interval, from, to });
+    const c = out.candles;
+    res.json({
+      ok: true, symbol, interval, count: c.length, meta: out.meta,
+      first: c[0] || null, last: c[c.length - 1] || null,
+    });
+  } catch (e) {
+    res.status(e.status || 502).json({ ok: false, symbol, interval, error: e.message });
+  }
+});
+
 // Confirm an index/ticker code in one call instead of guessing at the mapping.
 // Admin-gated: it is a symbol lookup used from a terminal, so the admin secret
 // is a better fit than making someone extract a Firebase ID token from devtools.
