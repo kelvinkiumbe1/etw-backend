@@ -68,7 +68,7 @@ const marketLimiter = rl(60 * 1000, 60,  'Too many market-data requests, please 
 app.get('/', (_req, res) => res.json({
   ok: true,
   service: 'etw-sync-backend',
-  version: 'ea-2',
+  version: 'ea-3',
   platforms: { mt5: true, mt4: true, mt5ea: true, tradelocker: true, dxtrade: true, ctrader: ctrader.configured() },
   email: email.configured(),
   eodhd: require('./src/eodhd').configured(),
@@ -1237,7 +1237,8 @@ app.post('/api/subscribe/create-order', authLimiter, requireAuth, async (req, re
 
     const publicBase = (process.env.PUBLIC_BACKEND_URL || (req.protocol + '://' + req.get('host'))).replace(/\/+$/, '');
     const appBase    = (process.env.APP_BASE_URL || req.get('origin') || publicBase).replace(/\/+$/, '');
-    const ipnId   = await pesapal.ensureIpnId(db, publicBase + '/api/pesapal/ipn');
+    // Registered lazily inside the Pesapal branch: an IntaSend checkout must not
+    // depend on (or wait for) Pesapal's IPN registration.
     const orderId = 'sub_' + req.uid.slice(0, 8) + '_' + Date.now();
     const nameParts = String(user.displayName || '').split(' ').filter(Boolean);
 
@@ -1272,6 +1273,7 @@ app.post('/api/subscribe/create-order', authLimiter, requireAuth, async (req, re
       });
     }
 
+    const ipnId = await pesapal.ensureIpnId(db, publicBase + '/api/pesapal/ipn');
     const order = await pesapal.submitOrder({
       id: orderId,
       amount: chargeAmount,
@@ -1303,7 +1305,10 @@ app.post('/api/subscribe/create-order', authLimiter, requireAuth, async (req, re
     res.json({ provider: 'pesapal', redirect_url: order.redirect_url, order_tracking_id: order.order_tracking_id, kind, amount: chargeAmount, currency: price.currency });
   } catch (e) {
     console.error('subscribe/create-order:', e.message);
-    res.status(500).json({ error: 'Could not start checkout.' });
+    // Surface the upstream reason (e.g. "IntaSend 401: …") instead of a blind
+    // 500 — checkout failures were undebuggable from the client without it.
+    const status = Number(e.status) >= 400 && Number(e.status) < 600 ? Number(e.status) : 500;
+    res.status(status).json({ error: e.message || 'Could not start checkout.' });
   }
 });
 
