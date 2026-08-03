@@ -68,7 +68,7 @@ const marketLimiter = rl(60 * 1000, 60,  'Too many market-data requests, please 
 app.get('/', (_req, res) => res.json({
   ok: true,
   service: 'etw-sync-backend',
-  version: 'ea-3',
+  version: 'ea-4',
   platforms: { mt5: true, mt4: true, mt5ea: true, tradelocker: true, dxtrade: true, ctrader: ctrader.configured() },
   email: email.configured(),
   eodhd: require('./src/eodhd').configured(),
