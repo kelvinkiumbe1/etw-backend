@@ -78,6 +78,7 @@ app.get('/', (_req, res) => res.json({
   eodhd: require('./src/eodhd').configured(),
   gumroad: gumroad.configured(),
   paymentProvider: 'gumroad',
+  grantHours: true,   // admin grant accepts {hours} for short passes
   appCheck: String(process.env.APPCHECK_ENFORCE || '').toLowerCase() === 'true',
 }));
 
@@ -1083,13 +1084,18 @@ app.post('/api/admin/grant', authLimiter, requireAdmin, async (req, res) => {
     const b = req.body || {};
     const plan = String(b.plan || 'pro').toLowerCase();
     if (plan !== 'pro' && plan !== 'essential') return res.status(400).json({ error: "plan must be 'pro' or 'essential'" });
-    const days = Math.max(1, Math.min(3650, parseInt(b.days, 10) || 30));
+    // Duration: whole days (default 30), or hours for short passes ({hours: 2}).
+    const hours = parseFloat(b.hours);
+    const durMs = (isFinite(hours) && hours > 0)
+      ? Math.min(3650 * 24, hours) * 3600 * 1000
+      : Math.max(1, Math.min(3650, parseInt(b.days, 10) || 30)) * DAY_MS;
+    const days = Math.round(durMs / DAY_MS * 100) / 100;   // for logs/response
     const user = await resolveTarget(b);
 
     // keepExpiresAt doubles as an explicit expiry override, so an admin grant is
     // an ordinary subscription with a custom end date — nothing special to
     // special-case anywhere else.
-    const expiresAt = Date.now() + days * DAY_MS;
+    const expiresAt = Date.now() + durMs;
     const cycle = days > 200 ? 'yearly' : 'monthly';
     await grantSubscription(user.uid, plan, cycle, {
       source: 'admin', grantedBy: req.adminBy || 'admin', grantedAt: Date.now(),
