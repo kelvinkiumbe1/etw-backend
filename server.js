@@ -699,7 +699,7 @@ app.post('/api/mfa/verify', mfaLimiter, requireAuth, async (req, res) => {
 // needs to know how long a paid cycle lasts: 31/366 (not 30/365) so Gumroad's
 // next recurring charge lands before the previous grant expires — access never
 // flickers off the morning a renewal is due.
-const PLAN_DAYS = { monthly: 31, yearly: 366 };
+const PLAN_DAYS = { monthly: 31, quarterly: 92, yearly: 366 };
 
 // Free-forever comp accounts — always full access, never charged.
 // Defined once in src/access.js so the gates and the grant path agree.
@@ -815,7 +815,7 @@ async function sendReceiptEmail(uid, order, expiresAt) {
          <p>You paid only the difference (<b>${money(order.amount, order.currency)}</b>), and your end date is unchanged: <b>${nice(expiresAt)}</b>.</p>`
       : `<p>Thanks — your payment of <b>${money(order.amount, order.currency)}</b> went through and your <b>${planName}</b> plan is active.</p>
          <table style="border-collapse:collapse;margin:14px 0;font-size:14px">
-           <tr><td style="padding:4px 14px 4px 0;color:#666">Plan</td><td><b>${planName}</b> (${order.cycle === 'yearly' ? 'yearly' : 'monthly'})</td></tr>
+           <tr><td style="padding:4px 14px 4px 0;color:#666">Plan</td><td><b>${planName}</b> (${['yearly','quarterly','monthly'].indexOf(order.cycle) >= 0 ? order.cycle : 'monthly'})</td></tr>
            <tr><td style="padding:4px 14px 4px 0;color:#666">Amount</td><td>${money(order.amount, order.currency)}</td></tr>
            <tr><td style="padding:4px 14px 4px 0;color:#666">Access until</td><td>${nice(expiresAt)}</td></tr>
            <tr><td style="padding:4px 14px 4px 0;color:#666">Auto-renew</td><td>Yes — manage or cancel any time from your Gumroad receipt</td></tr>

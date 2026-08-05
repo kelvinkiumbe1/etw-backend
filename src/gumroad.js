@@ -32,10 +32,12 @@ function normalizeKey(v) {
 // yearly ones are optional extras (they are SEPARATE Gumroad products, since
 // one product can't sell two cadences at two prices).
 const PRODUCTS = [
-  { env: 'GUMROAD_PRODUCT_ESSENTIAL_YEARLY', plan: 'essential', cycle: 'yearly' },
-  { env: 'GUMROAD_PRODUCT_PRO_YEARLY',       plan: 'pro',       cycle: 'yearly' },
-  { env: 'GUMROAD_PRODUCT_ESSENTIAL',        plan: 'essential', cycle: null },
-  { env: 'GUMROAD_PRODUCT_PRO',              plan: 'pro',       cycle: null },
+  { env: 'GUMROAD_PRODUCT_ESSENTIAL_YEARLY',    plan: 'essential', cycle: 'yearly' },
+  { env: 'GUMROAD_PRODUCT_PRO_YEARLY',          plan: 'pro',       cycle: 'yearly' },
+  { env: 'GUMROAD_PRODUCT_ESSENTIAL_QUARTERLY', plan: 'essential', cycle: 'quarterly' },
+  { env: 'GUMROAD_PRODUCT_PRO_QUARTERLY',       plan: 'pro',       cycle: 'quarterly' },
+  { env: 'GUMROAD_PRODUCT_ESSENTIAL',           plan: 'essential', cycle: null },
+  { env: 'GUMROAD_PRODUCT_PRO',                 plan: 'pro',       cycle: null },
 ];
 
 // Which plan/cycle does a verified sale belong to? Matched against BOTH the
@@ -50,7 +52,7 @@ function matchSale(sale) {
     const want = normalizeKey(process.env[p.env]);
     if (!want || !keys.includes(want)) continue;
     const r = String(sale.subscription_duration || sale.recurrence || '').toLowerCase();
-    return { plan: p.plan, cycle: p.cycle || (r === 'yearly' ? 'yearly' : 'monthly') };
+    return { plan: p.plan, cycle: p.cycle || (r === 'yearly' ? 'yearly' : (r === 'quarterly' || r === 'every_3_months') ? 'quarterly' : 'monthly') };
   }
   return null;
 }
