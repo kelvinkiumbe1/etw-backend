@@ -22,7 +22,7 @@ const mt5 = require('./src/mt5sync');
 const tradelocker = require('./src/connectors/tradelocker');
 const dxtrade = require('./src/connectors/dxtrade');
 const ctrader = require('./src/connectors/ctrader');
-const intasend = require('./src/intasend');
+const gumroad = require('./src/gumroad');
 const mt5ea = require('./src/connectors/mt5ea');
 const email = require('./src/email');
 const access = require('./src/access');
@@ -46,7 +46,7 @@ const ALLOWED_ORIGINS = [
 const isDevOrigin = (o) => /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(o || '');
 app.use(cors({
   origin(origin, cb) {
-    // No Origin header = same-origin, curl, the MT5 EA, or Pesapal's IPN. Allow:
+    // No Origin header = same-origin, curl, the MT5 EA, or Gumroad's ping. Allow:
     // those paths are authenticated by token or sync key, not by origin.
     if (!origin) return cb(null, true);
     if (ALLOWED_ORIGINS.includes(origin) || isDevOrigin(origin)) return cb(null, true);
@@ -57,6 +57,7 @@ app.use(cors({
 app.use('/api/ai/groq', express.json({ limit: '8mb' })); // AI vision payloads (base64 images) exceed 1mb
 app.use('/api/ai/transcribe', express.json({ limit: '25mb' })); // base64 voice audio
 app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' })); // Gumroad pings are form-encoded
 
 // Rate limiters (per-IP) — throttle auth/credential, unauthenticated, and proxy endpoints.
 const rl = (windowMs, max, message) => rateLimit({ windowMs, max, standardHeaders: true, legacyHeaders: false, message: { error: message } });
@@ -72,14 +73,8 @@ app.get('/', (_req, res) => res.json({
   platforms: { mt5: true, mt4: true, mt5ea: true, tradelocker: true, dxtrade: true, ctrader: ctrader.configured() },
   email: email.configured(),
   eodhd: require('./src/eodhd').configured(),
-  pesapal: require('./src/pesapal').configured(),
-  intasend: intasend.configured(),
-  intasendEnv: intasend.env(),
-  paymentProvider: String(process.env.PAYMENT_PROVIDER || 'pesapal').toLowerCase(),
-  pesapalEnv: process.env.PESAPAL_ENV || 'live',
-  // Surfaced so you can confirm at a glance that launch pricing is live —
-  // testPricing:true means every plan is charging 1 KES.
-  testPricing: String(process.env.TEST_PRICING || '').toLowerCase() === 'true',
+  gumroad: gumroad.configured(),
+  paymentProvider: 'gumroad',
   appCheck: String(process.env.APPCHECK_ENFORCE || '').toLowerCase() === 'true',
 }));
 
@@ -115,12 +110,11 @@ async function requireAppCheck(req, res, next) {
 }
 
 // Applied to every /api route except the ones that physically cannot carry an
-// App Check token: Pesapal's server-to-server IPN, Spotware's OAuth redirect, the
+// App Check token: Gumroad's server-to-server ping, Spotware's OAuth redirect, the
 // MT5 Expert Advisor's push (authenticated by its sync key) and the cron sweep
 // (authenticated by CRON_SECRET).
 const APPCHECK_EXEMPT = [
-  /^\/api\/pesapal\/ipn/,
-  /^\/api\/intasend\/ipn/,
+  /^\/api\/gumroad\/ping/,
   /^\/api\/ctrader\/callback/,
   /^\/api\/mt5\/trades/,
   /^\/api\/mt5-ea\/push/,
@@ -695,41 +689,17 @@ app.post('/api/mfa/verify', mfaLimiter, requireAuth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════
-//  SUBSCRIPTIONS (Pesapal)  —  server-side verify + grant only
+//  SUBSCRIPTIONS (Gumroad)  —  server-side verify + grant only
 // ══════════════════════════════════════════════════════════════
-const pesapal = require('./src/pesapal');
-
-// ⚠️ EDIT THESE before going live. Amounts are in the charge currency's
-// major unit. M-Pesa settles in KES, so use KES here (not USD) unless your
-// Pesapal account is set up for another currency.
-// USD prices converted at 1 USD = 130 KES: Essential $5/$48, Pro $12/$120.
-const PLAN_PRICES = {
-  essential: { monthly: { amount: 650,  currency: 'KES' }, yearly: { amount: 6240,  currency: 'KES' } },
-  pro:       { monthly: { amount: 1560, currency: 'KES' }, yearly: { amount: 15600, currency: 'KES' } },
-};
-
-// Test mode: charge 1 KES on every plan so the full Pesapal -> M-Pesa -> IPN ->
-// claim chain can be exercised for a cent. Controlled by env so it can be flipped
-// on Render without a code deploy — and, critically, so it DEFAULTS TO OFF. Left
-// hardcoded, this is the single worst bug you can ship: Pro for 1 KES.
-// Turn on:  TEST_PRICING=true   (Render -> Environment)
-// Turn off: delete the variable, or set it to anything else.
-const TEST_PRICING = String(process.env.TEST_PRICING || '').toLowerCase() === 'true';
+// Pricing lives on the Gumroad membership products, not here. The server only
+// needs to know how long a paid cycle lasts: 31/366 (not 30/365) so Gumroad's
+// next recurring charge lands before the previous grant expires — access never
+// flickers off the morning a renewal is due.
 const PLAN_DAYS = { monthly: 31, yearly: 366 };
 
 // Free-forever comp accounts — always full access, never charged.
 // Defined once in src/access.js so the gates and the grant path agree.
 const isComp = access.isComp;
-
-// Mid-cycle Essential → Pro upgrade: charge only the price difference and KEEP
-// the existing expiry date, so nobody has to wait for the period to end.
-const UPGRADE_DELTA = {
-  monthly: PLAN_PRICES.pro.monthly.amount - PLAN_PRICES.essential.monthly.amount,  //  910 KES ≈ $7
-  yearly:  PLAN_PRICES.pro.yearly.amount  - PLAN_PRICES.essential.yearly.amount,   // 9360 KES ≈ $72
-};
-// false = flat difference (what a customer expects: "+$7 and I'm Pro").
-// true  = bill only the unused portion of the period (fairer if they upgrade on day 28).
-const PRORATE_UPGRADE = false;
 
 // The ONE place access is granted: sets the custom claim (source of truth for
 // Firestore rules + the frontend) and mirrors it to users/{uid}.subscription.
@@ -830,7 +800,7 @@ async function sendReceiptEmail(uid, order, expiresAt) {
            <tr><td style="padding:4px 14px 4px 0;color:#666">Plan</td><td><b>${planName}</b> (${order.cycle === 'yearly' ? 'yearly' : 'monthly'})</td></tr>
            <tr><td style="padding:4px 14px 4px 0;color:#666">Amount</td><td>${money(order.amount, order.currency)}</td></tr>
            <tr><td style="padding:4px 14px 4px 0;color:#666">Access until</td><td>${nice(expiresAt)}</td></tr>
-           <tr><td style="padding:4px 14px 4px 0;color:#666">Auto-renew</td><td>No — nothing is charged automatically</td></tr>
+           <tr><td style="padding:4px 14px 4px 0;color:#666">Auto-renew</td><td>Yes — manage or cancel any time from your Gumroad receipt</td></tr>
          </table>`;
     await email.sendEmail({
       to: user.email, toName: user.displayName || '',
@@ -931,43 +901,71 @@ app.all('/api/cron/subscriptions', authLimiter, async (req, res) => {
   }
 });
 
-// Verify a Pesapal order and grant if it completed. Idempotent.
-async function settleOrder(orderTrackingId) {
-  const ref = db.collection('pendingOrders').doc(orderTrackingId);
-  const snap = await ref.get();
-  if (!snap.exists) return { ok: false, reason: 'unknown order' };
-  const o = snap.data();
-  if (o.status === 'COMPLETED') return { ok: true, already: true };
+// Verify a Gumroad sale and grant. Idempotent by sale id: Gumroad retries pings
+// it thinks failed, and every recurring membership charge arrives as a NEW sale
+// id — so a GRANTED doc means "this exact charge is handled", while renewals
+// still land as fresh grants that push expiresAt forward.
+async function settleGumroadSale(saleId, ping) {
+  const ref = db.collection('gumroadSales').doc(saleId);
+  const seen = await ref.get();
+  if (seen.exists && seen.data().status === 'GRANTED') return { ok: true, already: true };
 
-  // Orders created before IntaSend existed carry no provider field.
-  const provider = String(o.provider || 'pesapal').toLowerCase();
-  let paid = false, method = null, desc = '';
-  if (provider === 'intasend') {
-    const iv = await intasend.getStatus(o.invoiceId || orderTrackingId);
-    desc = (iv.state || '').toLowerCase();
-    paid = intasend.isPaid(iv.state);
-    method = iv.provider || null;
-  } else {
-    const st = await pesapal.getStatus(orderTrackingId);
-    desc = String(st.payment_status_description || '').toLowerCase();
-    paid = desc === 'completed' || st.status_code === 1;
-    method = st.payment_method || null;
+  // The ping is unauthenticated, so nothing in it is trusted. Re-fetching the
+  // sale under OUR access token is the authenticity check — a forged sale id
+  // dies here — and the verified copy decides plan, cycle and amount.
+  const sale = await gumroad.getSale(saleId);
+  if (sale.refunded || sale.chargedback) {
+    await ref.set({ status: 'IGNORED', reason: sale.refunded ? 'refunded' : 'chargedback', at: Date.now() }, { merge: true });
+    return { ok: false, reason: 'refunded' };
   }
-  if (paid) {
-    const expiresAt = await grantSubscription(
-      o.uid, o.plan, o.cycle,
-      { orderTrackingId, provider, paymentMethod: method, ...(o.kind === 'upgrade' ? { upgradedAt: Date.now() } : {}) },
-      o.kind === 'upgrade' ? o.keepExpiresAt : 0,
-    );
-    await ref.set({ status: 'COMPLETED', paymentMethod: method, settledAt: Date.now(), expiresAt }, { merge: true });
-    // Receipt + audience sync are fire-and-forget: access is already granted, and
-    // a Brevo hiccup must never turn a successful payment into an error.
-    sendReceiptEmail(o.uid, o, expiresAt).catch(() => {});
-    syncBrevoContact(o.uid, { force: true }).catch(() => {});
-    return { ok: true };
+  const matched = gumroad.matchSale(sale);
+  if (!matched) {
+    await ref.set({ status: 'IGNORED', reason: 'unknown product', productId: sale.product_id || null, at: Date.now() }, { merge: true });
+    return { ok: false, reason: 'not an ETW product' };
   }
-  await ref.set({ status: (desc || 'pending').toUpperCase() }, { merge: true });
-  return { ok: false, reason: desc || 'pending' };
+  const { plan, cycle } = matched;
+
+  // Who is this for? payment.html stamps the buyer's Firebase uid onto the
+  // checkout URL and Gumroad echoes it back in url_params. Fall back to matching
+  // the purchase email, for anyone who bought from the Gumroad page directly.
+  let uid = null;
+  const rawUid = String((ping && ping.url_params && ping.url_params.uid) || '').trim();
+  if (/^[A-Za-z0-9]{10,128}$/.test(rawUid)) {
+    try { uid = (await admin.auth().getUser(rawUid)).uid; } catch (e) { /* stale uid — try email */ }
+  }
+  if (!uid && sale.email) {
+    try { uid = (await admin.auth().getUserByEmail(String(sale.email).trim())).uid; } catch (e) { /* no account under that email */ }
+  }
+  if (!uid) {
+    // Real money, no matching account. Keep the sale so support can attach it by
+    // hand (/api/admin/grant), instead of the payment silently vanishing.
+    await ref.set({ status: 'UNMATCHED', email: sale.email || null, plan, cycle, at: Date.now() }, { merge: true });
+    console.warn('[gumroad] paid sale with no matching account:', saleId, sale.email || '(no email)');
+    return { ok: false, reason: 'no matching account' };
+  }
+
+  // Gumroad has returned price both as cents (500) and as a formatted string
+  // ("$5"); the amount is only used on the receipt, so parse forgivingly.
+  const rawPrice = String(sale.price == null ? '' : sale.price);
+  const priceNum = Number(rawPrice.replace(/[^0-9.]/g, '')) || 0;
+  const amount = rawPrice.includes('$') ? priceNum : priceNum / 100;
+  const currency = String(sale.currency || 'USD').toUpperCase();
+
+  const expiresAt = await grantSubscription(uid, plan, cycle, {
+    provider: 'gumroad', saleId, subscriptionId: sale.subscription_id || null,
+  });
+  await ref.set({
+    status: 'GRANTED', uid, plan, cycle, expiresAt, at: Date.now(),
+    email: sale.email || null, subscriptionId: sale.subscription_id || null,
+    recurring: !!(ping && String(ping.is_recurring_charge) === 'true'),
+    amount, currency,
+  }, { merge: true });
+
+  // Receipt + audience sync are fire-and-forget: access is already granted, and
+  // a Brevo hiccup must never turn a successful payment into an error.
+  sendReceiptEmail(uid, { plan, cycle, kind: 'new', amount, currency }, expiresAt).catch(() => {});
+  syncBrevoContact(uid, { force: true }).catch(() => {});
+  return { ok: true, uid, plan, cycle, expiresAt };
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1124,37 +1122,6 @@ app.post('/api/admin/revoke', authLimiter, requireAdmin, async (req, res) => {
   }
 });
 
-// Diagnostic: attempt a Pesapal order at an arbitrary amount and hand back the
-// RAW upstream reply. Submitting an order only creates a checkout session — no
-// money moves unless somebody actually pays it — so this is a safe way to find
-// out why one amount is accepted and another rejected (per-transaction caps,
-// currency not enabled, stale IPN id) without digging through logs.
-app.get('/api/admin/pesapal-probe', authLimiter, requireAdmin, async (req, res) => {
-  try {
-    if (!pesapal.configured()) return res.status(503).json({ error: 'Pesapal is not configured.' });
-    const amount = Number(req.query.amount || 650);
-    const currency = String(req.query.currency || 'KES').toUpperCase();
-    const publicBase = (process.env.PUBLIC_BACKEND_URL || (req.protocol + '://' + req.get('host'))).replace(/\/+$/, '');
-    const ipnId = await pesapal.ensureIpnId(db, publicBase + '/api/pesapal/ipn');
-    const order = await pesapal.submitOrder({
-      id: 'probe_' + Date.now(),
-      amount, currency,
-      description: 'ETW Journal probe ' + amount + ' ' + currency,
-      callbackUrl: APP_URL + '/payment.html?probe=1',
-      notificationId: ipnId,
-      email: 'probe@' + (process.env.BREVO_SENDER || 'ethwiz.space').split('@').pop(),
-      firstName: 'ETW', lastName: 'Probe', phone: '',
-    });
-    res.json({
-      sent: { amount, currency, ipnId, callbackUrl: APP_URL + '/payment.html?probe=1', env: process.env.PESAPAL_ENV || 'live' },
-      accepted: !!(order && order.redirect_url),
-      raw: order,
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
 // Support lookup: what access does this person actually have?
 app.get('/api/admin/user', authLimiter, requireAdmin, async (req, res) => {
   try {
@@ -1175,210 +1142,21 @@ app.get('/api/admin/user', authLimiter, requireAdmin, async (req, res) => {
   }
 });
 
-// Start a checkout. Requires auth so we bind the order to a real uid.
-app.post('/api/subscribe/create-order', authLimiter, requireAuth, async (req, res) => {
-  try {
-    // Provider comes from the request, falling back to PAYMENT_PROVIDER then Pesapal.
-    // Both can be live at once; the client chooses per checkout.
-    const wanted = String((req.body && req.body.provider) || process.env.PAYMENT_PROVIDER || 'pesapal').toLowerCase();
-    const provider = wanted === 'intasend' ? 'intasend' : 'pesapal';
-    if (provider === 'intasend' && !intasend.configured()) return res.status(503).json({ error: 'IntaSend is not configured on the server.' });
-    if (provider === 'pesapal' && !pesapal.configured()) return res.status(503).json({ error: 'Payments are not configured on the server.' });
-    const plan  = String((req.body && req.body.plan)  || '').toLowerCase();
-    let   cycle = String((req.body && req.body.cycle) || 'monthly').toLowerCase();
-    const price = PLAN_PRICES[plan] && PLAN_PRICES[plan][cycle];
-    if (!price) return res.status(400).json({ error: 'Unknown plan or billing cycle.' });
-
-    const user = await admin.auth().getUser(req.uid);
-
-    // Comp accounts skip payment entirely.
-    if (isComp(user.email)) {
-      const expiresAt = await grantSubscription(req.uid, 'pro', 'yearly', { comp: true });
-      return res.json({ comp: true, expiresAt });
-    }
-
-    // ── Mid-cycle upgrade: Essential → Pro for the price difference ──
-    // Keeps the current expiry date, so the remaining days simply become Pro days.
-    let kind = 'new', keepExpiresAt = 0, amount = price.amount;
-    if (req.body && req.body.upgrade) {
-      const cur = await access.accessFor(req.uid, null);
-      if (!cur.active)      return res.status(400).json({ error: 'No active subscription to upgrade.', code: 'no_subscription' });
-      if (access.isPro(cur)) return res.status(400).json({ error: "You're already on the Pro plan.", code: 'already_pro' });
-      if (plan !== 'pro')    return res.status(400).json({ error: 'Upgrades target the Pro plan.' });
-
-      const snap = await db.collection('users').doc(req.uid).get();
-      const sub  = (snap.exists && snap.data().subscription) || {};
-      cycle = PLAN_DAYS[sub.cycle] ? sub.cycle : 'monthly';   // bill the delta on THEIR cycle
-      amount = UPGRADE_DELTA[cycle];
-      if (PRORATE_UPGRADE && cur.expiresAt) {
-        const frac = Math.max(0, Math.min(1, (Number(cur.expiresAt) - Date.now()) / (PLAN_DAYS[cycle] * 86400000)));
-        amount = Math.max(1, Math.round(amount * frac));
-      }
-      kind = 'upgrade';
-      keepExpiresAt = Number(cur.expiresAt) || 0;
-    }
-    const chargeAmount = TEST_PRICING ? 1 : amount;
-
-    // Pesapal enforces a per-transaction cap per merchant contract; ours currently
-    // sits near 2,000 KES, which the yearly prices (6,240 / 15,600) exceed. Pesapal
-    // answers amount_exceeds_default_limit, which surfaced to users as the useless
-    // "did not return a checkout URL". Catch it here and say something actionable.
-    // Raise PESAPAL_MAX_AMOUNT (or unset it) once Pesapal lifts the limit.
-    const maxAmount = provider === 'pesapal' ? Number(process.env.PESAPAL_MAX_AMOUNT || 2000) : 0;
-    if (maxAmount > 0 && chargeAmount > maxAmount) {
-      console.warn('[pesapal] refusing ' + chargeAmount + ' ' + price.currency + ' — above cap ' + maxAmount);
-      return res.status(400).json({
-        error: cycle === 'yearly'
-          ? 'Yearly billing is not available yet — please choose the monthly plan.'
-          : 'That amount is above the limit our payment provider currently allows.',
-        code: 'amount_above_cap', max: maxAmount, currency: price.currency,
-      });
-    }
-
-    const publicBase = (process.env.PUBLIC_BACKEND_URL || (req.protocol + '://' + req.get('host'))).replace(/\/+$/, '');
-    const appBase    = (process.env.APP_BASE_URL || req.get('origin') || publicBase).replace(/\/+$/, '');
-    const ipnId   = await pesapal.ensureIpnId(db, publicBase + '/api/pesapal/ipn');
-    const orderId = 'sub_' + req.uid.slice(0, 8) + '_' + Date.now();
-    const nameParts = String(user.displayName || '').split(' ').filter(Boolean);
-
-    if (provider === 'intasend') {
-      const co = await intasend.createCheckout({
-        apiRef: orderId,
-        amount: chargeAmount,
-        currency: price.currency,
-        email: user.email,
-        firstName: nameParts[0] || 'ETW',
-        lastName: nameParts.slice(1).join(' ') || 'Trader',
-        phone: (req.body && req.body.phone) || '',
-        redirectUrl: appBase + '/payment.html?paid=1',
-        comment: kind === 'upgrade'
-          ? 'ETW Journal — upgrade to Pro (' + cycle + ', rest of period)'
-          : 'ETW Journal — ' + plan + ' (' + cycle + ')',
-      });
-      if (!co.url) {
-        console.error('[intasend] checkout rejected:', JSON.stringify(co.raw).slice(0, 400));
-        return res.status(502).json({ error: 'IntaSend did not return a checkout URL.', detail: co.raw });
-      }
-      // Keyed by our own order id: IntaSend may not return an invoice id until the
-      // payment starts, and api_ref is what the webhook carries back.
-      await db.collection('pendingOrders').doc(orderId).set({
-        uid: req.uid, plan, cycle, amount: chargeAmount, currency: price.currency,
-        kind, keepExpiresAt, status: 'PENDING', createdAt: Date.now(),
-        provider: 'intasend', invoiceId: co.invoiceId || null,
-      });
-      return res.json({
-        provider: 'intasend', redirect_url: co.url, order_tracking_id: orderId,
-        kind, amount: chargeAmount, currency: price.currency,
-      });
-    }
-
-    const order = await pesapal.submitOrder({
-      id: orderId,
-      amount: chargeAmount,
-      currency: price.currency,
-      description: kind === 'upgrade'
-        ? 'ETW Journal — upgrade to Pro (' + cycle + ', rest of period)'
-        : 'ETW Journal — ' + plan + ' (' + cycle + ')',
-      callbackUrl: appBase + '/payment.html?paid=1',
-      notificationId: ipnId,
-      email: user.email,
-      firstName: nameParts[0] || 'ETW',
-      lastName: nameParts.slice(1).join(' ') || 'Trader',
-      phone: (req.body && req.body.phone) || '',
-    });
-    if (!order.redirect_url || !order.order_tracking_id) {
-      // Log the whole upstream reply — Pesapal's reason (bad callback_url, stale
-      // notification_id, amount below minimum, currency not enabled) only exists
-      // here, and without it this is undebuggable from the client side.
-      console.error('[pesapal] SubmitOrder rejected:', JSON.stringify(order),
-        '| callback:', appBase + '/payment.html?paid=1', '| ipn:', ipnId,
-        '| amount:', chargeAmount, price.currency);
-      return res.status(502).json({ error: 'Pesapal did not return a checkout URL.', detail: order });
-    }
-
-    await db.collection('pendingOrders').doc(order.order_tracking_id).set({
-      uid: req.uid, plan, cycle, amount: chargeAmount, currency: price.currency,
-      kind, keepExpiresAt, status: 'PENDING', createdAt: Date.now(), provider: 'pesapal',
-    });
-    res.json({ provider: 'pesapal', redirect_url: order.redirect_url, order_tracking_id: order.order_tracking_id, kind, amount: chargeAmount, currency: price.currency });
-  } catch (e) {
-    console.error('subscribe/create-order:', e.message);
-    res.status(500).json({ error: 'Could not start checkout.' });
-  }
-});
-
-// Pesapal IPN (server-to-server notification). Registered as GET type.
-async function handleIpn(req, res) {
-  try {
-    const id = (req.query && req.query.OrderTrackingId) || (req.body && req.body.OrderTrackingId);
-    if (!id) return res.status(400).json({ error: 'missing OrderTrackingId' });
-    await settleOrder(id);
-    res.json({
-      orderNotificationType: (req.query && req.query.OrderNotificationType) || 'IPNCHANGE',
-      orderTrackingId: id,
-      orderMerchantReference: (req.query && req.query.OrderMerchantReference) || '',
-      status: 200,
-    });
-  } catch (e) {
-    console.error('pesapal ipn:', e.message);
-    res.status(200).json({ status: 500 });
-  }
-}
-// IntaSend webhook. The challenge only tells us the call is genuine; the amount
-// and state always come from a status lookup, so a spoofed body cannot grant
-// access. Always 200 — a retry storm helps nobody.
-app.post('/api/intasend/ipn', async (req, res) => {
+// Gumroad ping (server-to-server, form-encoded). Fires on every sale, including
+// each recurring membership charge. Registered once in Gumroad → Settings →
+// Advanced → Ping as  <backend>/api/gumroad/ping.  Always 200 — Gumroad retries
+// failures and a retry storm helps nobody; the sale is recorded either way, and
+// settleGumroadSale never trusts this body (it re-fetches the sale by id).
+app.post('/api/gumroad/ping', async (req, res) => {
   try {
     const b = req.body || {};
-    const v = intasend.verifyChallenge(b);
-    if (!v.ok) console.warn('[intasend] webhook challenge', v.reason, '— settling by lookup anyway');
-    const ref = b.api_ref || b.apiRef || null;
-    const invoiceId = b.invoice_id || b.invoiceId || null;
-    if (!ref && !invoiceId) return res.status(200).json({ status: 'ignored', reason: 'no api_ref or invoice_id' });
-    // api_ref is our pendingOrders doc id. Record the invoice id the first time we
-    // see it, since checkout creation may not have returned one.
-    if (ref && invoiceId) {
-      await db.collection('pendingOrders').doc(String(ref)).set({ invoiceId: String(invoiceId) }, { merge: true }).catch(() => {});
-    }
-    await settleOrder(String(ref || invoiceId));
-    res.status(200).json({ status: 'ok' });
+    const saleId = String(b.sale_id || '').trim();
+    if (!saleId) return res.status(200).json({ status: 'ignored', reason: 'no sale_id' });
+    const r = await settleGumroadSale(saleId, b);
+    res.status(200).json({ status: r.ok ? 'ok' : 'ignored', reason: r.reason });
   } catch (e) {
-    console.error('intasend ipn:', e.message);
+    console.error('gumroad ping:', e.message);
     res.status(200).json({ status: 'error' });
-  }
-});
-
-// Config + a live auth check, without creating a real invoice.
-app.get('/api/intasend/probe', authLimiter, requireAdmin, async (req, res) => {
-  const out = { configured: intasend.configured(), env: intasend.env(), base: intasend.base(),
-    challengeSet: !!process.env.INTASEND_WEBHOOK_CHALLENGE,
-    publicKeySet: !!process.env.INTASEND_PUBLIC_KEY, secretKeySet: !!process.env.INTASEND_SECRET_KEY };
-  if (!out.configured) return res.status(503).json(out);
-  try {
-    // A deliberately absent invoice: a 4xx with IntaSend's own body proves the keys
-    // authenticate, whereas 401/403 means they do not.
-    await intasend.getStatus('etw-probe-nonexistent');
-    res.json({ ...out, auth: 'ok', note: 'status lookup unexpectedly succeeded' });
-  } catch (e) {
-    const authOk = e.status !== 401 && e.status !== 403;
-    res.status(authOk ? 200 : 502).json({ ...out, auth: authOk ? 'ok' : 'rejected', upstreamStatus: e.status, upstream: e.upstream || e.message });
-  }
-});
-
-app.get('/api/pesapal/ipn', handleIpn);
-app.post('/api/pesapal/ipn', handleIpn);
-
-// Client polls this after returning from the Pesapal sheet.
-app.get('/api/subscribe/status/:id', authLimiter, requireAuth, async (req, res) => {
-  try {
-    const snap = await db.collection('pendingOrders').doc(req.params.id).get();
-    if (snap.exists && snap.data().uid !== req.uid) return res.status(403).json({ error: 'Not your order.' });
-    const r = await settleOrder(req.params.id);
-    const o = snap.exists ? snap.data() : {};
-    res.json({ status: o.status || 'PENDING', settled: !!r.ok });
-  } catch (e) {
-    console.error('subscribe/status:', e.message);
-    res.status(500).json({ error: 'Status check failed.' });
   }
 });
 
@@ -1415,18 +1193,11 @@ app.get('/api/subscribe/me', requireAuth, async (req, res) => {
       })().catch(() => {});
     }
 
-    // Active Essential? Quote the mid-cycle upgrade so the UI can price the button.
-    if (a.active && !access.isPro(a)) {
-      const snap = await db.collection('users').doc(req.uid).get();
-      const sub  = (snap.exists && snap.data().subscription) || {};
-      const cyc  = PLAN_DAYS[sub.cycle] ? sub.cycle : 'monthly';
-      let amt = UPGRADE_DELTA[cyc];
-      if (PRORATE_UPGRADE && a.expiresAt) {
-        const frac = Math.max(0, Math.min(1, (Number(a.expiresAt) - Date.now()) / (PLAN_DAYS[cyc] * 86400000)));
-        amt = Math.max(1, Math.round(amt * frac));
-      }
-      out.upgrade = { cycle: cyc, amount: TEST_PRICING ? 1 : amt, currency: PLAN_PRICES.pro[cyc].currency, keepsExpiry: true };
-    }
+    // Active Essential? Flag that an upgrade path exists. Gumroad cannot bill a
+    // mid-cycle price difference, so upgrading means: subscribe to Pro, then
+    // cancel the Essential membership from the Gumroad receipt — the pricing
+    // page explains this next to the button.
+    if (a.active && !access.isPro(a)) out.upgrade = { via: 'gumroad' };
     res.json(out);
   } catch (e) {
     console.error('subscribe/me:', e.message);
