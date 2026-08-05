@@ -114,4 +114,22 @@ async function listResourceSubscriptions() {
   return out;
 }
 
-module.exports = { configured, matchSale, getSale, normalizeKey, ensureResourceSubscriptions, listResourceSubscriptions };
+// Sales from the last N days, for the reconciliation sweep. Pages through the
+// Sales API (capped defensively — a sweep never needs more than a few pages).
+async function recentSales(days) {
+  const token = process.env.GUMROAD_ACCESS_TOKEN;
+  const after = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+  let url = API + '/sales?after=' + after + '&access_token=' + encodeURIComponent(token);
+  const sales = [];
+  for (let page = 0; page < 10 && url; page++) {
+    const r = await fetch(url);
+    const j = await r.json().catch(() => null);
+    if (!r.ok || !j || j.success !== true) break;
+    sales.push(...(j.sales || []));
+    url = j.next_page_url ? 'https://api.gumroad.com' + j.next_page_url : null;
+    if (url && url.indexOf('access_token=') === -1) url += '&access_token=' + encodeURIComponent(token);
+  }
+  return sales;
+}
+
+module.exports = { configured, matchSale, getSale, normalizeKey, ensureResourceSubscriptions, listResourceSubscriptions, recentSales };

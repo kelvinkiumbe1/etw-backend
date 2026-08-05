@@ -65,6 +65,9 @@ const authLimiter   = rl(15 * 60 * 1000, 40, 'Too many attempts. Please wait a f
 const eaLimiter     = rl(60 * 1000, 120, 'Too many requests, please slow down.');
 const aiLimiter     = rl(60 * 1000, 20,  'Too many AI requests, please wait a moment.');
 const marketLimiter = rl(60 * 1000, 60,  'Too many market-data requests, please wait.');
+// Webhooks: every posted sale id costs a Firestore read + a Gumroad API call,
+// so cap the rate — Gumroad's real traffic (sales + retries) sits far below this.
+const webhookLimiter = rl(60 * 1000, 60, 'Too many requests.');
 
 app.get('/', (_req, res) => res.json({
   ok: true,
@@ -908,7 +911,12 @@ app.all('/api/cron/subscriptions', authLimiter, async (req, res) => {
   if (given !== secret) return res.status(403).json({ error: 'forbidden' });
   try {
     const r = await sweepSubscriptions();
-    res.json({ ok: true, ...r });
+    // Also heal any Gumroad sales whose ping never landed. Failure here must
+    // not fail the sweep — the two jobs are independent.
+    let gumroadSweep = null;
+    try { gumroadSweep = await reconcileGumroadSales(3); }
+    catch (e) { gumroadSweep = { error: e.message }; }
+    res.json({ ok: true, ...r, gumroad: gumroadSweep });
   } catch (e) {
     console.error('cron/subscriptions:', e.message);
     res.status(500).json({ error: 'sweep failed' });
@@ -1000,6 +1008,32 @@ async function settleGumroadSale(saleId, ping) {
   sendReceiptEmail(uid, { plan, cycle, kind: 'new', amount, currency }, expiresAt).catch(() => {});
   syncBrevoContact(uid, { force: true }).catch(() => {});
   return { ok: true, uid, plan, cycle, expiresAt };
+}
+
+// Reconciliation: heal missed pings. A sale that lands while Render is down
+// (deploy, outage) never gets granted once Gumroad's retries run out — this
+// sweep re-settles any recent, unrefunded sale of our products that has no
+// GRANTED record. Runs once at boot and from the daily cron. Idempotent:
+// settleGumroadSale re-verifies every sale and skips ones already granted.
+async function reconcileGumroadSales(days = 3) {
+  if (!gumroad.configured()) return { checked: 0, healed: 0 };
+  const sales = await gumroad.recentSales(days);
+  let checked = 0, healed = 0;
+  for (const s of sales) {
+    const saleId = String(s.id || s.sale_id || '');
+    if (!saleId || !gumroad.matchSale(s)) continue;    // not one of our products
+    if (s.refunded || s.chargedback) continue;         // refund path handles these
+    checked++;
+    const seen = await db.collection('gumroadSales').doc(saleId).get();
+    if (seen.exists && seen.data().status === 'GRANTED') continue;
+    try {
+      // The API sale object doubles as the "ping": it carries url_params/email
+      // for uid resolution, and settle re-fetches + verifies by id anyway.
+      const r = await settleGumroadSale(saleId, s);
+      if (r.ok && !r.already) { healed++; console.log('[gumroad] reconciled missed sale', saleId); }
+    } catch (e) { console.warn('[gumroad] reconcile', saleId + ':', e.message); }
+  }
+  return { checked, healed };
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1203,7 +1237,7 @@ app.get('/api/admin/user', authLimiter, requireAdmin, async (req, res) => {
 // Advanced → Ping as  <backend>/api/gumroad/ping.  Always 200 — Gumroad retries
 // failures and a retry storm helps nobody; the sale is recorded either way, and
 // settleGumroadSale never trusts this body (it re-fetches the sale by id).
-app.post('/api/gumroad/ping', async (req, res) => {
+app.post('/api/gumroad/ping', webhookLimiter, async (req, res) => {
   try {
     const b = req.body || {};
     // Sales pings carry sale_id; refund/dispute resource posts have been seen
@@ -1275,5 +1309,12 @@ app.listen(port, () => {
     gumroad.ensureResourceSubscriptions(gumroadBase + '/api/gumroad/ping')
       .then((r) => console.log('[gumroad] resource subscriptions:', JSON.stringify(r)))
       .catch((e) => console.warn('[gumroad] resource subscriptions:', e.message));
+  }
+  // Boot-time reconciliation: exactly the moment missed pings need healing is
+  // right after downtime — which is right now, since we just started.
+  if (gumroad.configured()) {
+    reconcileGumroadSales(3)
+      .then((r) => { if (r.checked) console.log('[gumroad] boot reconcile:', JSON.stringify(r)); })
+      .catch((e) => console.warn('[gumroad] boot reconcile:', e.message));
   }
 });
