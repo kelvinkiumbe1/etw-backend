@@ -100,4 +100,18 @@ async function ensureResourceSubscriptions(postUrl) {
   return out;
 }
 
-module.exports = { configured, matchSale, getSale, normalizeKey, ensureResourceSubscriptions };
+// What refund/dispute hooks are actually registered on Gumroad's side right
+// now. Diagnostic only — /api/admin/gumroad-probe surfaces this.
+async function listResourceSubscriptions() {
+  const token = process.env.GUMROAD_ACCESS_TOKEN;
+  const out = {};
+  for (const name of ['refund', 'dispute']) {
+    const r = await fetch(API + '/resource_subscriptions?resource_name=' + name
+      + '&access_token=' + encodeURIComponent(token));
+    const j = await r.json().catch(() => null);
+    out[name] = ((j && j.resource_subscriptions) || []).map((s) => ({ id: s.id, post_url: s.post_url }));
+  }
+  return out;
+}
+
+module.exports = { configured, matchSale, getSale, normalizeKey, ensureResourceSubscriptions, listResourceSubscriptions };

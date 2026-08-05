@@ -1156,6 +1156,28 @@ app.post('/api/admin/revoke', authLimiter, requireAdmin, async (req, res) => {
   }
 });
 
+// Diagnostic: is Gumroad fully wired? Config flags plus the refund/dispute
+// resource subscriptions actually registered on Gumroad's side.
+app.get('/api/admin/gumroad-probe', authLimiter, requireAdmin, async (req, res) => {
+  const out = {
+    configured: gumroad.configured(),
+    tokenSet: !!process.env.GUMROAD_ACCESS_TOKEN,
+    products: {
+      essential: !!process.env.GUMROAD_PRODUCT_ESSENTIAL,
+      pro: !!process.env.GUMROAD_PRODUCT_PRO,
+      essentialYearly: !!process.env.GUMROAD_PRODUCT_ESSENTIAL_YEARLY,
+      proYearly: !!process.env.GUMROAD_PRODUCT_PRO_YEARLY,
+    },
+  };
+  if (!out.configured) return res.status(503).json(out);
+  try {
+    out.resourceSubscriptions = await gumroad.listResourceSubscriptions();
+    res.json(out);
+  } catch (e) {
+    res.status(502).json({ ...out, error: e.message });
+  }
+});
+
 // Support lookup: what access does this person actually have?
 app.get('/api/admin/user', authLimiter, requireAdmin, async (req, res) => {
   try {
