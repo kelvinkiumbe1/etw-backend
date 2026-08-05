@@ -74,4 +74,30 @@ async function getSale(saleId) {
   return json.sale;
 }
 
-module.exports = { configured, matchSale, getSale, normalizeKey };
+// Refund/dispute notifications are NOT covered by the Settings → Ping URL
+// (that only fires on sales); they arrive via the Resource Subscriptions API,
+// registered programmatically. Called once at boot — idempotent: an existing
+// registration for the same resource + post_url is left alone.
+async function ensureResourceSubscriptions(postUrl) {
+  const token = process.env.GUMROAD_ACCESS_TOKEN;
+  const out = {};
+  for (const name of ['refund', 'dispute']) {
+    try {
+      const list = await fetch(API + '/resource_subscriptions?resource_name=' + name
+        + '&access_token=' + encodeURIComponent(token));
+      const lj = await list.json().catch(() => null);
+      const subs = (lj && lj.resource_subscriptions) || [];
+      if (subs.some((s) => s && s.post_url === postUrl)) { out[name] = 'exists'; continue; }
+      const r = await fetch(API + '/resource_subscriptions', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ access_token: token, resource_name: name, post_url: postUrl }),
+      });
+      const j = await r.json().catch(() => null);
+      out[name] = (j && j.success === true) ? 'registered' : ('failed: ' + (r.status || '?'));
+    } catch (e) { out[name] = 'failed: ' + e.message; }
+  }
+  return out;
+}
+
+module.exports = { configured, matchSale, getSale, normalizeKey, ensureResourceSubscriptions };

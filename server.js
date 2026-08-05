@@ -730,6 +730,20 @@ async function grantSubscription(uid, plan, cycle, extra = {}, keepExpiresAt = 0
   return expiresAt;
 }
 
+// The inverse, for refunds and chargebacks: strips the claim and marks the
+// mirror doc. Access dies at the user's next token refresh — under an hour.
+async function revokeSubscription(uid, extra = {}) {
+  const user = await admin.auth().getUser(uid);
+  const claims = Object.assign({}, user.customClaims || {});
+  delete claims.subscribed; delete claims.plan; delete claims.expiresAt;
+  await admin.auth().setCustomUserClaims(uid, claims);
+  await db.collection('users').doc(uid).set(
+    { subscription: { status: 'revoked', revokedAt: Date.now(), ...extra } },
+    { merge: true }
+  );
+  syncBrevoContact(uid, { force: true }).catch(() => {});
+}
+
 // ══════════════════════════════════════════════════════════════
 //  BREVO AUDIENCE SYNC + SUBSCRIPTION LIFECYCLE EMAILS
 // ══════════════════════════════════════════════════════════════
@@ -908,13 +922,33 @@ app.all('/api/cron/subscriptions', authLimiter, async (req, res) => {
 async function settleGumroadSale(saleId, ping) {
   const ref = db.collection('gumroadSales').doc(saleId);
   const seen = await ref.get();
-  if (seen.exists && seen.data().status === 'GRANTED') return { ok: true, already: true };
+  const granted = seen.exists && seen.data().status === 'GRANTED' ? seen.data() : null;
 
   // The ping is unauthenticated, so nothing in it is trusted. Re-fetching the
   // sale under OUR access token is the authenticity check — a forged sale id
   // dies here — and the verified copy decides plan, cycle and amount.
   const sale = await gumroad.getSale(saleId);
-  if (sale.refunded || sale.chargedback) {
+  const refunded = !!(sale.refunded || sale.chargedback);
+
+  if (granted && !refunded) return { ok: true, already: true };
+
+  // ── Auto-revoke: a sale we granted has since been refunded/charged back ──
+  // Only pull access when THIS sale is the one backing the CURRENT period —
+  // refunding an old charge must not kill a period paid for by a newer one.
+  if (granted && refunded) {
+    const kind = sale.chargedback ? 'chargeback' : 'refund';
+    const snap = await db.collection('users').doc(granted.uid).get();
+    const sub = (snap.exists && snap.data().subscription) || {};
+    const backsAccess = sub.saleId === saleId && sub.status === 'active';
+    if (backsAccess) {
+      await revokeSubscription(granted.uid, { reason: kind, saleId });
+      console.log('[gumroad] revoked access for', granted.uid, 'after', kind, 'of sale', saleId);
+    }
+    await ref.set({ status: 'REFUNDED', reason: kind, refundedAt: Date.now(), revoked: backsAccess }, { merge: true });
+    return { ok: true, revoked: backsAccess };
+  }
+
+  if (refunded) {
     await ref.set({ status: 'IGNORED', reason: sale.refunded ? 'refunded' : 'chargedback', at: Date.now() }, { merge: true });
     return { ok: false, reason: 'refunded' };
   }
@@ -1150,7 +1184,9 @@ app.get('/api/admin/user', authLimiter, requireAdmin, async (req, res) => {
 app.post('/api/gumroad/ping', async (req, res) => {
   try {
     const b = req.body || {};
-    const saleId = String(b.sale_id || '').trim();
+    // Sales pings carry sale_id; refund/dispute resource posts have been seen
+    // with id — accept either, the sale is re-fetched by id regardless.
+    const saleId = String(b.sale_id || b.id || '').trim();
     if (!saleId) return res.status(200).json({ status: 'ignored', reason: 'no sale_id' });
     const r = await settleGumroadSale(saleId, b);
     res.status(200).json({ status: r.ok ? 'ok' : 'ignored', reason: r.reason });
@@ -1209,4 +1245,13 @@ const port = process.env.PORT || 8080;
 app.listen(port, () => {
   console.log('etw-sync-backend listening on :' + port);
   mt5.resumeAll();
+  // Refunds/disputes are only delivered via Gumroad's Resource Subscriptions
+  // API — the Settings → Ping URL fires on sales alone. Registration is
+  // idempotent, so doing it on every boot is safe.
+  const gumroadBase = (process.env.PUBLIC_BACKEND_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
+  if (gumroad.configured() && gumroadBase) {
+    gumroad.ensureResourceSubscriptions(gumroadBase + '/api/gumroad/ping')
+      .then((r) => console.log('[gumroad] resource subscriptions:', JSON.stringify(r)))
+      .catch((e) => console.warn('[gumroad] resource subscriptions:', e.message));
+  }
 });
