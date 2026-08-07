@@ -416,6 +416,15 @@ service cloud.firestore {
       allow read, write: if isAuthed() && request.auth.uid == uid;
     }
 
+    // "Notify me when this mentor adds times" waitlist — each mentee manages
+    // only their own entry; the backend notifies and clears entries.
+    match /mentorWaitlist/{wid} {
+      allow read, delete: if isAuthed() && resource.data.studentUid == request.auth.uid;
+      allow create, update: if isAuthed()
+        && request.resource.data.studentUid == request.auth.uid
+        && wid == request.resource.data.mentorUid + '_' + request.auth.uid;
+    }
+
     // ══════════════════════════════════════════════════
     //  BLOCK ALL OTHER COLLECTIONS
     // ══════════════════════════════════════════════════
