@@ -367,6 +367,56 @@ service cloud.firestore {
     }
 
     // ══════════════════════════════════════════════════
+    //  ETW UNIVERSITY (1-on-1 mentorship)
+    // ══════════════════════════════════════════════════
+    // Booking/cancelling happens ONLY through the backend (Admin SDK bypasses
+    // these rules), so clients can never set a slot to "booked" themselves —
+    // that's what makes the Pro gate and the monthly limit unbypassable.
+
+    // The mentor allowlist lives in the backend's MENTOR_EMAILS env var
+    // (Render) and is mirrored to etwConfig/mentors on every boot, so the
+    // rules can enforce it too. Clients can never read or write that doc.
+    function isMentorEmail() {
+      return isAuthed()
+          && request.auth.token.email != null
+          && request.auth.token.email.lower()
+               in get(/databases/$(database)/documents/etwConfig/mentors).data.emails;
+    }
+
+    // Public mentor profiles: anyone signed-in can browse; only a listed
+    // mentor can create/edit their own profile.
+    match /mentors/{uid} {
+      allow read: if isAuthed();
+      allow write: if isAuthed() && request.auth.uid == uid && isMentorEmail();
+    }
+
+    // Session slots: mentors manage their own; students only READ
+    // (Pro subscribers browse open slots; participants see their own session).
+    match /mentorSlots/{slotId} {
+      allow read: if isAuthed()
+                  && (hasPro()
+                      || resource.data.mentorUid == request.auth.uid
+                      || resource.data.studentUid == request.auth.uid);
+      allow create: if isAuthed() && request.resource.data.mentorUid == request.auth.uid && isMentorEmail();
+      allow update: if isAuthed() && resource.data.mentorUid == request.auth.uid;
+      allow delete: if isAuthed() && resource.data.mentorUid == request.auth.uid;
+
+      // Video-call signaling (WebRTC offer/answer/ICE) lives under the
+      // booking; only its two participants may touch it.
+      match /{sub}/{docId} {
+        allow read, write: if isAuthed()
+          && (get(/databases/$(database)/documents/mentorSlots/$(slotId)).data.mentorUid == request.auth.uid
+           || get(/databases/$(database)/documents/mentorSlots/$(slotId)).data.studentUid == request.auth.uid);
+      }
+    }
+
+    // Web-push tokens: each user manages only their own (backend reads via
+    // Admin SDK when sending notifications).
+    match /pushTokens/{uid} {
+      allow read, write: if isAuthed() && request.auth.uid == uid;
+    }
+
+    // ══════════════════════════════════════════════════
     //  BLOCK ALL OTHER COLLECTIONS
     // ══════════════════════════════════════════════════
     match /{document=**} {

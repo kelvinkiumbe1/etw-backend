@@ -1303,6 +1303,11 @@ app.get('/api/subscribe/me', requireAuth, async (req, res) => {
   }
 });
 
+// ── ETW UNIVERSITY (1-on-1 mentorship) ─────────────────────────────
+// Server-enforced booking (Pro-only, one session per month) + mentor
+// notifications (Web Push + email) + the 1-hour reminder sweep.
+require('./src/mentorship').mount(app, requireAuth, db);
+
 const port = process.env.PORT || 8080;
 app.listen(port, () => {
   console.log('etw-sync-backend listening on :' + port);
