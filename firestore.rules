@@ -190,9 +190,28 @@ service cloud.firestore {
     //  NOTE: deliberately NOT behind hasSub(). This doc holds the account +
     //  subscription mirror and broker status, and the paywall screen itself
     //  reads it — gating it would break the page that asks you to pay.
+    //  SERVER-OWNED FIELDS — the client may write this doc but NOT these keys.
+    //  syncTokens is a prepaid balance, i.e. money: a blanket
+    //  `allow write: request.auth.uid == uid` let any signed-in user set
+    //  syncTokens.balance to whatever they liked and sync for free. mt5Direct is
+    //  listed too because its `status` is what the token meter sweeps on, so a
+    //  client that could forge status:'connected' could also dodge the
+    //  depletion stop. Both are written only by the Admin SDK, which bypasses
+    //  rules — so denying the client costs the app nothing.
+    //  NOTE: `subscription` is intentionally NOT here. Access is decided by the
+    //  Firebase custom claim (see src/access.js), never by this doc, so the
+    //  mirror is cosmetic and the frontend still writes it.
+    function serverOwnedUserFields() {
+      return ['syncTokens', 'mt5Direct'];
+    }
     match /users/{uid} {
-      allow read:  if isAuthed() && (request.auth.uid == uid || isAdmin());
-      allow write: if isAuthed() && request.auth.uid == uid;
+      allow read:   if isAuthed() && (request.auth.uid == uid || isAdmin());
+      allow create: if isAuthed() && request.auth.uid == uid
+                    && !request.resource.data.keys().hasAny(serverOwnedUserFields());
+      allow update: if isAuthed() && request.auth.uid == uid
+                    && !request.resource.data.diff(resource.data).affectedKeys()
+                          .hasAny(serverOwnedUserFields());
+      allow delete: if false;
     }
 
     // ══════════════════════════════════════════════════
@@ -202,8 +221,17 @@ service cloud.firestore {
     //  The backend Admin SDK bypasses rules, so server sync still works.
     // ══════════════════════════════════════════════════
     //  Sub-collections carry journal content, so they ARE behind the paywall.
+    //  FIX 2 — `syncLedger` is excluded from the write grant the same way, and
+    //  for the same reason: it is the audit trail for a prepaid balance, so a
+    //  client that could write it could forge its own top-ups and make the
+    //  balance unauditable. Read stays allowed — the user is entitled to see
+    //  where their tokens went; only the Admin SDK may write it.
+    //  Firestore grants if ANY matching rule allows, so a restrictive rule added
+    //  alongside this one would be useless — the exclusion has to live here.
     match /users/{uid}/{collection}/{docId} {
-      allow read, write: if hasSub() && request.auth.uid == uid && collection != 'private';
+      allow read, write: if hasSub() && request.auth.uid == uid
+                         && !(collection in ['private', 'syncLedger']);
+      allow read: if isAuthed() && request.auth.uid == uid && collection == 'syncLedger';
       allow read: if hasSub() &&
         isMentorOf(uid) &&
         collection in ['trades', 'playbooks'];
@@ -423,6 +451,35 @@ service cloud.firestore {
       allow create, update: if isAuthed()
         && request.resource.data.studentUid == request.auth.uid
         && wid == request.resource.data.mentorUid + '_' + request.auth.uid;
+    }
+
+    // ETW SPACES: live group rooms hosted by mentors, open to EVERY active
+    // subscriber (Essential + Pro) — unlike 1-on-1 mentorship, which is Pro.
+    function canUseSpaces() {
+      return hasSub() || isMentorEmail();
+    }
+    match /mentorSpaces/{sid} {
+      allow read: if canUseSpaces();
+      allow create: if isAuthed() && isMentorEmail() && request.resource.data.hostUid == request.auth.uid;
+      allow update, delete: if isAuthed() && resource.data.hostUid == request.auth.uid;
+
+      // Participant cards: join under your own uid; the HOST may also edit
+      // anyone's card (that's how the mic is granted/revoked) and remove
+      // stale cards when ending the room.
+      match /participants/{puid} {
+        allow read: if canUseSpaces();
+        allow create: if canUseSpaces() && puid == request.auth.uid;
+        allow update, delete: if isAuthed()
+          && (puid == request.auth.uid
+           || get(/databases/$(database)/documents/mentorSpaces/$(sid)).data.hostUid == request.auth.uid);
+      }
+
+      // Mesh signaling (offers/answers/ICE) + room chat. Not sensitive —
+      // any subscriber in the room reads/writes; 'participants' is excluded
+      // so its stricter rules above can't be bypassed via this wildcard.
+      match /{sub}/{docId} {
+        allow read, write: if sub != 'participants' && canUseSpaces();
+      }
     }
 
     // ══════════════════════════════════════════════════

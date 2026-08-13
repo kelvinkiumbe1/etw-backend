@@ -40,6 +40,42 @@ const PRODUCTS = [
   { env: 'GUMROAD_PRODUCT_PRO',                 plan: 'pro',       cycle: null },
 ];
 
+// ── Auto-Sync token packs ──────────────────────────────────────────────────
+// These are NOT subscriptions: they buy a prepaid token balance that the sync
+// meter draws down (see src/tokens.js). Kept in a separate map from PRODUCTS so
+// a token purchase can never be mistaken for a plan grant — buying sync credit
+// must not unlock the journal.
+//
+// Configure as GUMROAD_TOKEN_PRODUCTS="permalink:tokens,permalink:tokens"
+//   e.g. GUMROAD_TOKEN_PRODUCTS=odqsfy:2500,olaaoaq:6500
+// The token count here is AUTHORITATIVE — never derive it from the amount paid.
+// Gumroad settles in the buyer's currency, so the same pack arrives as a
+// different number depending on where they are.
+function tokenProductMap() {
+  const out = {};
+  String(process.env.GUMROAD_TOKEN_PRODUCTS || '')
+    .split(',').map((s) => s.trim()).filter(Boolean)
+    .forEach((pair) => {
+      const i = pair.lastIndexOf(':');
+      if (i < 1) return;
+      const key = normalizeKey(pair.slice(0, i));
+      const n = Number(pair.slice(i + 1).trim());
+      if (key && Number.isFinite(n) && n > 0) out[key] = Math.trunc(n);
+    });
+  return out;
+}
+
+// Is this verified sale a token pack? Same id/permalink matching as matchSale.
+// Returns { tokens } or null.
+function matchTokenSale(sale) {
+  const map = tokenProductMap();
+  if (!Object.keys(map).length) return null;
+  const keys = [sale.product_id, sale.product_permalink, sale.permalink]
+    .filter(Boolean).map(normalizeKey);
+  for (const k of keys) if (map[k]) return { tokens: map[k] };
+  return null;
+}
+
 // Which plan/cycle does a verified sale belong to? Matched against BOTH the
 // product id and the permalink, so either works in the env var. The cycle comes
 // from the product itself when pinned (yearly products), otherwise from the
@@ -134,4 +170,4 @@ async function recentSales(days) {
   return sales;
 }
 
-module.exports = { configured, matchSale, getSale, normalizeKey, ensureResourceSubscriptions, listResourceSubscriptions, recentSales };
+module.exports = { configured, matchSale, matchTokenSale, tokenProductMap, getSale, normalizeKey, ensureResourceSubscriptions, listResourceSubscriptions, recentSales };

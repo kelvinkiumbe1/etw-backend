@@ -26,12 +26,25 @@ const gumroad = require('./src/gumroad');
 const mt5ea = require('./src/connectors/mt5ea');
 const email = require('./src/email');
 const access = require('./src/access');
+const tokens = require('./src/tokens');
 
 initFirebase();
 const db = admin.firestore();
 store.init(db);
 mt5.init();
 ctrader.init();
+// onDeplete is injected rather than required, so tokens.js does not have to
+// require mt5sync.js (which would be a cycle via store).
+tokens.init({
+  onDeplete: async (uid) => {
+    await mt5.stopSync(uid, { undeploy: true }).catch(() => {});
+    await mt5.setStatus(uid, { status: 'depleted', error: null }).catch(() => {});
+    console.log('[tokens] depleted -> undeployed and stopped sync for', uid);
+  },
+  onPause:  (uid, reason) => mt5.pause(uid, reason),
+  onResume: (uid) => mt5.resumeOne(uid),
+  onPull:   (uid) => mt5.pullOnce(uid),
+});
 
 const app = express();
 app.set('trust proxy', 1); // behind Render's proxy — needed for correct client IP in rate limiting
@@ -157,11 +170,112 @@ async function requirePro(req, res, next) {
 app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requireSub, async (req, res) => {
   const { login, password, server, platform, journalAccountId } = req.body || {};
   if (!login || !password || !server) return res.status(400).json({ error: 'login, password and server are required' });
-  await mt5.setStatus(req.uid, { status: 'connecting', platform: platform || 'mt5', login: String(login), server, error: null });
-  res.json({ ok: true, status: 'connecting' });
+
+  // Auto-Sync is METERED. Charge the connect fee first, inside a transaction,
+  // before MetaApi is touched — two concurrent connects would otherwise both
+  // pass a bare balance check and only one would be paid for. A short balance
+  // fails the request outright with 402; the journal surfaces `error` verbatim.
+  const accountKey = crypto.createHash('sha256')
+    .update(String(login) + '|' + String(server).toLowerCase()).digest('hex').slice(0, 32);
+  let charged = 0;
+  try {
+    charged = await tokens.chargeConnect(req.uid, {
+      accountKey,
+      note: 'History import — ' + server + ' / ' + login,
+    });
+    // charged === 0 means the fee was already paid for this account this month
+    // (MetaApi caps its add-account charge the same way), so the reconnect is
+    // free — but the meter still has to be re-anchored or the next sweep would
+    // bill every hour since the previous session ended.
+    if (charged === 0) await tokens.touchMeterAnchor(req.uid).catch(() => {});
+  } catch (e) {
+    if (e.code === 'insufficient_tokens') {
+      return res.status(402).json({
+        error: 'You need ' + e.needed + ' sync tokens to connect (that covers importing your history) — you have '
+             + e.balance + '. Top up under Brokers to continue.',
+        code: 'insufficient_tokens', balance: e.balance, needed: e.needed,
+      });
+    }
+    console.error('mt5 connect charge:', e.message);
+    return res.status(500).json({ error: 'Could not check your sync token balance. Please try again.' });
+  }
+
+  // Preserve a previously chosen mode across reconnects; default to the cheap
+  // one. Defaulting to 'live' would silently put every new user on the 3x rate.
+  let mode = 'daily';
+  try {
+    const prev = await db.collection('users').doc(req.uid).get();
+    mode = ((prev.exists && prev.data().mt5Direct && prev.data().mt5Direct.mode) || 'daily');
+  } catch (e) {}
+  await mt5.setStatus(req.uid, { status: 'connecting', platform: platform || 'mt5', login: String(login), server, error: null, accountKey, mode, journalAccountId: journalAccountId || '' });
+  res.json({ ok: true, status: 'connecting', tokensCharged: charged });
   mt5.startSync({ uid: req.uid, login: String(login), password, server, platform: platform || 'mt5', accountId: journalAccountId || '' })
-    .catch(async (e) => { console.error('mt5 startSync:', e.message); await mt5.setStatus(req.uid, { status: 'error', error: mt5.friendlyError(e) }).catch(() => {}); });
+    .then(async (r) => {
+      // Already deployed => no history backfill happened => MetaApi is not
+      // billing us for one, so give the fee back rather than pocketing it.
+      if (charged && r && r.wasDeployed) {
+        await tokens.refundConnect(req.uid, charged, {
+          accountKey, note: 'Account already connected — no history import needed',
+        }).catch(() => {});
+      }
+      // Daily mode imports the history once, then lets go. startSync always
+      // leaves a live connection behind, which in daily mode would bill the
+      // hourly rate for a service the user is not paying the hourly rate for.
+      if (mode === 'daily') {
+        await mt5.stopSync(req.uid, { undeploy: true }).catch(() => {});
+        await mt5.setStatus(req.uid, { status: 'connected', lastPullAt: Date.now() }).catch(() => {});
+      }
+    })
+    .catch(async (e) => {
+      console.error('mt5 startSync:', e.message);
+      // ALWAYS refund a failed connect. A mistyped investor password is by far
+      // the most common failure here, and burning the fee on a typo generates
+      // refund requests that cost more to handle than the tokens are worth.
+      if (charged) {
+        await tokens.refundConnect(req.uid, charged, {
+          accountKey, note: 'Connect failed — ' + (e.message || 'error').slice(0, 120),
+        }).catch(() => {});
+      }
+      await mt5.setStatus(req.uid, { status: 'error', error: mt5.friendlyError(e) }).catch(() => {});
+    });
 });
+// Switch between metered speeds. The client cannot write mt5Direct (Firestore
+// rules deny it, because status drives the meter), so the mode change has to
+// come through here.
+//   live  — connection held open, trades land in seconds, billed per hour
+//   daily — deploy/pull/undeploy once a day, trades land within a day, billed
+//           per pull at roughly a third of the cost
+app.post('/api/mt5-direct/mode', authLimiter, requireAuth, requireSub, async (req, res) => {
+  const mode = String((req.body && req.body.mode) || '').toLowerCase();
+  if (mode !== 'live' && mode !== 'daily') return res.status(400).json({ error: "mode must be 'live' or 'daily'" });
+  try {
+    const snap = await db.collection('users').doc(req.uid).get();
+    const d = (snap.exists && snap.data().mt5Direct) || {};
+    const was = d.mode || 'live';
+    if (was === mode) return res.json({ ok: true, mode, unchanged: true });
+
+    await mt5.setStatus(req.uid, { mode });
+
+    // Only reshape the connection if one exists. Switching while disconnected
+    // just records the preference for the next connect.
+    if (d.status === 'connected' || d.status === 'paused') {
+      if (mode === 'daily') {
+        // Undeploy now: staying deployed is exactly the cost the user is opting
+        // out of. The scheduler picks them up for the next pull.
+        await mt5.stopSync(req.uid, { undeploy: true }).catch(() => {});
+        await mt5.setStatus(req.uid, { status: 'connected', pausedReason: null });
+      } else if (!tokens.marketClosed()) {
+        await tokens.touchMeterAnchor(req.uid).catch(() => {});   // don't bill the idle gap
+        mt5.resumeOne(req.uid).catch((e) => console.error('mode->live resume:', e.message));
+      }
+    }
+    res.json({ ok: true, mode });
+  } catch (e) {
+    console.error('mt5 mode:', e.message);
+    res.status(500).json({ error: 'Could not change sync mode.' });
+  }
+});
+
 app.post('/api/mt5-direct/disconnect', requireAuth, async (req, res) => {
   try { await mt5.stopSync(req.uid, { forget: !!(req.body && req.body.forget) }); } catch (e) { console.warn(e.message); }
   await mt5.setStatus(req.uid, { status: 'disconnected' }).catch(() => {});
@@ -946,6 +1060,20 @@ async function settleGumroadSale(saleId, ping) {
   // refunding an old charge must not kill a period paid for by a newer one.
   if (granted && refunded) {
     const kind = sale.chargedback ? 'chargeback' : 'refund';
+
+    // Token packs aren't access, they're balance — so claw the tokens back
+    // rather than revoking a subscription this sale never granted. Anything
+    // already spent on sync is unrecoverable (we can't un-import trades), so
+    // clawback takes only what's still unspent and logs the shortfall.
+    if (granted.kind === 'tokens') {
+      const recovered = await tokens.clawback(granted.uid, granted.tokens || 0, {
+        ref: saleId, note: 'Gumroad ' + kind,
+      }).catch((e) => { console.error('[gumroad] token clawback:', e.message); return 0; });
+      await ref.set({ status: 'REFUNDED', reason: kind, refundedAt: Date.now(), recovered }, { merge: true });
+      console.log(`[gumroad] ${kind} on token sale ${saleId}: recovered ${recovered}/${granted.tokens} from ${granted.uid}`);
+      return { ok: true, recovered };
+    }
+
     const snap = await db.collection('users').doc(granted.uid).get();
     const sub = (snap.exists && snap.data().subscription) || {};
     const backsAccess = sub.saleId === saleId && sub.status === 'active';
@@ -961,6 +1089,45 @@ async function settleGumroadSale(saleId, ping) {
     await ref.set({ status: 'IGNORED', reason: sale.refunded ? 'refunded' : 'chargedback', at: Date.now() }, { merge: true });
     return { ok: false, reason: 'refunded' };
   }
+  // Who is this for? The checkout URL stamps the buyer's Firebase uid on and
+  // Gumroad echoes it back in url_params. Fall back to matching the purchase
+  // email, for anyone who bought from the Gumroad page directly. Shared by the
+  // plan and token paths below.
+  async function resolveUid() {
+    const rawUid = String((ping && ping.url_params && ping.url_params.uid) || '').trim();
+    if (/^[A-Za-z0-9]{10,128}$/.test(rawUid)) {
+      try { return (await admin.auth().getUser(rawUid)).uid; } catch (e) { /* stale uid — try email */ }
+    }
+    if (sale.email) {
+      try { return (await admin.auth().getUserByEmail(String(sale.email).trim())).uid; } catch (e) { /* no account */ }
+    }
+    return null;
+  }
+
+  // ── Auto-Sync token pack? ─────────────────────────────────────────────────
+  // Checked BEFORE matchSale so a token product can never fall through into the
+  // plan path and hand someone a free subscription.
+  const tokenSale = gumroad.matchTokenSale(sale);
+  if (tokenSale) {
+    const tuid = await resolveUid();
+    if (!tuid) {
+      await ref.set({ status: 'UNMATCHED', kind: 'tokens', email: sale.email || null, tokens: tokenSale.tokens, at: Date.now() }, { merge: true });
+      console.warn('[gumroad] paid token pack with no matching account:', saleId, sale.email || '(no email)');
+      return { ok: false, reason: 'no matching account' };
+    }
+    // Claim the sale id and credit in that order: the ledger entry carries the
+    // sale id, so a retry of this ping finds `granted` above and stops.
+    await ref.set({
+      status: 'GRANTED', kind: 'tokens', uid: tuid, tokens: tokenSale.tokens,
+      email: sale.email || null, productId: sale.product_id || null, at: Date.now(),
+    }, { merge: true });
+    const balance = await tokens.credit(tuid, tokenSale.tokens, {
+      kind: 'purchase', ref: saleId, note: 'Gumroad token pack',
+    });
+    console.log(`[gumroad] +${tokenSale.tokens} sync tokens -> ${tuid} (sale ${saleId}, balance ${balance})`);
+    return { ok: true, uid: tuid, tokens: tokenSale.tokens, balance };
+  }
+
   const matched = gumroad.matchSale(sale);
   if (!matched) {
     await ref.set({ status: 'IGNORED', reason: 'unknown product', productId: sale.product_id || null, at: Date.now() }, { merge: true });
@@ -968,17 +1135,7 @@ async function settleGumroadSale(saleId, ping) {
   }
   const { plan, cycle } = matched;
 
-  // Who is this for? payment.html stamps the buyer's Firebase uid onto the
-  // checkout URL and Gumroad echoes it back in url_params. Fall back to matching
-  // the purchase email, for anyone who bought from the Gumroad page directly.
-  let uid = null;
-  const rawUid = String((ping && ping.url_params && ping.url_params.uid) || '').trim();
-  if (/^[A-Za-z0-9]{10,128}$/.test(rawUid)) {
-    try { uid = (await admin.auth().getUser(rawUid)).uid; } catch (e) { /* stale uid — try email */ }
-  }
-  if (!uid && sale.email) {
-    try { uid = (await admin.auth().getUserByEmail(String(sale.email).trim())).uid; } catch (e) { /* no account under that email */ }
-  }
+  let uid = await resolveUid();
   if (!uid) {
     // Real money, no matching account. Keep the sale so support can attach it by
     // hand (/api/admin/grant), instead of the payment silently vanishing.
@@ -1258,6 +1415,25 @@ app.post('/api/gumroad/ping', webhookLimiter, async (req, res) => {
   }
 });
 
+// Admin: grant or adjust a balance by hand — comps, support fixes, settling a
+// parked payment. Signed, audited through the same ledger as everything else.
+app.post('/api/admin/tokens', authLimiter, requireAdmin, async (req, res) => {
+  try {
+    const { uid, email: who, tokens: n, note } = req.body || {};
+    let target = uid;
+    if (!target && who) { const u = await admin.auth().getUserByEmail(String(who).trim()); target = u.uid; }
+    const amt = Math.trunc(Number(n));
+    if (!target || !Number.isFinite(amt) || amt === 0) return res.status(400).json({ error: 'uid (or email) and a non-zero tokens amount are required' });
+    const after = amt > 0
+      ? await tokens.credit(target, amt, { kind: 'adjust', ref: 'admin', note: note || 'Admin grant' })
+      : await tokens.charge(target, -amt, { kind: 'adjust', ref: 'admin', note: note || 'Admin deduction' });
+    res.json({ ok: true, uid: target, balance: after });
+  } catch (e) {
+    console.error('admin tokens:', e.message);
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
 // "What access do I have?" — also auto-grants comp accounts on first check.
 app.get('/api/subscribe/me', requireAuth, async (req, res) => {
   try {
@@ -1308,10 +1484,49 @@ app.get('/api/subscribe/me', requireAuth, async (req, res) => {
 // notifications (Web Push + email) + the 1-hour reminder sweep.
 require('./src/mentorship').mount(app, requireAuth, db);
 
+// ── Dormant MetaApi account pruning ────────────────────────────────
+// An idle registered account costs $0.00105/hr ($0.77/mo); deleting it stops
+// that, but re-adding costs $2.10 — so the threshold has to sit past the
+// ~3-month break-even or we lose money on everyone who returns. The user's
+// connect fee (800 tokens ~ KSh 400) covers the re-add when they do.
+async function pruneDormantAccounts() {
+  const days = Math.max(30, Number(process.env.SYNC_PRUNE_AFTER_DAYS || 90));
+  try {
+    const dormant = await mt5.findDormant(days);
+    if (!dormant.length) return { pruned: 0 };
+    let pruned = 0;
+    for (const { uid, lastSeen } of dormant) {
+      try {
+        await mt5.removeAccount(uid);
+        // Must follow the delete: MetaApi will bill the add fee again, so the
+        // user's connect fee has to be chargeable again too.
+        await tokens.clearConnectCharge(uid);
+        pruned++;
+        console.log(`[prune] removed MetaApi account for ${uid} (idle since ${new Date(lastSeen).toISOString().slice(0, 10)})`);
+      } catch (e) { console.error('[prune] failed for', uid, '-', e.message); }
+    }
+    console.log(`[prune] ${pruned}/${dormant.length} dormant accounts removed (threshold ${days}d)`);
+    return { pruned };
+  } catch (e) { console.error('[prune]', e.message); return { pruned: 0, error: e.message }; }
+}
+
 const port = process.env.PORT || 8080;
 app.listen(port, () => {
   console.log('etw-sync-backend listening on :' + port);
   mt5.resumeAll();
+  // Auto-Sync meter. Bills whole hours only, so the sub-hourly passes are almost
+  // all no-ops; frequent passes just keep the anchor honest across restarts.
+  tokens.startMeter();
+  // Daily sweep. Nothing is time-critical here — an account idle for 90 days
+  // can wait another few hours — so it runs well after boot and then daily.
+  setTimeout(() => { pruneDormantAccounts().catch(() => {}); }, 5 * 60 * 1000);
+  const pruneTimer = setInterval(() => { pruneDormantAccounts().catch(() => {}); }, 24 * 3600 * 1000);
+  if (pruneTimer.unref) pruneTimer.unref();
+  if (!Object.keys(gumroad.tokenProductMap()).length) {
+    console.warn('[tokens] GUMROAD_TOKEN_PRODUCTS unset — token packs cannot be credited');
+  } else {
+    console.log('[tokens] token packs:', JSON.stringify(gumroad.tokenProductMap()));
+  }
   // Refunds/disputes are only delivered via Gumroad's Resource Subscriptions
   // API — the Settings → Ping URL fires on sales alone. Registration is
   // idempotent, so doing it on every boot is safe.
