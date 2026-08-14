@@ -35,6 +35,10 @@ async function writeTrades(trades) {
     for (const t of trades.slice(i, i + 400)) { batch.set(db.collection('trades').doc(), t); n++; }
     await batch.commit();
   }
+  // Single choke point for every connector, so risk interventions are evaluated
+  // here rather than in each one. Fire-and-forget: a warning must never be able
+  // to fail an import.
+  try { require('./aiGuard').onTradesWritten(trades); } catch (e) { /* guard is optional */ }
   return n;
 }
 

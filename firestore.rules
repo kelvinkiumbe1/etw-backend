@@ -201,8 +201,11 @@ service cloud.firestore {
     //  NOTE: `subscription` is intentionally NOT here. Access is decided by the
     //  Firebase custom claim (see src/access.js), never by this doc, so the
     //  mirror is cosmetic and the frontend still writes it.
+    //  aiGuard is the dedupe memo for server-pushed risk warnings. It is written
+    //  only by the Admin SDK; if a client could write it, a trader could forge a
+    //  "already warned" record and switch their own loss-limit alerts off.
     function serverOwnedUserFields() {
-      return ['syncTokens', 'mt5Direct'];
+      return ['syncTokens', 'mt5Direct', 'aiGuard'];
     }
     match /users/{uid} {
       allow read:   if isAuthed() && (request.auth.uid == uid || isAdmin());

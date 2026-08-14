@@ -27,10 +27,12 @@ const mt5ea = require('./src/connectors/mt5ea');
 const email = require('./src/email');
 const access = require('./src/access');
 const tokens = require('./src/tokens');
+const aiGuard = require('./src/aiGuard');
 
 initFirebase();
 const db = admin.firestore();
 store.init(db);
+aiGuard.init(db);   // risk interventions, pushed the moment synced trades land
 mt5.init();
 ctrader.init();
 // onDeplete is injected rather than required, so tokens.js does not have to
