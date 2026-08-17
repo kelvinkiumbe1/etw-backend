@@ -364,7 +364,10 @@ app.post('/api/ai/groq', aiLimiter, requireAuth, requirePro, async (req, res) =>
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
       body: JSON.stringify({
-        model: body.model || 'llama-3.3-70b-versatile',
+        // Keep this in sync with window.ETW_AI_MODELS.main in journal.html — a stale
+        // default here silently retires the AI for any caller that omits a model.
+        // (llama-3.3-70b-versatile was shut down by Groq on 2026-08-16.)
+        model: body.model || 'openai/gpt-oss-120b',
         messages: body.messages,
         temperature: typeof body.temperature === 'number' ? body.temperature : 0.7,
         max_tokens: Math.min(Number(body.max_tokens) || 1024, 8192),
