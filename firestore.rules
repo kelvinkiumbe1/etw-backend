@@ -205,7 +205,10 @@ service cloud.firestore {
     //  only by the Admin SDK; if a client could write it, a trader could forge a
     //  "already warned" record and switch their own loss-limit alerts off.
     function serverOwnedUserFields() {
-      return ['syncTokens', 'mt5Direct', 'aiGuard'];
+      // btQuota is the backtest session-creation counter — Admin SDK only,
+      // for the same reason as syncTokens: a client that could write it
+      // could reset its own monthly limit.
+      return ['syncTokens', 'mt5Direct', 'aiGuard', 'btQuota'];
     }
     match /users/{uid} {
       allow read:   if isAuthed() && (request.auth.uid == uid || isAdmin());

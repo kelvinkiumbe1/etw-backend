@@ -1489,6 +1489,12 @@ app.get('/api/subscribe/me', requireAuth, async (req, res) => {
 // notifications (Web Push + email) + the 1-hour reminder sweep.
 require('./src/mentorship').mount(app, requireAuth, db);
 
+// ── Backtest session quota (server-enforced) ─────────────────
+// Essential: 3 sessions/cycle, Pro: 10/cycle. Deletes never decrement the
+// counter. Reuses access.accessFor() so plan/expiresAt resolve exactly the
+// same way they do for every other subscription-gated route.
+require('./src/backtestQuota').mount(app, requireAuth, db, access);
+
 // ── Dormant MetaApi account pruning ────────────────────────────────
 // An idle registered account costs $0.00105/hr ($0.77/mo); deleting it stops
 // that, but re-adding costs $2.10 — so the threshold has to sit past the
