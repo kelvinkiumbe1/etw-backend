@@ -140,8 +140,10 @@ async function startSync({ uid, login, password, server, accountId, platform, ac
     platform: platform === 'mt4' ? 'mt4' : 'mt5',
     source, account, written: await store.existingTickets(uid, source, accountId || '', accountKey),
   };
-  await _connectAndSync(sync);
-  return { ok: true, wasDeployed, metaApiAccountId: account.id };
+  await setStatus(uid, { metaApiAccountId: account.id, status: 'connected', mode: 'daily' }, accountKey);
+  const fresh = await pullOnce(uid, accountKey);
+  await setStatus(uid, { status: 'connected', mode: 'daily', lastPullAt: Date.now() }, accountKey);
+  return { ok: true, wasDeployed, fresh, metaApiAccountId: account.id };
 }
 
 // forget:   undeploy AND delete the MetaApi account (user disconnected for good)

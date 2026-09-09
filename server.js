@@ -45,7 +45,7 @@ tokens.init({
   },
   onPause:  (uid, reason) => mt5.pause(uid, reason),
   onResume: (uid) => mt5.resumeOne(uid),
-  onPull:   (uid) => mt5.pullOnce(uid),
+  onPull:   (uid, accountKey) => mt5.pullOnce(uid, accountKey),
 });
 
 const app = express();
@@ -191,14 +191,13 @@ app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requireSub, async 
     return res.status(500).json({ error: 'Could not reserve an MT5 account slot. Please try again.' });
   }
 
-  // Direct sync is no longer metered; live mode is the only mode because the
-  // account remains connected and new closed trades arrive automatically.
-  let mode = 'live';
+  // Direct sync runs as a daily pull so MetaApi accounts are not held deployed.
+  let mode = 'daily';
   try {
     const prev = await db.collection('users').doc(req.uid).get();
     mode = ((prev.exists && prev.data().mt5DirectAccounts &&
       prev.data().mt5DirectAccounts[accountKey] &&
-      prev.data().mt5DirectAccounts[accountKey].mode) || 'live');
+      prev.data().mt5DirectAccounts[accountKey].mode) || 'daily');
   } catch (e) {}
   await mt5.setStatus(req.uid, { status: 'connecting', platform: platform || 'mt5', login: String(login), server, error: null, accountKey, mode, journalAccountId: journalAccountId || '' }, accountKey);
   res.json({ ok: true, status: 'connecting', accountKey, accountLimit });
@@ -211,21 +210,17 @@ app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requireSub, async 
       await mt5.setStatus(req.uid, { status: 'error', error: mt5.friendlyError(e) }, accountKey).catch(() => {});
     });
 });
-// Switch between metered speeds. The client cannot write mt5Direct (Firestore
-// rules deny it, because status drives the meter), so the mode change has to
-// come through here.
-//   live  — connection held open, trades land in seconds, billed per hour
-//   daily — deploy/pull/undeploy once a day, trades land within a day, billed
-//           per pull at roughly a third of the cost
+// Daily mode is the only supported direct-sync mode. This endpoint remains for
+// old clients that may still send a mode preference.
 app.post('/api/mt5-direct/mode', authLimiter, requireAuth, requireSub, async (req, res) => {
   const mode = String((req.body && req.body.mode) || '').toLowerCase();
-  if (mode !== 'live') return res.status(400).json({ error: "mode must be 'live'" });
+  if (mode !== 'daily') return res.status(400).json({ error: "only daily sync is supported" });
   const accountKey = String((req.body && req.body.accountKey) || 'legacy');
   try {
     const snap = await db.collection('users').doc(req.uid).get();
     const data = snap.exists ? snap.data() : {};
     const d = (data.mt5DirectAccounts && data.mt5DirectAccounts[accountKey]) || data.mt5Direct || {};
-    const was = d.mode || 'live';
+    const was = d.mode || 'daily';
     if (was === mode) return res.json({ ok: true, mode, unchanged: true });
 
     await mt5.setStatus(req.uid, { mode }, accountKey);
@@ -1487,7 +1482,8 @@ async function pruneDormantAccounts() {
 const port = process.env.PORT || 8080;
 app.listen(port, () => {
   console.log('etw-sync-backend listening on :' + port);
-  mt5.resumeAll();
+tokens.startMeter();
+mt5.resumeAll();
   // Refunds/disputes are only delivered via Gumroad's Resource Subscriptions
   // API — the Settings → Ping URL fires on sales alone. Registration is
   // idempotent, so doing it on every boot is safe.

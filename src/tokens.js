@@ -294,36 +294,20 @@ async function meterUser(uid) {
   return outcome;
 }
 
-// Daily mode: charge per pull, then pull. Charging FIRST means a user who can't
-// afford the pull is depleted rather than getting a free one, and the pull is
-// only attempted once the tokens are actually taken.
-async function pullDue(uid, mt5) {
-  const r = rates();
+// Daily mode: pull once per day. Direct MT5 sync is included with the
+// subscription, so this scheduler must never debit sync tokens.
+async function pullDue(uid, mt5, accountKey) {
   const last = Number(mt5.lastPullAt || 0);
   const everyMs = Math.max(1, Number(process.env.SYNC_PULL_EVERY_HOURS || 24)) * HOUR_MS;
   if (Date.now() - last < everyMs) return { skipped: 'too_soon' };
 
-  try {
-    await charge(uid, r.tokensPerPull, {
-      kind: 'pull', ref: mt5.metaApiAccountId || null, note: 'Daily sync pull',
-    });
-  } catch (e) {
-    if (e.code === 'insufficient_tokens') {
-      if (onDeplete) await onDeplete(uid).catch(() => {});
-      return { depleted: true };
-    }
-    throw e;
-  }
   if (onPull) {
-    try { await onPull(uid); }
+    try { await onPull(uid, accountKey); }
     catch (e) {
-      // The pull failed after we took the tokens — give them back. A broker-side
-      // outage is not something the user should pay for.
-      await refundConnect(uid, r.tokensPerPull, { note: 'Pull failed — ' + (e.message || 'error').slice(0, 120) }).catch(() => {});
       return { error: e.message };
     }
   }
-  return { pulled: true, debited: r.tokensPerPull };
+  return { pulled: true };
 }
 
 async function meterTick() {
@@ -348,16 +332,21 @@ async function meterTick() {
       }
     }
 
-    const snap = await store.db.collection('users').where('mt5Direct.status', '==', 'connected').get();
+    const snap = await store.db.collection('users').get();
     for (const doc of snap.docs) {
       const uid = doc.id;
-      const mt5 = doc.data().mt5Direct || {};
-      const mode = mt5.mode || 'live';
+      const data = doc.data();
+      const accounts = Object.assign({}, data.mt5DirectAccounts || {});
+      if (!Object.keys(accounts).length && data.mt5Direct) accounts.legacy = data.mt5Direct;
+      for (const accountKey of Object.keys(accounts)) {
+        const mt5 = accounts[accountKey] || {};
+        if (mt5.status !== 'connected') continue;
+      const mode = mt5.mode || 'daily';
       try {
         // ── 2. Daily mode: pull if due, regardless of market hours (a pull
         //      after the close still collects Friday's trades). ─────────────
         if (mode === 'daily') {
-          const o = await pullDue(uid, mt5);
+          const o = await pullDue(uid, mt5, accountKey);
           swept++;
           if (o.debited) debited += o.debited;
           if (o.pulled) pulled++;
@@ -365,17 +354,14 @@ async function meterTick() {
           continue;
         }
 
-        // ── 3. Live mode: bill the hours, then pause if the market shut ────
-        const o = await meterUser(uid);
-        swept++;
-        if (o.debited) debited += o.debited;
-        if (o.depleted) { depleted++; continue; }        // already undeployed
-
-        if (closed && onPause) {
-          try { await onPause(uid, 'market_closed'); paused++; }
-          catch (e) { console.error('[tokens] pause failed for', uid, '-', e.message); }
+        // Live mode is retired; normalize legacy records to daily behavior.
+        if (mode === 'live') {
+          await store.db.collection('users').doc(uid).set({ mt5DirectAccounts: {
+            [accountKey]: { mode: 'daily' }
+          }}, { merge: true });
         }
       } catch (e) { console.error('[tokens] meter failed for', uid, '-', e.message); }
+      }
     }
   } catch (e) { console.error('[tokens] meterTick:', e.message); }
 
