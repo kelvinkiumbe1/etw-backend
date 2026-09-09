@@ -35,11 +35,23 @@ async function setStatus(uid, patch, accountKey) {
   }, { merge: true });
 }
 
-async function reserveAccount(uid, accountKey, patch, limit) {
+async function reserveAccount(uid, accountKey, patch, limit, periodKey) {
   const ref = store.db.collection('users').doc(uid);
   return store.db.runTransaction(async (tx) => {
     const snap = await tx.get(ref);
     const data = snap.exists ? snap.data() : {};
+    const usage = data.mt5DirectPeriod || {};
+    const period = usage.periodKey === periodKey
+      ? usage
+      : { periodKey, accountKeys: [] };
+    const usedKeys = Array.isArray(period.accountKeys) ? period.accountKeys : [];
+    if (!usedKeys.includes(accountKey) && usedKeys.length >= limit) {
+      const e = new Error('Your plan allows ' + limit + ' new MT5 account' + (limit === 1 ? '' : 's') + ' per subscription period.');
+      e.code = 'mt5_period_limit';
+      e.limit = limit;
+      e.used = usedKeys.length;
+      throw e;
+    }
     const accounts = Object.assign({}, data[STATUS_KEY + 'Accounts'] || {});
     if (!accounts[accountKey] && data[STATUS_KEY] && data[STATUS_KEY].metaApiAccountId) {
       accounts.legacy = data[STATUS_KEY];
@@ -57,7 +69,12 @@ async function reserveAccount(uid, accountKey, patch, limit) {
     }
     const next = Object.assign({}, accounts[accountKey] || {}, patch, { accountKey, updatedAt: Date.now() });
     accounts[accountKey] = next;
-    tx.set(ref, { [STATUS_KEY + 'Accounts']: accounts, [STATUS_KEY]: next }, { merge: true });
+    const nextUsedKeys = usedKeys.includes(accountKey) ? usedKeys : usedKeys.concat(accountKey);
+    tx.set(ref, {
+      [STATUS_KEY + 'Accounts']: accounts,
+      [STATUS_KEY]: next,
+      mt5DirectPeriod: { periodKey, accountKeys: nextUsedKeys, updatedAt: Date.now() },
+    }, { merge: true });
     return next;
   });
 }

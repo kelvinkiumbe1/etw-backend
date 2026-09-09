@@ -178,14 +178,15 @@ app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requireSub, async 
   const accountKey = crypto.createHash('sha256')
     .update(String(platform || 'mt5') + '|' + String(login) + '|' + String(server).toLowerCase()).digest('hex').slice(0, 32);
   const accountLimit = access.isPro(req.access) ? 3 : 1;
+  const periodKey = String(req.access.expiresAt || req.access.periodStart || req.access.plan || 'active');
   try {
     await mt5.reserveAccount(req.uid, accountKey, {
       status: 'connecting', platform: platform || 'mt5', login: String(login), server,
       error: null, journalAccountId: journalAccountId || '',
-    }, accountLimit);
+    }, accountLimit, periodKey);
   } catch (e) {
-    if (e.code === 'mt5_account_limit') {
-      return res.status(409).json({ error: e.message, code: e.code, limit: e.limit, linked: e.linked });
+    if (e.code === 'mt5_account_limit' || e.code === 'mt5_period_limit') {
+      return res.status(409).json({ error: e.message, code: e.code, limit: e.limit, linked: e.linked, used: e.used });
     }
     console.error('mt5 account reservation:', e.message);
     return res.status(500).json({ error: 'Could not reserve an MT5 account slot. Please try again.' });

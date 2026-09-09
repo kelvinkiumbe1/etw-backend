@@ -18,6 +18,9 @@ Status + counters are written to `users/{uid}.mt5Direct` and per-account records
 `metaApiAccountId`, `error`) which the frontend watches live. MT5 Direct is included
 with active plans: Essential users may link one account and Pro users may link three.
 It does not consume sync tokens or require a separate MT5 payment.
+Each Essential subscription period permits one distinct linked account and each
+Pro period permits three. Disconnecting an account does not restore that
+period's slot; the allowance resets when the subscription period changes.
 
 ---
 
