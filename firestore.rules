@@ -208,7 +208,7 @@ service cloud.firestore {
       // btQuota is the backtest session-creation counter — Admin SDK only,
       // for the same reason as syncTokens: a client that could write it
       // could reset its own monthly limit.
-      return ['syncTokens', 'mt5Direct', 'aiGuard', 'btQuota'];
+      return ['syncTokens', 'mt5Direct', 'mt5DirectAccounts', 'aiGuard', 'btQuota'];
     }
     match /users/{uid} {
       allow read:   if isAuthed() && (request.auth.uid == uid || isAdmin());

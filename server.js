@@ -173,72 +173,42 @@ app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requireSub, async 
   const { login, password, server, platform, journalAccountId } = req.body || {};
   if (!login || !password || !server) return res.status(400).json({ error: 'login, password and server are required' });
 
-  // Auto-Sync is METERED. Charge the connect fee first, inside a transaction,
-  // before MetaApi is touched — two concurrent connects would otherwise both
-  // pass a bare balance check and only one would be paid for. A short balance
-  // fails the request outright with 402; the journal surfaces `error` verbatim.
+  // MT5 Direct is included with both paid plans. The only server-side gate is
+  // the number of linked broker accounts: Essential gets one, Pro gets three.
   const accountKey = crypto.createHash('sha256')
-    .update(String(login) + '|' + String(server).toLowerCase()).digest('hex').slice(0, 32);
-  let charged = 0;
+    .update(String(platform || 'mt5') + '|' + String(login) + '|' + String(server).toLowerCase()).digest('hex').slice(0, 32);
+  const accountLimit = access.isPro(req.access) ? 3 : 1;
   try {
-    charged = await tokens.chargeConnect(req.uid, {
-      accountKey,
-      note: 'History import — ' + server + ' / ' + login,
-    });
-    // charged === 0 means the fee was already paid for this account this month
-    // (MetaApi caps its add-account charge the same way), so the reconnect is
-    // free — but the meter still has to be re-anchored or the next sweep would
-    // bill every hour since the previous session ended.
-    if (charged === 0) await tokens.touchMeterAnchor(req.uid).catch(() => {});
+    await mt5.reserveAccount(req.uid, accountKey, {
+      status: 'connecting', platform: platform || 'mt5', login: String(login), server,
+      error: null, journalAccountId: journalAccountId || '',
+    }, accountLimit);
   } catch (e) {
-    if (e.code === 'insufficient_tokens') {
-      return res.status(402).json({
-        error: 'You need ' + e.needed + ' sync tokens to connect (that covers importing your history) — you have '
-             + e.balance + '. Top up under Brokers to continue.',
-        code: 'insufficient_tokens', balance: e.balance, needed: e.needed,
-      });
+    if (e.code === 'mt5_account_limit') {
+      return res.status(409).json({ error: e.message, code: e.code, limit: e.limit, linked: e.linked });
     }
-    console.error('mt5 connect charge:', e.message);
-    return res.status(500).json({ error: 'Could not check your sync token balance. Please try again.' });
+    console.error('mt5 account reservation:', e.message);
+    return res.status(500).json({ error: 'Could not reserve an MT5 account slot. Please try again.' });
   }
 
-  // Preserve a previously chosen mode across reconnects; default to the cheap
-  // one. Defaulting to 'live' would silently put every new user on the 3x rate.
-  let mode = 'daily';
+  // Direct sync is no longer metered; live mode is the only mode because the
+  // account remains connected and new closed trades arrive automatically.
+  let mode = 'live';
   try {
     const prev = await db.collection('users').doc(req.uid).get();
-    mode = ((prev.exists && prev.data().mt5Direct && prev.data().mt5Direct.mode) || 'daily');
+    mode = ((prev.exists && prev.data().mt5DirectAccounts &&
+      prev.data().mt5DirectAccounts[accountKey] &&
+      prev.data().mt5DirectAccounts[accountKey].mode) || 'live');
   } catch (e) {}
-  await mt5.setStatus(req.uid, { status: 'connecting', platform: platform || 'mt5', login: String(login), server, error: null, accountKey, mode, journalAccountId: journalAccountId || '' });
-  res.json({ ok: true, status: 'connecting', tokensCharged: charged });
-  mt5.startSync({ uid: req.uid, login: String(login), password, server, platform: platform || 'mt5', accountId: journalAccountId || '' })
+  await mt5.setStatus(req.uid, { status: 'connecting', platform: platform || 'mt5', login: String(login), server, error: null, accountKey, mode, journalAccountId: journalAccountId || '' }, accountKey);
+  res.json({ ok: true, status: 'connecting', accountKey, accountLimit });
+  mt5.startSync({ uid: req.uid, login: String(login), password, server, platform: platform || 'mt5', accountId: journalAccountId || '', accountKey })
     .then(async (r) => {
-      // Already deployed => no history backfill happened => MetaApi is not
-      // billing us for one, so give the fee back rather than pocketing it.
-      if (charged && r && r.wasDeployed) {
-        await tokens.refundConnect(req.uid, charged, {
-          accountKey, note: 'Account already connected — no history import needed',
-        }).catch(() => {});
-      }
-      // Daily mode imports the history once, then lets go. startSync always
-      // leaves a live connection behind, which in daily mode would bill the
-      // hourly rate for a service the user is not paying the hourly rate for.
-      if (mode === 'daily') {
-        await mt5.stopSync(req.uid, { undeploy: true }).catch(() => {});
-        await mt5.setStatus(req.uid, { status: 'connected', lastPullAt: Date.now() }).catch(() => {});
-      }
+      await mt5.setStatus(req.uid, { status: 'connected' }, accountKey).catch(() => {});
     })
     .catch(async (e) => {
       console.error('mt5 startSync:', e.message);
-      // ALWAYS refund a failed connect. A mistyped investor password is by far
-      // the most common failure here, and burning the fee on a typo generates
-      // refund requests that cost more to handle than the tokens are worth.
-      if (charged) {
-        await tokens.refundConnect(req.uid, charged, {
-          accountKey, note: 'Connect failed — ' + (e.message || 'error').slice(0, 120),
-        }).catch(() => {});
-      }
-      await mt5.setStatus(req.uid, { status: 'error', error: mt5.friendlyError(e) }).catch(() => {});
+      await mt5.setStatus(req.uid, { status: 'error', error: mt5.friendlyError(e) }, accountKey).catch(() => {});
     });
 });
 // Switch between metered speeds. The client cannot write mt5Direct (Firestore
@@ -249,28 +219,20 @@ app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requireSub, async 
 //           per pull at roughly a third of the cost
 app.post('/api/mt5-direct/mode', authLimiter, requireAuth, requireSub, async (req, res) => {
   const mode = String((req.body && req.body.mode) || '').toLowerCase();
-  if (mode !== 'live' && mode !== 'daily') return res.status(400).json({ error: "mode must be 'live' or 'daily'" });
+  if (mode !== 'live') return res.status(400).json({ error: "mode must be 'live'" });
+  const accountKey = String((req.body && req.body.accountKey) || 'legacy');
   try {
     const snap = await db.collection('users').doc(req.uid).get();
-    const d = (snap.exists && snap.data().mt5Direct) || {};
+    const data = snap.exists ? snap.data() : {};
+    const d = (data.mt5DirectAccounts && data.mt5DirectAccounts[accountKey]) || data.mt5Direct || {};
     const was = d.mode || 'live';
     if (was === mode) return res.json({ ok: true, mode, unchanged: true });
 
-    await mt5.setStatus(req.uid, { mode });
+    await mt5.setStatus(req.uid, { mode }, accountKey);
 
     // Only reshape the connection if one exists. Switching while disconnected
     // just records the preference for the next connect.
-    if (d.status === 'connected' || d.status === 'paused') {
-      if (mode === 'daily') {
-        // Undeploy now: staying deployed is exactly the cost the user is opting
-        // out of. The scheduler picks them up for the next pull.
-        await mt5.stopSync(req.uid, { undeploy: true }).catch(() => {});
-        await mt5.setStatus(req.uid, { status: 'connected', pausedReason: null });
-      } else if (!tokens.marketClosed()) {
-        await tokens.touchMeterAnchor(req.uid).catch(() => {});   // don't bill the idle gap
-        mt5.resumeOne(req.uid).catch((e) => console.error('mode->live resume:', e.message));
-      }
-    }
+    if (d.status === 'paused') mt5.resumeOne(req.uid, accountKey).catch((e) => console.error('mode resume:', e.message));
     res.json({ ok: true, mode });
   } catch (e) {
     console.error('mt5 mode:', e.message);
@@ -279,8 +241,9 @@ app.post('/api/mt5-direct/mode', authLimiter, requireAuth, requireSub, async (re
 });
 
 app.post('/api/mt5-direct/disconnect', requireAuth, async (req, res) => {
-  try { await mt5.stopSync(req.uid, { forget: !!(req.body && req.body.forget) }); } catch (e) { console.warn(e.message); }
-  await mt5.setStatus(req.uid, { status: 'disconnected' }).catch(() => {});
+  const accountKey = String((req.body && req.body.accountKey) || 'legacy');
+  try { await mt5.stopSync(req.uid, { forget: !!(req.body && req.body.forget), accountKey }); } catch (e) { console.warn(e.message); }
+  await mt5.setStatus(req.uid, { status: 'disconnected' }, accountKey).catch(() => {});
   res.json({ ok: true });
 });
 
@@ -1525,19 +1488,6 @@ const port = process.env.PORT || 8080;
 app.listen(port, () => {
   console.log('etw-sync-backend listening on :' + port);
   mt5.resumeAll();
-  // Auto-Sync meter. Bills whole hours only, so the sub-hourly passes are almost
-  // all no-ops; frequent passes just keep the anchor honest across restarts.
-  tokens.startMeter();
-  // Daily sweep. Nothing is time-critical here — an account idle for 90 days
-  // can wait another few hours — so it runs well after boot and then daily.
-  setTimeout(() => { pruneDormantAccounts().catch(() => {}); }, 5 * 60 * 1000);
-  const pruneTimer = setInterval(() => { pruneDormantAccounts().catch(() => {}); }, 24 * 3600 * 1000);
-  if (pruneTimer.unref) pruneTimer.unref();
-  if (!Object.keys(gumroad.tokenProductMap()).length) {
-    console.warn('[tokens] GUMROAD_TOKEN_PRODUCTS unset — token packs cannot be credited');
-  } else {
-    console.log('[tokens] token packs:', JSON.stringify(gumroad.tokenProductMap()));
-  }
   // Refunds/disputes are only delivered via Gumroad's Resource Subscriptions
   // API — the Settings → Ping URL fires on sales alone. Registration is
   // idempotent, so doing it on every boot is safe.

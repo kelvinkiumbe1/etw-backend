@@ -13,8 +13,11 @@ It exposes exactly what the ETW frontend already calls:
 | `POST` | `/api/mt5-direct/connect` | `{ login, password, server, journalAccountId }` | `Authorization: Bearer <Firebase idToken>` |
 | `POST` | `/api/mt5-direct/disconnect` | `{ forget }` | same |
 
-Status + counters are written to `users/{uid}.mt5Direct` (`status`, `historyImported`,
-`lastSyncAt`, `metaApiAccountId`, `error`) which the frontend watches live.
+Status + counters are written to `users/{uid}.mt5Direct` and per-account records in
+`users/{uid}.mt5DirectAccounts` (`status`, `historyImported`, `lastSyncAt`,
+`metaApiAccountId`, `error`) which the frontend watches live. MT5 Direct is included
+with active plans: Essential users may link one account and Pro users may link three.
+It does not consume sync tokens or require a separate MT5 payment.
 
 ---
 

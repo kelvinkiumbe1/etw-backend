@@ -16,13 +16,14 @@ async function setStatus(uid, key, patch) {
 // Query by uid only (single-field — no composite index needed) and filter in memory.
 // When accountId is given, dedup is scoped to that account so the same broker trades
 // can sync into a different profile.
-async function existingTickets(uid, source, accountId) {
+async function existingTickets(uid, source, accountId, accountKey) {
   const snap = await db.collection('trades').where('uid', '==', uid).get();
   const s = new Set();
   snap.forEach(d => {
     const x = d.data();
     if (x.source !== source || x.ticket == null) return;
     if (accountId !== undefined && (x.accountId || '') !== (accountId || '')) return;
+    if (accountKey !== undefined && x.mt5AccountKey && x.mt5AccountKey !== accountKey) return;
     s.add(String(x.ticket));
   });
   return s;

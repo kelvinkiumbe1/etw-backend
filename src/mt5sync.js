@@ -2,7 +2,8 @@
 // Deploys the account, then imports closed trades using an RPC connection
 // (getDealsByTimeRange) — more reliable than the streaming historyStorage — and
 // re-polls periodically for new trades. Status is written to
-// users/{uid}.mt5Direct so the frontend can watch it live.
+// users/{uid}.mt5Direct and users/{uid}.mt5DirectAccounts so the frontend can
+// watch each linked account live.
 //
 // SDK: targets metaapi.cloud-sdk v27. Version-sensitive calls are flagged "SDK:".
 
@@ -12,7 +13,7 @@ const store = require('./store');
 
 const STATUS_KEY = 'mt5Direct';
 let api = null;
-const active = new Map(); // uid -> { account, rpc, timer, written, ... }
+const active = new Map(); // uid:accountKey -> { account, rpc, timer, written, ... }
 
 function init() {
   const token = process.env.METAAPI_TOKEN;
@@ -20,7 +21,46 @@ function init() {
   api = new MetaApi(token, process.env.METAAPI_REGION ? { region: process.env.METAAPI_REGION } : {});
 }
 
-const setStatus = (uid, patch) => store.setStatus(uid, STATUS_KEY, patch);
+function activeKey(uid, accountKey) {
+  return String(uid) + ':' + String(accountKey || 'legacy');
+}
+
+async function setStatus(uid, patch, accountKey) {
+  if (!accountKey) return store.setStatus(uid, STATUS_KEY, patch);
+  const ref = store.db.collection('users').doc(uid);
+  const current = Object.assign({ updatedAt: Date.now(), accountKey }, patch);
+  await ref.set({
+    [STATUS_KEY + 'Accounts']: { [accountKey]: current },
+    [STATUS_KEY]: current,
+  }, { merge: true });
+}
+
+async function reserveAccount(uid, accountKey, patch, limit) {
+  const ref = store.db.collection('users').doc(uid);
+  return store.db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const data = snap.exists ? snap.data() : {};
+    const accounts = Object.assign({}, data[STATUS_KEY + 'Accounts'] || {});
+    if (!accounts[accountKey] && data[STATUS_KEY] && data[STATUS_KEY].metaApiAccountId) {
+      accounts.legacy = data[STATUS_KEY];
+    }
+    const linked = Object.keys(accounts).filter((key) => {
+      const item = accounts[key] || {};
+      return item.metaApiAccountId || ['connecting', 'connected', 'paused'].includes(item.status);
+    });
+    if (!accounts[accountKey] && linked.length >= limit) {
+      const e = new Error('Your plan allows ' + limit + ' linked MT5 account' + (limit === 1 ? '' : 's') + '.');
+      e.code = 'mt5_account_limit';
+      e.limit = limit;
+      e.linked = linked.length;
+      throw e;
+    }
+    const next = Object.assign({}, accounts[accountKey] || {}, patch, { accountKey, updatedAt: Date.now() });
+    accounts[accountKey] = next;
+    tx.set(ref, { [STATUS_KEY + 'Accounts']: accounts, [STATUS_KEY]: next }, { merge: true });
+    return next;
+  });
+}
 
 async function findOrCreateAccount({ uid, login, password, server, platform }) {
   try {
@@ -58,13 +98,13 @@ async function fetchDeals(rpc) {
 async function syncOnce(sync) {
   const deals = await fetchDeals(sync.rpc);
   const trades = buildTradesFromDeals(deals, { uid: sync.uid, accountId: sync.accountId })
-    .map(t => ({ ...t, source: sync.source }));
+    .map(t => ({ ...t, source: sync.source, mt5AccountKey: sync.accountKey }));
   const fresh = trades.filter(t => !sync.written.has(String(t.ticket)));
   if (fresh.length) { await store.writeTrades(fresh); fresh.forEach(t => sync.written.add(String(t.ticket))); }
   await setStatus(sync.uid, {
     status: 'connected', platform: sync.platform, login: String(sync.login || ''), server: sync.server || '',
     metaApiAccountId: sync.account.id, historyImported: sync.written.size, lastSyncAt: Date.now(), error: null,
-  });
+  }, sync.accountKey);
   console.log(`mt5 sync (uid ${sync.uid}): ${deals.length} deals, +${fresh.length} new trades, ${sync.written.size} total`);
   return fresh.length;
 }
@@ -80,11 +120,12 @@ async function _connectAndSync(sync) {
   console.log('mt5: RPC synchronized, importing deals');
   await syncOnce(sync);
   sync.timer = setInterval(() => { syncOnce(sync).catch(e => console.error('mt5 poll error:', e.message)); }, 60000);
-  active.set(sync.uid, sync);
+  active.set(activeKey(sync.uid, sync.accountKey), sync);
 }
 
-async function startSync({ uid, login, password, server, accountId, platform }) {
-  await stopSync(uid, { forget: false }).catch(() => {});
+async function startSync({ uid, login, password, server, accountId, platform, accountKey }) {
+  accountKey = accountKey || 'legacy';
+  await stopSync(uid, { forget: false, accountKey }).catch(() => {});
   console.log(`mt5 startSync: uid ${uid}, login ${login}, server ${server}`);
   const account = await findOrCreateAccount({ uid, login, password, server, platform });
   // Was this account ALREADY deployed? If so no history backfill is about to
@@ -95,8 +136,9 @@ async function startSync({ uid, login, password, server, accountId, platform }) 
   const wasDeployed = String(account.state || '').toUpperCase() === 'DEPLOYED';
   const source = (platform === 'mt4' ? 'mt4' : 'mt5') + '-direct';
   const sync = {
-    uid, login, server, accountId: accountId || '', platform: platform === 'mt4' ? 'mt4' : 'mt5',
-    source, account, written: await store.existingTickets(uid, source),
+    uid, login, server, accountId: accountId || '', accountKey,
+    platform: platform === 'mt4' ? 'mt4' : 'mt5',
+    source, account, written: await store.existingTickets(uid, source, accountId || '', accountKey),
   };
   await _connectAndSync(sync);
   return { ok: true, wasDeployed, metaApiAccountId: account.id };
@@ -105,50 +147,54 @@ async function startSync({ uid, login, password, server, accountId, platform }) 
 // forget:   undeploy AND delete the MetaApi account (user disconnected for good)
 // undeploy: undeploy but keep the account (token balance ran dry — they'll be
 //           back, and keeping it spares them a fresh history import)
-async function stopSync(uid, { forget, undeploy } = {}) {
-  const sync = active.get(uid);
+async function stopSync(uid, { forget, undeploy, accountKey } = {}) {
+  const key = activeKey(uid, accountKey);
+  const sync = active.get(key);
   if (!sync) return;
   if (sync.timer) clearInterval(sync.timer);
   try { if (sync.rpc) await sync.rpc.close(); } catch (e) {}
   if (forget) {
     try { await sync.account.undeploy(); } catch (e) {}
     try { await sync.account.remove(); } catch (e) {}
-    await store.setStatus(uid, STATUS_KEY, { metaApiAccountId: null });
+    await setStatus(uid, { metaApiAccountId: null, status: 'disconnected' }, sync.accountKey);
   } else if (undeploy) {
     // The point of stopping on depletion: an account left deployed keeps
     // billing us for a user who has stopped paying.
     try { await sync.account.undeploy(); } catch (e) { console.warn('mt5 undeploy:', e.message); }
   }
-  active.delete(uid);
+  active.delete(key);
 }
 
 // Rebuild a sync context from Firestore alone. The MetaApi account keeps the
 // broker credentials once created, so re-attaching never needs the password
 // again — which is what makes weekend pause/resume and daily pulls possible
 // without storing anything sensitive on our side.
-async function _syncFromDoc(uid, d) {
+async function _syncFromDoc(uid, d, accountKey) {
   if (!d || !d.metaApiAccountId) throw new Error('No MetaApi account on file for this user.');
   const account = await api.metatraderAccountApi.getAccount(d.metaApiAccountId); // SDK:
   const platform = d.platform === 'mt4' ? 'mt4' : 'mt5';
   const source = platform + '-direct';
   return {
     uid, login: d.login, server: d.server, accountId: d.journalAccountId || '',
-    platform, source, account, written: await store.existingTickets(uid, source),
+    accountKey: accountKey || 'legacy',
+    platform, source, account, written: await store.existingTickets(uid, source, d.journalAccountId || '', accountKey || 'legacy'),
   };
 }
 
-async function _readStatus(uid) {
+async function _readStatus(uid, accountKey) {
   const snap = await store.db.collection('users').doc(uid).get();
-  return (snap.exists && snap.data().mt5Direct) || null;
+  if (!snap.exists) return null;
+  const data = snap.data();
+  return (data[STATUS_KEY + 'Accounts'] && data[STATUS_KEY + 'Accounts'][accountKey]) || data[STATUS_KEY] || null;
 }
 
 // ── Daily mode: one deploy → pull → undeploy cycle ─────────────────────────
 // MetaApi charges $0.118125 per deployment but only $0.00105/hr while
 // undeployed, so a once-a-day round trip costs roughly a third of holding the
 // connection open — at the price of trades landing within a day, not a minute.
-async function pullOnce(uid) {
-  const d = await _readStatus(uid);
-  const sync = await _syncFromDoc(uid, d);
+async function pullOnce(uid, accountKey) {
+  const d = await _readStatus(uid, accountKey || 'legacy');
+  const sync = await _syncFromDoc(uid, d, accountKey);
   await sync.account.deploy();
   await sync.account.waitConnected();
   sync.rpc = sync.account.getRPCConnection();
@@ -162,7 +208,7 @@ async function pullOnce(uid) {
     // account deployed and quietly billing at the live rate.
     try { await sync.account.undeploy(); } catch (e) { console.warn('mt5 pull undeploy:', e.message); }
   }
-  await setStatus(uid, { lastPullAt: Date.now() });
+  await setStatus(uid, { lastPullAt: Date.now() }, sync.accountKey);
   console.log(`mt5 daily pull (uid ${uid}): +${fresh} trades`);
   return fresh;
 }
@@ -171,27 +217,27 @@ async function pullOnce(uid) {
 // No trade can close while the market is shut, so ~206 hours a month were being
 // billed for nothing. Pausing undeploys (19x cheaper) and keeps the account, so
 // resuming costs one deployment rather than a fresh history import.
-async function pause(uid, reason) {
-  await stopSync(uid, { undeploy: true }).catch(() => {});
+async function pause(uid, reason, accountKey) {
+  await stopSync(uid, { undeploy: true, accountKey }).catch(() => {});
   // Not in the active map (e.g. after a restart)? Undeploy via the API anyway.
-  if (!active.has(uid)) {
+  if (!active.has(activeKey(uid, accountKey))) {
     try {
-      const d = await _readStatus(uid);
+      const d = await _readStatus(uid, accountKey || 'legacy');
       if (d && d.metaApiAccountId) {
         const account = await api.metatraderAccountApi.getAccount(d.metaApiAccountId);
         await account.undeploy();
       }
     } catch (e) { console.warn('mt5 pause undeploy:', e.message); }
   }
-  await setStatus(uid, { status: 'paused', pausedReason: reason || 'market_closed', error: null });
+  await setStatus(uid, { status: 'paused', pausedReason: reason || 'market_closed', error: null }, accountKey);
   console.log(`mt5 paused (${reason}) for`, uid);
 }
 
-async function resumeOne(uid) {
-  const d = await _readStatus(uid);
-  const sync = await _syncFromDoc(uid, d);
+async function resumeOne(uid, accountKey) {
+  const d = await _readStatus(uid, accountKey || 'legacy');
+  const sync = await _syncFromDoc(uid, d, accountKey);
   await _connectAndSync(sync);
-  await setStatus(uid, { pausedReason: null });
+  await setStatus(uid, { pausedReason: null }, sync.accountKey);
   console.log('mt5 resumed for', uid);
   return true;
 }
@@ -201,17 +247,22 @@ async function resumeOne(uid) {
 // daily-mode and paused users are intentionally left undeployed.
 async function resumeAll() {
   try {
-    const snap = await store.db.collection('users').where('mt5Direct.status', '==', 'connected').get();
+    const snap = await store.db.collection('users').get();
     for (const doc of snap.docs) {
-      const d = doc.data().mt5Direct || {};
-      if (!d.metaApiAccountId) continue;
-      if ((d.mode || 'live') !== 'live') continue;   // daily mode: the scheduler handles it
       const uid = doc.id;
-      try {
-        const sync = await _syncFromDoc(uid, d);
-        await _connectAndSync(sync);
-        console.log('resumed MT sync for', uid);
-      } catch (e) { console.error('resume failed for', uid, '-', e.message); }
+      const data = doc.data();
+      const accounts = Object.assign({}, data[STATUS_KEY + 'Accounts'] || {});
+      if (!Object.keys(accounts).length && data[STATUS_KEY]) accounts.legacy = data[STATUS_KEY];
+      for (const accountKey of Object.keys(accounts)) {
+        const d = accounts[accountKey];
+        if (!d || d.status !== 'connected' || !d.metaApiAccountId) continue;
+        if ((d.mode || 'live') !== 'live') continue;
+        try {
+          const sync = await _syncFromDoc(uid, d, accountKey);
+          await _connectAndSync(sync);
+          console.log('resumed MT sync for', uid, accountKey);
+        } catch (e) { console.error('resume failed for', uid, accountKey, '-', e.message); }
+      }
     }
   } catch (e) { console.error('resumeAll failed:', e.message); }
 }
@@ -264,5 +315,6 @@ function friendlyError(e) {
 module.exports = {
   init, startSync, stopSync, resumeAll, setStatus, friendlyError,
   pullOnce, pause, resumeOne, findDormant, removeAccount,
-  isActive: (uid) => active.has(uid),
+  reserveAccount,
+  isActive: (uid, accountKey) => active.has(activeKey(uid, accountKey)),
 };
