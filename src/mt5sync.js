@@ -75,7 +75,28 @@ async function reserveAccount(uid, accountKey, patch, limit, periodKey) {
       [STATUS_KEY]: next,
       mt5DirectPeriod: { periodKey, accountKeys: nextUsedKeys, updatedAt: Date.now() },
     }, { merge: true });
-    return next;
+    return { ...next, reservedNewPeriodSlot: !usedKeys.includes(accountKey) };
+  });
+}
+
+async function releaseNewPeriodSlot(uid, accountKey, periodKey) {
+  const ref = store.db.collection('users').doc(uid);
+  await store.db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (!snap.exists) return;
+    const data = snap.data() || {};
+    const usage = data.mt5DirectPeriod || {};
+    if (usage.periodKey !== periodKey || !Array.isArray(usage.accountKeys) ||
+        !usage.accountKeys.includes(accountKey)) return;
+
+    const accounts = Object.assign({}, data[STATUS_KEY + 'Accounts'] || {});
+    const account = accounts[accountKey] || {};
+    accounts[accountKey] = { ...account, metaApiAccountId: null, status: 'error' };
+    const nextKeys = usage.accountKeys.filter((key) => key !== accountKey);
+    tx.set(ref, {
+      [STATUS_KEY + 'Accounts']: accounts,
+      mt5DirectPeriod: { periodKey, accountKeys: nextKeys, updatedAt: Date.now() },
+    }, { merge: true });
   });
 }
 
@@ -334,6 +355,6 @@ function friendlyError(e) {
 module.exports = {
   init, startSync, stopSync, resumeAll, setStatus, friendlyError,
   pullOnce, pause, resumeOne, findDormant, removeAccount,
-  reserveAccount,
+  reserveAccount, releaseNewPeriodSlot,
   isActive: (uid, accountKey) => active.has(activeKey(uid, accountKey)),
 };

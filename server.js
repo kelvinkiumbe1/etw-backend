@@ -179,8 +179,9 @@ app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requireSub, async 
     .update(String(platform || 'mt5') + '|' + String(login) + '|' + String(server).toLowerCase()).digest('hex').slice(0, 32);
   const accountLimit = access.isPro(req.access) ? 3 : 1;
   const periodKey = String(req.access.expiresAt || req.access.periodStart || req.access.plan || 'active');
+  let reservation;
   try {
-    await mt5.reserveAccount(req.uid, accountKey, {
+    reservation = await mt5.reserveAccount(req.uid, accountKey, {
       status: 'connecting', platform: platform || 'mt5', login: String(login), server,
       error: null, journalAccountId: journalAccountId || '',
     }, accountLimit, periodKey);
@@ -209,6 +210,11 @@ app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requireSub, async 
     .catch(async (e) => {
       console.error('mt5 startSync:', e.message);
       await mt5.setStatus(req.uid, { status: 'error', error: mt5.friendlyError(e) }, accountKey).catch(() => {});
+      if (reservation && reservation.reservedNewPeriodSlot) {
+        await mt5.releaseNewPeriodSlot(req.uid, accountKey, periodKey).catch((releaseError) => {
+          console.error('mt5 reservation rollback:', releaseError.message);
+        });
+      }
     });
 });
 // Daily mode is the only supported direct-sync mode. This endpoint remains for
