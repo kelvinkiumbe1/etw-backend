@@ -789,33 +789,69 @@ const PLAN_DAYS = { monthly: 31, quarterly: 92, yearly: 366 };
 // Defined once in src/access.js so the gates and the grant path agree.
 const isComp = access.isComp;
 
+// Serialise claim edits per uid (grants, bonus credits, clawbacks) so two events
+// landing together can't read the same expiresAt and overwrite each other.
+const _uidLocks = new Map();
+function withUidLock(uid, fn) {
+  const prev = _uidLocks.get(uid) || Promise.resolve();
+  const run = prev.catch(() => {}).then(fn);
+  const tail = run.catch(() => {});
+  _uidLocks.set(uid, tail);
+  tail.then(() => { if (_uidLocks.get(uid) === tail) _uidLocks.delete(uid); });
+  return run;
+}
+
 // The ONE place access is granted: sets the custom claim (source of truth for
 // Firestore rules + the frontend) and mirrors it to users/{uid}.subscription.
 // keepExpiresAt preserves an existing period (used by mid-cycle upgrades).
 async function grantSubscription(uid, plan, cycle, extra = {}, keepExpiresAt = 0) {
-  const days = PLAN_DAYS[cycle] || 31;
-  const expiresAt = Number(keepExpiresAt) > Date.now()
-    ? Number(keepExpiresAt)
-    : Date.now() + days * 24 * 60 * 60 * 1000;
-  const user = await admin.auth().getUser(uid);
-  const claims = Object.assign({}, user.customClaims || {}, { subscribed: true, plan, expiresAt });
-  await admin.auth().setCustomUserClaims(uid, claims);
+  // Serialised per uid with the referral bonus credits/clawbacks below, so two
+  // writers can never read the same claim and overwrite each other's expiresAt.
+  return withUidLock(uid, async () => {
+    const days = PLAN_DAYS[cycle] || 31;
+    const now = Date.now();
+    const DAY = 24 * 60 * 60 * 1000;
 
-  // startedAt = when this subscriber first paid. Preserved across renewals and
-  // upgrades so the Settings card can show a real "Subscribed on" date instead
-  // of the most recent charge.
-  let startedAt = Date.now();
-  try {
-    const prev = await db.collection('users').doc(uid).get();
-    const prevStart = prev.exists && prev.data().subscription && prev.data().subscription.startedAt;
-    if (prevStart) startedAt = Number(prevStart);
-  } catch (e) { /* first-time subscriber, or read failed — today is correct enough */ }
+    // startedAt = when this subscriber first paid. Preserved across renewals and
+    // upgrades so the Settings card can show a real "Subscribed on" date instead
+    // of the most recent charge. The same read gives us the referral bonus state.
+    let startedAt = now, ref = {};
+    try {
+      const prev = await db.collection('users').doc(uid).get();
+      const prevStart = prev.exists && prev.data().subscription && prev.data().subscription.startedAt;
+      if (prevStart) startedAt = Number(prevStart);
+      ref = (prev.exists && prev.data().referral) || {};
+    } catch (e) { /* first-time subscriber, or read failed — today is correct enough */ }
 
-  await db.collection('users').doc(uid).set(
-    { subscription: { plan, cycle, status: 'active', expiresAt, startedAt, updatedAt: Date.now(), ...extra } },
-    { merge: true }
-  );
-  return expiresAt;
+    const user = await admin.auth().getUser(uid);
+    const prevClaims = user.customClaims || {};
+    let expiresAt, bonusMs = Math.max(0, Number(ref.bonusMs || 0)), bankUsed = 0;
+
+    if (Number(keepExpiresAt) > now) {
+      expiresAt = Number(keepExpiresAt);
+    } else {
+      expiresAt = now + days * DAY;
+      // Referral bonus days already sitting on the current period are carried
+      // over (a renewal must not wipe them), capped at what is actually unused.
+      const carry = Math.min(bonusMs, Math.max(0, Number(prevClaims.expiresAt || 0) - now));
+      // Banked bonus days (earned while not subscribed) — or a negative balance
+      // left by a clawback — are settled on this new period.
+      bankUsed = Math.trunc(Number(ref.bankedDays || 0));
+      expiresAt = Math.max(now + DAY, expiresAt + carry + bankUsed * DAY);
+      bonusMs = carry + Math.max(0, bankUsed) * DAY;
+    }
+
+    const claims = Object.assign({}, prevClaims, { subscribed: true, plan, expiresAt });
+    await admin.auth().setCustomUserClaims(uid, claims);
+
+    const doc = { subscription: { plan, cycle, status: 'active', expiresAt, startedAt, updatedAt: Date.now(), ...extra } };
+    if (Number(keepExpiresAt) <= now) {
+      doc.referral = { bonusMs };
+      if (bankUsed) doc.referral.bankedDays = admin.firestore.FieldValue.increment(-bankUsed);
+    }
+    await db.collection('users').doc(uid).set(doc, { merge: true });
+    return expiresAt;
+  });
 }
 
 // The inverse, for refunds and chargebacks: strips the claim and marks the
@@ -1052,6 +1088,8 @@ async function settleGumroadSale(saleId, ping) {
       console.log('[gumroad] revoked access for', granted.uid, 'after', kind, 'of sale', saleId);
     }
     await ref.set({ status: 'REFUNDED', reason: kind, refundedAt: Date.now(), revoked: backsAccess }, { merge: true });
+    await referralOnRefund(granted.uid, saleId)
+      .catch((e) => console.error('[referral] clawback for sale', saleId + ':', e.message));
     return { ok: true, revoked: backsAccess };
   }
 
@@ -1135,6 +1173,9 @@ async function settleGumroadSale(saleId, ping) {
   // a Brevo hiccup must never turn a successful payment into an error.
   sendReceiptEmail(uid, { plan, cycle, kind: 'new', amount, currency }, expiresAt).catch(() => {});
   syncBrevoContact(uid, { force: true }).catch(() => {});
+  // Referral reward for whoever referred this buyer (verified sale only).
+  await referralOnPaidSale({ uid, plan, cycle, saleId, saleEmail: sale.email || '' })
+    .catch((e) => console.error('[referral] reward for sale', saleId + ':', e.message));
   return { ok: true, uid, plan, cycle, expiresAt };
 }
 
@@ -1163,6 +1204,273 @@ async function reconcileGumroadSales(days = 3) {
   }
   return { checked, healed };
 }
+
+// ══════════════════════════════════════════════════════════════
+//  REFERRAL PROGRAM — server-owned end to end
+// ══════════════════════════════════════════════════════════════
+// Rewards (to the REFERRER, when the person they referred pays):
+//   Essential plan ............ 7 bonus days
+//   Pro plan .................. 15 bonus days
+//   Quarterly or yearly cycle . +5 bonus days on top of the above
+//
+// Why nothing here can be gamed from a browser:
+//  * Codes, referral links and rewards live in referralCodes/{code},
+//    referrals/{referredUid} and users/{uid}.referral / .referredBy — all
+//    written ONLY here (Admin SDK). Firestore rules deny every client write.
+//  * A reward is paid only from settleGumroadSale(), i.e. after Gumroad itself
+//    confirms a real, unrefunded sale. Admin grants and comp accounts never pay
+//    out. Bonus days go onto the referrer's custom claim (the real access gate).
+//  * One referrer per user, forever. You can only be referred BEFORE you have
+//    ever paid, never by yourself (same uid or same normalised email), and a
+//    sale paid from the referrer's own email does not count.
+//  * Rewards are tracked per sale and capped per referred user at the value of
+//    the best plan they bought: renewals add nothing, an upgrade (Essential →
+//    Pro, monthly → yearly) only tops up the difference, and every award is
+//    idempotent on the sale id, so Gumroad retries/reconciles cannot double pay.
+//  * A refund or chargeback of the paying sale claws the bonus back.
+const REFERRAL_BASE_DAYS = { essential: 7, pro: 15 };
+const REFERRAL_LONG_CYCLE_BONUS = 5;              // quarterly or yearly
+const REFERRAL_DAY_MS = 24 * 60 * 60 * 1000;
+const REFERRAL_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';   // no 0/O/1/I
+const referralLimiter      = rl(15 * 60 * 1000, 60, 'Too many requests. Please wait a few minutes.');
+const referralClaimLimiter = rl(60 * 60 * 1000, 10, 'Too many referral attempts. Please try again later.');
+
+function referralDaysFor(plan, cycle) {
+  const base = REFERRAL_BASE_DAYS[String(plan || '').toLowerCase()] || 0;
+  if (!base) return 0;
+  const c = String(cycle || '').toLowerCase();
+  return base + (c === 'quarterly' || c === 'yearly' ? REFERRAL_LONG_CYCLE_BONUS : 0);
+}
+
+// Gmail ignores dots and +tags — normalise so "a.b+x@gmail.com" == "ab@gmail.com".
+function normEmail(e) {
+  let s = String(e || '').trim().toLowerCase();
+  const at = s.lastIndexOf('@'); if (at < 1) return s;
+  let local = s.slice(0, at), dom = s.slice(at + 1);
+  local = local.split('+')[0];
+  if (dom === 'gmail.com' || dom === 'googlemail.com') { local = local.replace(/\./g, ''); dom = 'gmail.com'; }
+  return local + '@' + dom;
+}
+function maskEmail(e) {
+  const s = String(e || ''); const at = s.indexOf('@');
+  if (at < 1) return 'New trader';
+  return s.slice(0, Math.min(2, at)) + '•••' + s.slice(at);
+}
+function referralCodeOk(c) { return /^[A-HJ-NP-Z2-9]{8}$/.test(c); }
+function newReferralCode() {
+  let s = ''; for (let i = 0; i < 8; i++) s += REFERRAL_ALPHABET[crypto.randomInt(REFERRAL_ALPHABET.length)];
+  return s;
+}
+
+async function getOrCreateReferralCode(uid) {
+  const userRef = db.collection('users').doc(uid);
+  const snap = await userRef.get();
+  const existing = snap.exists && snap.data().referral && snap.data().referral.code;
+  if (existing && referralCodeOk(existing)) return existing;
+  for (let i = 0; i < 6; i++) {
+    const code = newReferralCode();
+    const ok = await db.runTransaction(async (tx) => {
+      const cRef = db.collection('referralCodes').doc(code);
+      const [c, u] = await Promise.all([tx.get(cRef), tx.get(userRef)]);
+      const cur = u.exists && u.data().referral && u.data().referral.code;
+      if (cur) return cur;                      // another request created it first
+      if (c.exists) return null;                // collision — try a new code
+      tx.set(cRef, { uid, createdAt: Date.now() });
+      tx.set(userRef, { referral: { code, createdAt: Date.now() } }, { merge: true });
+      return code;
+    });
+    if (ok) return ok;
+  }
+  throw new Error('Could not create a referral code, please retry.');
+}
+
+// Has this account EVER paid (or been granted) access? Then it can't be referred.
+async function hasEverBeenCustomer(uid, userRecord) {
+  const c = (userRecord && userRecord.customClaims) || {};
+  if (c.subscribed) return true;
+  const u = await db.collection('users').doc(uid).get();
+  const sub = (u.exists && u.data().subscription) || {};
+  if (sub.startedAt || sub.saleId || sub.provider || sub.comp || sub.status === 'active' || sub.status === 'revoked') return true;
+  const sales = await db.collection('gumroadSales').where('uid', '==', uid).limit(5).get();
+  return sales.docs.some((d) => ['GRANTED', 'REFUNDED'].includes(d.data().status));
+}
+
+// Add (days > 0) or remove (days < 0) bonus time on a user's access.
+// Active subscriber → moves the claim's expiresAt. Otherwise the days are banked
+// and grantSubscription() adds them to the next period they pay for.
+async function adjustReferralBonus(uid, days, why) {
+  if (!days) return { applied: 0, banked: 0 };
+  return withUidLock(uid, async () => {
+    const user = await admin.auth().getUser(uid);
+    if (isComp(user.email)) return { applied: 0, banked: 0, comp: true };
+    const ref = db.collection('users').doc(uid);
+    const snap = await ref.get();
+    const r = (snap.exists && snap.data().referral) || {};
+    const c = user.customClaims || {};
+    const now = Date.now();
+    const deltaMs = days * REFERRAL_DAY_MS;
+    const earned = Math.max(0, Number(r.earnedDays || 0) + days);
+
+    if (c.subscribed && Number(c.expiresAt) > now) {
+      const expiresAt = Math.max(now, Number(c.expiresAt) + deltaMs);
+      await admin.auth().setCustomUserClaims(uid, Object.assign({}, c, { expiresAt }));
+      const bonusMs = Math.max(0, Number(r.bonusMs || 0) + deltaMs);
+      await ref.set({
+        subscription: { expiresAt, updatedAt: now },
+        referral: { bonusMs, earnedDays: earned, lastBonusAt: now },
+      }, { merge: true });
+      console.log(`[referral] ${days > 0 ? '+' : ''}${days}d on ${uid} (${why}) → ${ymd(expiresAt)}`);
+      return { applied: days, banked: 0, expiresAt };
+    }
+    // Not active right now: bank it. A clawback may take the bank below zero —
+    // that debt comes off the next paid period, so a refund can't keep free days.
+    const banked = Number(r.bankedDays || 0) + days;
+    await ref.set({ referral: { bankedDays: banked, earnedDays: earned, lastBonusAt: now } }, { merge: true });
+    console.log(`[referral] ${days > 0 ? 'banked +' : 'bank '}${days}d for ${uid} (${why}) → ${banked}d banked`);
+    return { applied: 0, banked: days };
+  });
+}
+
+// Called after settleGumroadSale() has granted a PLAN sale. Never throws into
+// the payment path — a referral hiccup must not turn a payment into an error.
+async function referralOnPaidSale({ uid, plan, cycle, saleId, saleEmail }) {
+  const ref = db.collection('referrals').doc(uid);
+  const pre = await ref.get();
+  if (!pre.exists) return null;
+  const referrerUid = pre.data().referrerUid;
+  if (!referrerUid || referrerUid === uid) return null;
+
+  let referrer;
+  try { referrer = await admin.auth().getUser(referrerUid); } catch (e) { return null; }
+  const selfPaid = saleEmail && normEmail(saleEmail) === normEmail(referrer.email);
+  const target = referralDaysFor(plan, cycle);
+
+  let award = null;
+  await db.runTransaction(async (tx) => {
+    const s = await tx.get(ref);
+    if (!s.exists) return;
+    const d = s.data();
+    const awards = Array.isArray(d.awards) ? d.awards : [];
+    if (awards.some((a) => a.saleId === saleId)) return;          // already handled (retry/reconcile)
+    if (selfPaid) {
+      tx.update(ref, { awards: awards.concat([{ saleId, days: 0, plan, cycle, at: Date.now(), blocked: 'self-purchase' }]) });
+      return;
+    }
+    const already = Math.max(0, Number(d.rewardedDays || 0));
+    const days = target - already;                                 // renewals → 0, upgrades → top-up
+    if (days <= 0) return;
+    award = { saleId, days, plan, cycle, at: Date.now(), reversed: false };
+    tx.update(ref, {
+      status: 'rewarded', rewardedDays: already + days, awards: awards.concat([award]),
+      plan, cycle, rewardedAt: Date.now(),
+    });
+  });
+  if (!award) return null;
+  try {
+    const out = await adjustReferralBonus(referrerUid, award.days, 'referral sale ' + saleId);
+    return { referrerUid, days: award.days, ...out };
+  } catch (e) {
+    // Recorded but not credited — flag it so support can settle it by hand.
+    await ref.set({ creditError: { saleId, message: e.message, at: Date.now() } }, { merge: true }).catch(() => {});
+    throw e;
+  }
+}
+
+// Refund/chargeback of a sale that earned a referral bonus → take it back.
+async function referralOnRefund(uid, saleId) {
+  const ref = db.collection('referrals').doc(uid);
+  let take = null;
+  await db.runTransaction(async (tx) => {
+    const s = await tx.get(ref);
+    if (!s.exists) return;
+    const d = s.data();
+    const awards = Array.isArray(d.awards) ? d.awards.slice() : [];
+    const i = awards.findIndex((a) => a.saleId === saleId && !a.reversed && Number(a.days) > 0);
+    if (i < 0) return;
+    awards[i] = Object.assign({}, awards[i], { reversed: true, reversedAt: Date.now() });
+    const left = Math.max(0, Number(d.rewardedDays || 0) - Number(awards[i].days));
+    take = { referrerUid: d.referrerUid, days: Number(awards[i].days) };
+    tx.update(ref, { awards, rewardedDays: left, status: left > 0 ? 'rewarded' : 'reversed' });
+  });
+  if (take) await adjustReferralBonus(take.referrerUid, -take.days, 'refund of ' + saleId);
+  return take;
+}
+
+// GET  /api/referral/me — the caller's code, link, totals and referral list.
+app.get('/api/referral/me', referralLimiter, requireAuth, async (req, res) => {
+  try {
+    const code = await getOrCreateReferralCode(req.uid);
+    const [userSnap, mineSnap, list] = await Promise.all([
+      db.collection('users').doc(req.uid).get(),
+      db.collection('referrals').doc(req.uid).get(),
+      db.collection('referrals').where('referrerUid', '==', req.uid).limit(200).get(),
+    ]);
+    const r = (userSnap.exists && userSnap.data().referral) || {};
+    const rows = list.docs.map((d) => d.data()).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    const user = await admin.auth().getUser(req.uid);
+    const canEnterCode = !mineSnap.exists && !(await hasEverBeenCustomer(req.uid, user));
+    res.json({
+      code,
+      link: APP_URL + '/journal?ref=' + code,          // clean URL (same style as mentor invite links)
+      rewards: { essential: REFERRAL_BASE_DAYS.essential, pro: REFERRAL_BASE_DAYS.pro, longCycleBonus: REFERRAL_LONG_CYCLE_BONUS },
+      stats: {
+        joined: rows.length,
+        rewarded: rows.filter((x) => Number(x.rewardedDays) > 0).length,
+        pending: rows.filter((x) => !(Number(x.rewardedDays) > 0) && x.status !== 'reversed').length,
+        earnedDays: Math.max(0, Number(r.earnedDays || 0)),
+        bankedDays: Math.max(0, Number(r.bankedDays || 0)),
+      },
+      referrals: rows.slice(0, 50).map((x) => ({
+        label: x.referredLabel || 'New trader',
+        status: Number(x.rewardedDays) > 0 ? 'rewarded' : (x.status === 'reversed' ? 'reversed' : 'pending'),
+        plan: x.plan || null, cycle: x.cycle || null,
+        days: Math.max(0, Number(x.rewardedDays || 0)),
+        joinedAt: x.createdAt || null,
+      })),
+      referredBy: mineSnap.exists ? { at: mineSnap.data().createdAt || null } : null,
+      canEnterCode,
+    });
+  } catch (e) {
+    console.error('referral/me:', e.message);
+    res.status(500).json({ error: 'Could not load your referral details.' });
+  }
+});
+
+// POST /api/referral/claim { code } — attach the caller to a referrer.
+app.post('/api/referral/claim', referralClaimLimiter, requireAuth, async (req, res) => {
+  try {
+    const code = String((req.body && req.body.code) || '').trim().toUpperCase();
+    if (!referralCodeOk(code)) return res.status(400).json({ error: 'That referral code is not valid.', code: 'invalid' });
+    const cSnap = await db.collection('referralCodes').doc(code).get();
+    if (!cSnap.exists) return res.status(404).json({ error: 'That referral code does not exist.', code: 'invalid' });
+    const referrerUid = cSnap.data().uid;
+    if (!referrerUid || referrerUid === req.uid) return res.status(400).json({ error: 'You cannot use your own referral code.', code: 'self' });
+
+    const [me, them] = await Promise.all([admin.auth().getUser(req.uid), admin.auth().getUser(referrerUid)]);
+    if (isComp(me.email)) return res.status(400).json({ error: 'This account cannot be referred.', code: 'comp' });
+    if (me.email && normEmail(me.email) === normEmail(them.email)) return res.status(400).json({ error: 'You cannot use your own referral code.', code: 'self' });
+    if (await hasEverBeenCustomer(req.uid, me)) {
+      return res.status(409).json({ error: 'Referral codes only work for new members who have not subscribed before.', code: 'existing_customer' });
+    }
+
+    const ref = db.collection('referrals').doc(req.uid);
+    const created = await db.runTransaction(async (tx) => {
+      const s = await tx.get(ref);
+      if (s.exists) return false;                     // one referrer per user, forever
+      tx.set(ref, {
+        referredUid: req.uid, referrerUid, code, status: 'pending',
+        referredLabel: maskEmail(me.email), rewardedDays: 0, awards: [], createdAt: Date.now(),
+      });
+      tx.set(db.collection('users').doc(req.uid), { referredBy: { code, at: Date.now() } }, { merge: true });
+      return true;
+    });
+    if (!created) return res.status(409).json({ error: 'A referral is already linked to your account.', code: 'already' });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('referral/claim:', e.message);
+    res.status(500).json({ error: 'Could not apply the referral code.' });
+  }
+});
 
 // ══════════════════════════════════════════════════════════════
 //  ADMIN: grant / revoke access without a payment
