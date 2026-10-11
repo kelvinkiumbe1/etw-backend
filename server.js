@@ -488,6 +488,84 @@ app.post('/api/ai/transcribe', aiLimiter, requireAuth, requirePro, async (req, r
   } catch (e) { console.error('transcribe proxy:', e.message); res.status(502).json({ error: 'Transcription upstream error.' }); }
 });
 
+// ── Economic calendar (Forex Factory weekly feed) ──────────
+// Forex Factory publishes the current week as JSON. Browsers can't read it
+// directly (no CORS) and it is rate-limited, so the server fetches it at most
+// every 10 minutes, serves everyone from memory, and keeps a copy of every week
+// in Firestore (econCalendar/{sundayYMD}) — that history is what lets the app
+// tag past trades as Before / During / After news. Unofficial feed: if it is
+// down or blocks us, the last good copy keeps being served.
+const FF_URL = 'https://nfs.faireconomy.media/ff_calendar_thisweek.json';
+const FF_TTL = 10 * 60 * 1000;
+let FF_MEM = { at: 0, week: '', events: null, error: null };
+let FF_INFLIGHT = null;
+function ffWeekKey(ts) { const d = new Date(ts); d.setUTCHours(0, 0, 0, 0); d.setUTCDate(d.getUTCDate() - d.getUTCDay()); return d.toISOString().slice(0, 10); }
+function ffNorm(list) {
+  const out = [];
+  (Array.isArray(list) ? list : []).forEach((e) => {
+    if (!e || !e.date || !e.title) return;
+    const ts = Date.parse(e.date); if (!isFinite(ts)) return;
+    const impact = String(e.impact || '').toLowerCase();
+    const cur = String(e.country || '').toUpperCase().slice(0, 4);
+    const id = crypto.createHash('sha1').update(cur + '|' + e.title + '|' + e.date).digest('hex').slice(0, 16);
+    out.push({ id, ts, cur, title: String(e.title).slice(0, 160),
+      impact: /high/.test(impact) ? 'high' : /medium/.test(impact) ? 'medium' : /low/.test(impact) ? 'low' : /holiday/.test(impact) ? 'holiday' : 'none',
+      forecast: String(e.forecast || ''), previous: String(e.previous || ''), actual: String(e.actual || '') });
+  });
+  return out.sort((a, b) => a.ts - b.ts);
+}
+async function ffRefresh(force) {
+  if (!force && FF_MEM.events && Date.now() - FF_MEM.at < FF_TTL) return FF_MEM;
+  if (FF_INFLIGHT) return FF_INFLIGHT;
+  FF_INFLIGHT = (async () => {
+    try {
+      const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 12000);
+      const r = await fetch(FF_URL, { signal: ctl.signal, headers: { 'User-Agent': 'Mozilla/5.0 (ETW Journal calendar)', 'Accept': 'application/json' } });
+      clearTimeout(to);
+      if (!r.ok) throw new Error('feed HTTP ' + r.status);
+      const events = ffNorm(await r.json());
+      if (!events.length) throw new Error('feed returned no events');
+      const week = ffWeekKey(events[0].ts + 6 * 3600 * 1000);
+      FF_MEM = { at: Date.now(), week, events, error: null };
+      db.collection('econCalendar').doc(week).set({ week, events, updatedAt: Date.now(), source: 'forexfactory' }).catch((e) => console.warn('[calendar] store:', e.message));
+    } catch (e) {
+      console.warn('[calendar] refresh failed:', e.message);
+      FF_MEM.error = e.message; FF_MEM.at = FF_MEM.events ? Date.now() - FF_TTL + 2 * 60 * 1000 : 0;   // retry in ~2 min
+      if (!FF_MEM.events) {
+        // cold start + feed down: fall back to the newest stored week
+        try {
+          const snap = await db.collection('econCalendar').orderBy(admin.firestore.FieldPath.documentId(), 'desc').limit(1).get();
+          snap.forEach((d) => { const x = d.data() || {}; FF_MEM = { at: Date.now() - FF_TTL + 2 * 60 * 1000, week: d.id, events: x.events || [], error: e.message }; });
+        } catch (e2) {}
+      }
+    } finally { FF_INFLIGHT = null; }
+    return FF_MEM;
+  })();
+  return FF_INFLIGHT;
+}
+app.get('/api/calendar/week', marketLimiter, requireAuth, requireSub, async (req, res) => {
+  const m = await ffRefresh(false);
+  if (!m.events) return res.status(503).json({ error: 'The economic calendar is unavailable right now. Please try again shortly.' });
+  res.set('Cache-Control', 'private, max-age=120');
+  res.json({ week: m.week, updatedAt: m.at, stale: !!m.error, events: m.events, source: 'Forex Factory' });
+});
+// Stored weeks for a time range (max ~4 months) — used to tag past trades with news.
+app.get('/api/calendar/range', marketLimiter, requireAuth, requireSub, async (req, res) => {
+  const to = Math.min(Number(req.query.to) || Date.now(), Date.now() + 8 * 86400000);
+  const from = Math.max(Number(req.query.from) || (to - 60 * 86400000), to - 125 * 86400000);
+  try {
+    await ffRefresh(false).catch(() => {});
+    const FP = admin.firestore.FieldPath.documentId();
+    const snap = await db.collection('econCalendar').where(FP, '>=', ffWeekKey(from)).where(FP, '<=', ffWeekKey(to)).get();
+    const weeks = []; let events = [];
+    snap.forEach((d) => { weeks.push(d.id); events = events.concat(((d.data() || {}).events || []).filter((e) => e.impact === 'high' || e.impact === 'medium')); });
+    res.json({ weeks: weeks.sort(), events: events.filter((e) => e.ts >= from - 86400000 && e.ts <= to + 86400000) });
+  } catch (e) { console.error('calendar range:', e.message); res.status(500).json({ error: 'Could not load calendar history.' }); }
+});
+// Keep each week stored even when nobody opens the app.
+setInterval(() => { ffRefresh(false).catch(() => {}); }, 30 * 60 * 1000);
+setTimeout(() => { ffRefresh(true).catch(() => {}); }, 15000);
+
 // ── Market-data proxy (Twelve Data) ────────────────────────
 // Keeps the Twelve Data key server-side (was base64-obfuscated in the client).
 // Public market data, so no Firebase auth — protected by rate limiting only.
