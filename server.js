@@ -44,9 +44,91 @@ tokens.init({
     console.log('[tokens] depleted -> undeployed and stopped sync for', uid);
   },
   onPause:  (uid, reason) => mt5.pause(uid, reason),
-  onResume: (uid) => mt5.resumeOne(uid),
-  onPull:   (uid, accountKey) => mt5.pullOnce(uid, accountKey),
+  // MT5/MT4 Direct auto-sync is a Pro feature. Every automatic resume and every
+  // scheduled pull checks the plan first, so Essential accounts that were linked
+  // before the change never sync again until the user upgrades to Pro.
+  onResume: async (uid, accountKey) => {
+    const g = await directPlanGate(uid);
+    if (g === 'pro') return mt5.resumeOne(uid, accountKey);
+    if (g === 'locked') await holdDirectForPro(uid, accountKey);
+  },
+  onPull:   async (uid, accountKey) => {
+    const g = await directPlanGate(uid);
+    if (g === 'pro') return mt5.pullOnce(uid, accountKey);
+    if (g === 'locked') await holdDirectForPro(uid, accountKey);
+  },
 });
+
+// ── MT5 Direct = Pro only ──────────────────────────────────
+// 'pro' → sync; 'locked' → active Essential (or lapsed) plan, hold the sync;
+// 'unknown' → the plan lookup failed, skip this one pull and try again later.
+async function directPlanGate(uid) {
+  try { const a = await access.accessFor(uid, null); return (a.active && access.isPro(a)) ? 'pro' : 'locked'; }
+  catch (e) { console.warn('[mt5-pro] plan check failed for', uid, e.message); return 'unknown'; }
+}
+const PRO_HOLD_MSG = 'MT5 Direct auto-sync is on the Pro plan. Upgrade to Pro to resume syncing — your imported trades are safe.';
+function directAccountKeys(data) {
+  const keys = Object.keys((data && data.mt5DirectAccounts) || {});
+  if (!keys.length && data && data.mt5Direct) keys.push((data.mt5Direct && data.mt5Direct.accountKey) || 'legacy');
+  return keys;
+}
+// Stop (but do NOT forget) a linked account: credentials stay stored so an
+// upgrade can bring it straight back without the user re-entering anything.
+async function holdDirectForPro(uid, accountKey) {
+  let keys = accountKey ? [accountKey] : [];
+  if (!keys.length) { try { const d = await db.collection('users').doc(uid).get(); keys = directAccountKeys(d.exists ? d.data() : {}); } catch (e) {} }
+  if (!keys.length) keys = ['legacy'];
+  for (const k of keys) {
+    await mt5.stopSync(uid, { undeploy: true, accountKey: k }).catch(() => {});
+    await mt5.setStatus(uid, { status: 'pro_required', error: PRO_HOLD_MSG, heldAt: Date.now() }, k).catch(() => {});
+  }
+  console.log('[mt5-pro] held MT5 Direct sync (not Pro) for', uid, keys.join(','));
+}
+// After an upgrade to Pro: restart every account that was held for the plan.
+async function releaseDirectForPro(uid) {
+  try {
+    const d = await db.collection('users').doc(uid).get(); const data = d.exists ? d.data() : {};
+    const accs = data.mt5DirectAccounts || {};
+    let keys = Object.keys(accs).filter((k) => accs[k] && accs[k].status === 'pro_required');
+    if (!keys.length && data.mt5Direct && data.mt5Direct.status === 'pro_required') keys = [data.mt5Direct.accountKey || 'legacy'];
+    for (const k of keys) {
+      await mt5.setStatus(uid, { status: 'connecting', error: null }, k).catch(() => {});
+      mt5.resumeOne(uid, k)
+        .then(() => mt5.setStatus(uid, { status: 'connected', error: null }, k).catch(() => {}))
+        .catch((e) => mt5.setStatus(uid, { status: 'error', error: mt5.friendlyError(e) }, k).catch(() => {}));
+    }
+    if (keys.length) console.log('[mt5-pro] resumed MT5 Direct sync after Pro upgrade for', uid, keys.join(','));
+  } catch (e) { console.warn('[mt5-pro] release failed for', uid, e.message); }
+}
+// Hold or release one user according to their current plan.
+async function enforceDirectPlan(uid) {
+  const g = await directPlanGate(uid);
+  if (g === 'pro') return releaseDirectForPro(uid);
+  if (g !== 'locked') return;
+  const d = await db.collection('users').doc(uid).get().catch(() => null); const data = d && d.exists ? d.data() : {};
+  const accs = data.mt5DirectAccounts || {};
+  const live = directAccountKeys(data).filter((k) => {
+    const st = (accs[k] && accs[k].status) || (data.mt5Direct && data.mt5Direct.status) || '';
+    return st && st !== 'disconnected' && st !== 'pro_required';
+  });
+  if (live.length) for (const k of live) await holdDirectForPro(uid, k);
+}
+// Sweep every linked MT5 Direct user. Runs at boot (after resumeAll, so nothing
+// that resumed on restart keeps syncing) and from the daily cron.
+async function sweepDirectPlans() {
+  let checked = 0, held = 0;
+  try {
+    const snap = await db.collection('users')
+      .where('mt5Direct.status', 'in', ['connected', 'connecting', 'paused', 'error', 'depleted']).get();
+    for (const doc of snap.docs) {
+      checked++;
+      const g = await directPlanGate(doc.id);
+      if (g === 'locked') { await enforceDirectPlan(doc.id); held++; }
+    }
+  } catch (e) { console.warn('[mt5-pro] sweep failed:', e.message); }
+  if (checked) console.log('[mt5-pro] sweep checked', checked, 'held', held);
+  return { checked, held };
+}
 
 const app = express();
 app.set('trust proxy', 1); // behind Render's proxy — needed for correct client IP in rate limiting
@@ -169,12 +251,11 @@ async function requirePro(req, res, next) {
 }
 
 // ── MT5 / MT4 ──────────────────────────────────────────────
-app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requireSub, async (req, res) => {
+app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requirePro, async (req, res) => {
   const { login, password, server, platform, journalAccountId } = req.body || {};
   if (!login || !password || !server) return res.status(400).json({ error: 'login, password and server are required' });
 
-  // MT5 Direct is included with both paid plans. The only server-side gate is
-  // the number of linked broker accounts: Essential gets one, Pro gets three.
+  // MT5 Direct is a Pro feature (requirePro above). Pro links up to three accounts.
   const accountKey = crypto.createHash('sha256')
     .update(String(platform || 'mt5') + '|' + String(login) + '|' + String(server).toLowerCase()).digest('hex').slice(0, 32);
   const accountLimit = access.isPro(req.access) ? 3 : 1;
@@ -219,7 +300,7 @@ app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requireSub, async 
 });
 // Daily mode is the only supported direct-sync mode. This endpoint remains for
 // old clients that may still send a mode preference.
-app.post('/api/mt5-direct/mode', authLimiter, requireAuth, requireSub, async (req, res) => {
+app.post('/api/mt5-direct/mode', authLimiter, requireAuth, requirePro, async (req, res) => {
   const mode = String((req.body && req.body.mode) || '').toLowerCase();
   if (mode !== 'daily') return res.status(400).json({ error: "only daily sync is supported" });
   const accountKey = String((req.body && req.body.accountKey) || 'legacy');
@@ -850,6 +931,8 @@ async function grantSubscription(uid, plan, cycle, extra = {}, keepExpiresAt = 0
       if (bankUsed) doc.referral.bankedDays = admin.firestore.FieldValue.increment(-bankUsed);
     }
     await db.collection('users').doc(uid).set(doc, { merge: true });
+    // Pro → resume any MT5 Direct account held for the plan; Essential → hold it.
+    setTimeout(() => { enforceDirectPlan(uid).catch(() => {}); }, 1500);
     return expiresAt;
   });
 }
@@ -865,6 +948,7 @@ async function revokeSubscription(uid, extra = {}) {
     { subscription: { status: 'revoked', revokedAt: Date.now(), ...extra } },
     { merge: true }
   );
+  enforceDirectPlan(uid).catch(() => {});
   syncBrevoContact(uid, { force: true }).catch(() => {});
 }
 
@@ -1037,7 +1121,9 @@ app.all('/api/cron/subscriptions', authLimiter, async (req, res) => {
     let gumroadSweep = null;
     try { gumroadSweep = await reconcileGumroadSales(3); }
     catch (e) { gumroadSweep = { error: e.message }; }
-    res.json({ ok: true, ...r, gumroad: gumroadSweep });
+    let mt5Pro = null;
+    try { mt5Pro = await sweepDirectPlans(); } catch (e) { mt5Pro = { error: e.message }; }
+    res.json({ ok: true, ...r, gumroad: gumroadSweep, mt5Pro });
   } catch (e) {
     console.error('cron/subscriptions:', e.message);
     res.status(500).json({ error: 'sweep failed' });
@@ -1799,6 +1885,10 @@ app.listen(port, () => {
   console.log('etw-sync-backend listening on :' + port);
 tokens.startMeter();
 mt5.resumeAll();
+// Essential users linked MT5 Direct before it moved to Pro: stop them right after
+// the boot-time resume, then re-check once the resumes have settled.
+setTimeout(() => { sweepDirectPlans().catch(() => {}); }, 5000);
+setTimeout(() => { sweepDirectPlans().catch(() => {}); }, 90000);
   // Refunds/disputes are only delivered via Gumroad's Resource Subscriptions
   // API — the Settings → Ping URL fires on sales alone. Registration is
   // idempotent, so doing it on every boot is safe.
