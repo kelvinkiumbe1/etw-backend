@@ -166,6 +166,15 @@ const marketLimiter = rl(60 * 1000, 60,  'Too many market-data requests, please 
 // so cap the rate — Gumroad's real traffic (sales + retries) sits far below this.
 const webhookLimiter = rl(60 * 1000, 60, 'Too many requests.');
 
+// Constant-time secret check, so response timing can't leak a shared secret
+// (ADMIN_SECRET, CRON_SECRET) one character at a time. Hashing first gives
+// timingSafeEqual equal-length inputs whatever was sent.
+function secretMatches(given, secret) {
+  if (!secret || !given) return false;
+  const h = (v) => crypto.createHash('sha256').update(String(v)).digest();
+  return crypto.timingSafeEqual(h(given), h(secret));
+}
+
 app.get('/', (_req, res) => res.json({
   ok: true,
   service: 'etw-sync-backend',
@@ -179,16 +188,49 @@ app.get('/', (_req, res) => res.json({
   appCheck: String(process.env.APPCHECK_ENFORCE || '').toLowerCase() === 'true',
 }));
 
-async function requireAuth(req, res, next) {
+// Email 2FA is enforced on the token, not in the browser. When a user has 2FA on,
+// their custom claims carry mfaRequired:true plus mfaSessions — the auth_time of
+// every sign-in session that has passed a code (or a trusted-device check).
+// auth_time is fixed for the life of a sign-in and survives token refreshes, so a
+// fresh sign-in with a stolen password gets a new auth_time that is not on the
+// list, and is refused here and by the Firestore rules until a code is entered.
+function mfaSatisfied(decoded) {
+  if (!decoded || decoded.mfaRequired !== true) return true;
+  return Array.isArray(decoded.mfaSessions) && decoded.mfaSessions.includes(decoded.auth_time);
+}
+
+// Verify an ID token AND that its session hasn't been revoked. Plain
+// verifyIdToken only checks the signature, so after a password change, a disable
+// or revokeRefreshTokens() a stolen token kept working until it expired (up to an
+// hour). checkRevoked costs one Auth lookup per call. On failure the 401 carries
+// a `code` the client acts on: session_revoked / account_disabled sign it out.
+async function verifySession(idToken) {
+  try { return { decoded: await admin.auth().verifyIdToken(idToken, true) }; }
+  catch (e) {
+    const c = String(e.code || e.errorInfo && e.errorInfo.code || '');
+    if (c === 'auth/id-token-revoked') return { error: 'Your session was signed out. Please sign in again.', code: 'session_revoked' };
+    if (c === 'auth/user-disabled') return { error: 'This account has been disabled.', code: 'account_disabled' };
+    return { error: 'Invalid or expired token', code: 'invalid_token' };
+  }
+}
+
+// Verifies the Firebase ID token only. Used directly by the /api/mfa/* routes,
+// which an unverified session must still be able to reach to enter its code.
+async function requireAuthPreMfa(req, res, next) {
   const m = (req.headers.authorization || '').match(/^Bearer (.+)$/);
   if (!m) return res.status(401).json({ error: 'Missing Authorization: Bearer <idToken>' });
-  try {
-    const decoded = await admin.auth().verifyIdToken(m[1]);
-    req.uid = decoded.uid;
-    req.token = decoded;              // carries the subscription claim for the gates below
+  const v = await verifySession(m[1]);
+  if (v.error) return res.status(401).json({ error: v.error, code: v.code });
+  req.uid = v.decoded.uid;
+  req.token = v.decoded;              // carries the subscription claim for the gates below
+  next();
+}
+
+async function requireAuth(req, res, next) {
+  return requireAuthPreMfa(req, res, () => {
+    if (!mfaSatisfied(req.token)) return res.status(401).json({ error: 'Two-factor verification required.', code: 'mfa_required' });
     next();
-  }
-  catch (e) { res.status(401).json({ error: 'Invalid or expired token' }); }
+  });
 }
 
 // ── App Check ──────────────────────────────────────────────
@@ -772,9 +814,10 @@ function escapeHtml(s) {
 app.post('/api/auth/login-alert', authLimiter, requireAuth, async (req, res) => {
   res.json({ ok: true });   // respond immediately; do the work in the background
   try {
-    const deviceId = (req.body && req.body.deviceId) || '';
+    const deviceId = String((req.body && req.body.deviceId) || '');
     const userAgent = (req.body && req.body.userAgent) || '';
-    if (!deviceId) return;
+    // It becomes a field name in knownDevices, so keep it to a plain short token.
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(deviceId)) return;
     const ref = admin.firestore().collection('users').doc(req.uid).collection('private').doc('knownDevices');
     const snap = await ref.get();
     const known = (snap.exists && snap.data()) || {};
@@ -811,6 +854,17 @@ app.post('/api/auth/login-alert', authLimiter, requireAuth, async (req, res) => 
       </div>`,
     });
   } catch (e) { console.error('login-alert:', e.message); }
+});
+
+// Sign out everywhere: revokes every refresh token, so other devices are cut off
+// at their next API call (requireAuth checks revocation) and at their next token
+// refresh for Firestore (within the hour). It also moves tokensValidAfterTime,
+// which retires every 2FA trusted device. The caller is signed out too.
+app.post('/api/auth/signout-all', authLimiter, requireAuth, async (req, res) => {
+  try {
+    await admin.auth().revokeRefreshTokens(req.uid);
+    res.json({ ok: true });
+  } catch (e) { console.error('signout-all:', e.message); res.status(500).json({ error: 'Could not sign out other devices.' }); }
 });
 
 // ── Branded auth emails via Brevo (path B) ─────────────────
@@ -873,13 +927,35 @@ app.post('/api/auth/send-reset', authLimiter, async (req, res) => {
 });
 
 // ── Email 2FA (new/untrusted-device only) ──────────────────
-// Opt-in via users/{uid}.mfaEnabled. On login from a device not in the user's
+// Opt-in via POST /api/mfa/settings. On login from a device not in the user's
 // trusted list, a 6-digit code is emailed (Brevo) and must be verified before
-// the app proceeds. Codes are stored hashed + expiring, with attempt lockout,
-// in users/{uid}/private/mfa (server-only). Client-side gate for v1.
+// the session can use the API or Firestore. Codes are stored hashed + expiring,
+// with attempt lockout, in users/{uid}/private/mfa (server-only).
+//
+// TRUSTED DEVICES are proven with a key, not remembered by an ID. On "trust this
+// device" the browser makes a non-extractable ECDSA P-256 key (WebCrypto, kept in
+// IndexedDB) and sends only the public half. To skip the code later it signs a
+// one-time challenge from the gate. The private key can't be read out by any
+// script, so copying the browser's storage to another machine gets nothing.
+// trusted[] is keyed by the key's RFC 7638 thumbprint (a hash), and each entry
+// records the account's tokensValidAfterTime: a password change or "sign out
+// everywhere" moves that, which silently retires every trusted device.
+//
+// ENFORCEMENT lives in the token: the claims mfaRequired + mfaSessions (see
+// mfaSatisfied above requireAuth). requireAuth and the Firestore rules both
+// refuse a session whose auth_time has not passed a code, so skipping the
+// browser overlay — or signing in straight through the Firebase REST API with a
+// stolen password — gets nothing. users/{uid}.mfaEnabled is only a mirror for
+// the Settings toggle, and the rules make it server-owned.
 const MFA_CODE_TTL = 10 * 60 * 1000;         // 10 minutes
 const MFA_TRUST_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days
-const mfaLimiter = rl(10 * 60 * 1000, 15, 'Too many 2FA attempts. Please wait a few minutes.');
+const MFA_LOCK_MS = 15 * 60 * 1000;          // lockout after MFA_MAX_ATTEMPTS wrong codes
+const MFA_MAX_ATTEMPTS = 5;
+const MFA_MAX_SESSIONS = 10;                 // custom claims are capped at 1000 bytes
+const MFA_CHALLENGE_TTL = 2 * 60 * 1000;     // device-key challenge lifetime
+const MFA_MAX_DEVICES = 10;
+// Each sign-in now makes two gate calls (challenge, then proof or send).
+const mfaLimiter = rl(10 * 60 * 1000, 30, 'Too many 2FA attempts. Please wait a few minutes.');
 function hashCode(code, uid) { return crypto.createHash('sha256').update(String(code) + '|' + uid).digest('hex'); }
 function mfaRef(uid) { return admin.firestore().collection('users').doc(uid).collection('private').doc('mfa'); }
 function codeEmailHtml(code) {
@@ -892,48 +968,289 @@ function codeEmailHtml(code) {
   </div>`;
 }
 
-// Decide whether this login needs a code; if so, generate + email it.
-app.post('/api/mfa/gate', mfaLimiter, requireAuth, async (req, res) => {
+function disableCodeEmailHtml(code) {
+  return `<div style="font-family:system-ui,-apple-system,'Segoe UI',sans-serif;max-width:440px;margin:auto;color:#1a1a1a;padding:8px">
+    <h2 style="margin:0 0 8px;color:#C8973A">Turn off 2-factor authentication?</h2>
+    <p>Someone signed in to your ETW Journal account asked to turn off email 2-factor authentication. Enter this code to confirm:</p>
+    <div style="font-size:34px;font-weight:800;letter-spacing:8px;background:#f4f4f6;border-radius:10px;padding:16px;text-align:center;margin:16px 0">${escapeHtml(code)}</div>
+    <p style="color:#666;font-size:13px">This code expires in 10 minutes. <b>If this wasn't you</b>, don't share the code — reset your password immediately.</p>
+    <p style="color:#999;font-size:12px;margin-top:16px">ETW Journal security</p>
+  </div>`;
+}
+
+// Accept only a P-256 public JWK, reduced to the members that define the key.
+function cleanDeviceJwk(jwk) {
+  if (!jwk || jwk.kty !== 'EC' || jwk.crv !== 'P-256') return null;
+  const b64u = /^[A-Za-z0-9_-]{43}$/;          // 32-byte coordinate, base64url
+  if (!b64u.test(String(jwk.x)) || !b64u.test(String(jwk.y))) return null;
+  try { crypto.createPublicKey({ key: { kty: 'EC', crv: 'P-256', x: jwk.x, y: jwk.y }, format: 'jwk' }); }
+  catch (e) { return null; }                   // not a point on the curve
+  return { kty: 'EC', crv: 'P-256', x: jwk.x, y: jwk.y };
+}
+// RFC 7638 thumbprint: the device's id in trusted[], a hash rather than a secret.
+function jwkThumbprint(jwk) {
+  return crypto.createHash('sha256').update(JSON.stringify({ crv: jwk.crv, kty: jwk.kty, x: jwk.x, y: jwk.y })).digest('base64url');
+}
+// What the browser signs: bound to the account and to this sign-in session, so a
+// signature can't be replayed for anyone else or any other sign-in.
+function deviceProofMessage(uid, authTime, challenge) {
+  return Buffer.from('etw-mfa-device|' + uid + '|' + authTime + '|' + challenge);
+}
+function verifyDeviceSig(jwk, message, sigB64u) {
   try {
-    const deviceId = String((req.body && req.body.deviceId) || '');
-    const udoc = await admin.firestore().collection('users').doc(req.uid).get();
-    if (!(udoc.exists && udoc.data().mfaEnabled === true)) return res.json({ required: false });
-    const snap = await mfaRef(req.uid).get();
+    const key = crypto.createPublicKey({ key: jwk, format: 'jwk' });
+    // WebCrypto ECDSA signatures are raw r||s (IEEE P1363), not DER.
+    return crypto.verify('sha256', message, { key, dsaEncoding: 'ieee-p1363' }, Buffer.from(String(sigB64u), 'base64url'));
+  } catch (e) { return false; }
+}
+// Live trusted devices only: unexpired, key-based (the old plain-ID entries are
+// dropped), and minted under the account's current tokensValidAfterTime.
+function liveTrusted(trusted, validAfter) {
+  const now = Date.now(), out = {};
+  for (const [id, t] of Object.entries(trusted || {})) {
+    if (t && typeof t === 'object' && t.jwk && t.exp > now && t.validAfter === validAfter) out[id] = t;
+  }
+  return out;
+}
+// Add (or refresh) a trusted device, pruning dead entries in the same write.
+async function trustDevice(uid, jwk, ua) {
+  const user = await admin.auth().getUser(uid);
+  const validAfter = user.tokensValidAfterTime || '';
+  const ref = mfaRef(uid);
+  await admin.firestore().runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const trusted = liveTrusted(((snap.exists && snap.data()) || {}).trusted, validAfter);
+    trusted[jwkThumbprint(jwk)] = { jwk, exp: Date.now() + MFA_TRUST_TTL, addedAt: Date.now(), validAfter, ua: String(ua || '').slice(0, 200) };
+    // Over the cap → forget the oldest.
+    const ids = Object.keys(trusted).sort((a, b) => trusted[a].addedAt - trusted[b].addedAt);
+    while (ids.length > MFA_MAX_DEVICES) delete trusted[ids.shift()];
+    tx.set(ref, { trusted }, { mergeFields: ['trusted'] });
+  });
+}
+
+// Edit the 2FA claims, keeping every other claim (subscription etc.) intact.
+// Serialised with grantSubscription & co. so neither overwrites the other.
+function editMfaClaims(uid, fn) {
+  return withUidLock(uid, async () => {
+    const user = await admin.auth().getUser(uid);
+    const claims = Object.assign({}, user.customClaims || {});
+    fn(claims);
+    await admin.auth().setCustomUserClaims(uid, claims);
+  });
+}
+// Mark one sign-in session (by its auth_time) as having passed 2FA.
+function markSessionVerified(uid, authTime) {
+  return editMfaClaims(uid, (c) => {
+    c.mfaRequired = true;
+    const prev = Array.isArray(c.mfaSessions) ? c.mfaSessions.filter((t) => t !== authTime) : [];
+    c.mfaSessions = prev.concat(authTime).slice(-MFA_MAX_SESSIONS);
+  });
+}
+
+// Email a fresh code for `purpose` ('signin' | 'disable'), bound to this sign-in
+// session. `data` is the current private/mfa doc. Returns { status, error? }.
+async function issueCode(uid, authTime, purpose, data) {
+  const now = Date.now();
+  if (data.lockedUntil && data.lockedUntil > now) return { status: 429, error: 'Too many wrong codes — try again in a few minutes.' };
+  const code = String(crypto.randomInt(100000, 1000000));
+  // A resend must not reset the wrong-guess counter, or resending would buy
+  // unlimited guesses. It only starts over once the previous code has expired.
+  const p = data.pending;
+  const attempts = (p && p.exp > now && p.authTime === authTime) ? (p.attempts || 0) : 0;
+  await mfaRef(uid).set({ pending: { hash: hashCode(code, uid), exp: now + MFA_CODE_TTL, attempts, authTime, purpose } }, { merge: true });
+  const user = await admin.auth().getUser(uid).catch(() => null);
+  if (!user || !user.email) return { status: 400, error: 'No email on this account to send a code to.' };
+  const sent = await email.sendEmail(purpose === 'disable'
+    ? { to: user.email, toName: user.displayName || '', subject: 'Confirm turning off 2-factor authentication', html: disableCodeEmailHtml(code) }
+    : { to: user.email, toName: user.displayName || '', subject: 'Your ETW Journal sign-in code', html: codeEmailHtml(code) });
+  if (!sent) return { status: 502, error: 'Could not send code email' };
+  return { status: 200 };
+}
+
+// Check a submitted code for `purpose`, consuming it on success. Read-check-write
+// runs in a transaction so parallel guesses can't all slip in under the attempt
+// limit. Returns { status, error? }.
+function checkCode(uid, authTime, code, purpose) {
+  const ref = mfaRef(uid);
+  return admin.firestore().runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
     const data = (snap.exists && snap.data()) || {};
-    const trusted = data.trusted || {};
-    if (deviceId && trusted[deviceId] && trusted[deviceId] > Date.now()) return res.json({ required: false });
-    const code = String(Math.floor(100000 + Math.random() * 900000));
-    await mfaRef(req.uid).set({ pending: { hash: hashCode(code, req.uid), exp: Date.now() + MFA_CODE_TTL, attempts: 0, deviceId } }, { merge: true });
-    const user = await admin.auth().getUser(req.uid).catch(() => null);
-    if (user && user.email) {
-      const sent = await email.sendEmail({ to: user.email, toName: user.displayName || '', subject: 'Your ETW Journal sign-in code', html: codeEmailHtml(code) });
-      if (!sent) return res.status(502).json({ required: true, sent: false, error: 'Could not send code email' });
+    const p = data.pending;
+    const now = Date.now();
+    if (data.lockedUntil && data.lockedUntil > now) return { status: 429, error: 'Too many wrong codes — try again in a few minutes.' };
+    // Pre-purpose codes were all sign-in codes.
+    if (!p || p.authTime !== authTime || (p.purpose || 'signin') !== purpose) return { status: 400, error: 'No code pending — request a new one.' };
+    if (now > p.exp) { tx.set(ref, { pending: null }, { merge: true }); return { status: 400, error: 'Code expired — request a new one.' }; }
+    if (hashCode(code, uid) !== p.hash) {
+      const attempts = (p.attempts || 0) + 1;
+      if (attempts >= MFA_MAX_ATTEMPTS) {
+        tx.set(ref, { pending: null, lockedUntil: now + MFA_LOCK_MS }, { merge: true });
+        return { status: 429, error: 'Too many wrong codes — try again in a few minutes.' };
+      }
+      tx.set(ref, { pending: { ...p, attempts } }, { merge: true });
+      return { status: 401, error: 'Incorrect code.' };
     }
-    res.json({ required: true, sent: true });
+    tx.set(ref, { pending: null, lockedUntil: null }, { merge: true });
+    return { status: 200 };
+  });
+}
+
+// Decide whether this session needs a code. Three calls, one route:
+//   {}                          → { required:true, challenge } (nothing emailed yet)
+//   { proof:{ jwk, challenge, sig } } → trusted-device check; on failure emails a code
+//   { send:true }               → email a code (no device key, or "Resend code")
+// `refresh: true` tells the client its claims changed and it must fetch a new
+// ID token (getIdToken(true)) before Firestore will let it in.
+app.post('/api/mfa/gate', mfaLimiter, requireAuthPreMfa, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const authTime = req.token.auth_time;
+    let required = req.token.mfaRequired === true;
+    if (!required) {
+      // Accounts that switched 2FA on before it moved into the claim: the doc
+      // flag is all they have. Promote it to the claim so it is enforced.
+      const udoc = await admin.firestore().collection('users').doc(req.uid).get();
+      if (!(udoc.exists && udoc.data().mfaEnabled === true)) return res.json({ required: false });
+      await editMfaClaims(req.uid, (c) => { c.mfaRequired = true; });
+      required = true;
+    }
+    if (mfaSatisfied(req.token)) return res.json({ required: false });
+
+    const now = Date.now();
+    const ref = mfaRef(req.uid);
+    const snap = await ref.get();
+    const data = (snap.exists && snap.data()) || {};
+
+    if (body.proof) {
+      // The challenge is single-use whatever the outcome.
+      const ch = data.challenge;
+      await ref.set({ challenge: null }, { merge: true });
+      const jwk = cleanDeviceJwk(body.proof.jwk);
+      const okChallenge = ch && ch.exp > now && ch.authTime === authTime && ch.value === String(body.proof.challenge || '');
+      if (jwk && okChallenge) {
+        const user = await admin.auth().getUser(req.uid);
+        const t = liveTrusted(data.trusted, user.tokensValidAfterTime || '')[jwkThumbprint(jwk)];
+        if (t && verifyDeviceSig(t.jwk, deviceProofMessage(req.uid, authTime, ch.value), body.proof.sig)) {
+          await markSessionVerified(req.uid, authTime);
+          return res.json({ required: false, refresh: true });
+        }
+      }
+      // Not a (still) trusted device — fall through and email a code.
+    } else if (!body.send) {
+      const value = crypto.randomBytes(32).toString('base64url');
+      await ref.set({ challenge: { value, exp: now + MFA_CHALLENGE_TTL, authTime } }, { merge: true });
+      return res.json({ required: true, challenge: value });
+    }
+
+    const r = await issueCode(req.uid, authTime, 'signin', data);
+    res.status(r.status).json({ required: true, sent: r.status === 200, ...(r.error ? { error: r.error } : {}) });
   } catch (e) { console.error('mfa gate:', e.message); res.status(500).json({ error: 'MFA error' }); }
 });
 
-// Verify a submitted code; optionally trust the device for 30 days.
-app.post('/api/mfa/verify', mfaLimiter, requireAuth, async (req, res) => {
+// Verify a submitted sign-in code; optionally trust the device for 30 days.
+app.post('/api/mfa/verify', mfaLimiter, requireAuthPreMfa, async (req, res) => {
   try {
-    const deviceId = String((req.body && req.body.deviceId) || '');
     const code = String((req.body && req.body.code) || '');
-    const snap = await mfaRef(req.uid).get();
-    const data = (snap.exists && snap.data()) || {};
-    const p = data.pending;
-    if (!p) return res.status(400).json({ ok: false, error: 'No code pending — request a new one.' });
-    if (Date.now() > p.exp) { await mfaRef(req.uid).set({ pending: null }, { merge: true }); return res.status(400).json({ ok: false, error: 'Code expired — request a new one.' }); }
-    if ((p.attempts || 0) >= 5) { await mfaRef(req.uid).set({ pending: null }, { merge: true }); return res.status(429).json({ ok: false, error: 'Too many attempts — request a new code.' }); }
-    if (hashCode(code, req.uid) !== p.hash) {
-      await mfaRef(req.uid).set({ pending: { ...p, attempts: (p.attempts || 0) + 1 } }, { merge: true });
-      return res.status(401).json({ ok: false, error: 'Incorrect code.' });
-    }
-    const patch = { pending: null };
-    if (req.body && req.body.trust && deviceId) { const trusted = data.trusted || {}; trusted[deviceId] = Date.now() + MFA_TRUST_TTL; patch.trusted = trusted; }
-    await mfaRef(req.uid).set(patch, { merge: true });
-    res.json({ ok: true });
+    const jwk = req.body && req.body.trust ? cleanDeviceJwk(req.body.publicKey) : null;
+    const authTime = req.token.auth_time;
+    const result = await checkCode(req.uid, authTime, code, 'signin');
+    if (result.status !== 200) return res.status(result.status).json({ ok: false, error: result.error });
+    await markSessionVerified(req.uid, authTime);
+    if (jwk) await trustDevice(req.uid, jwk, req.get('user-agent'));
+    res.json({ ok: true, refresh: true });
   } catch (e) { console.error('mfa verify:', e.message); res.status(500).json({ ok: false, error: 'MFA error' }); }
 });
+
+// Whether 2FA is on, from the live user record rather than the caller's token,
+// which can be up to an hour stale. The doc flag covers not-yet-backfilled accounts.
+async function mfaIsOn(uid) {
+  const user = await admin.auth().getUser(uid);
+  if ((user.customClaims || {}).mfaRequired === true) return true;
+  const udoc = await db.collection('users').doc(uid).get();
+  return udoc.exists && udoc.data().mfaEnabled === true;
+}
+
+// Turn 2FA on or off. Switching it ON marks the current session (and device, if
+// given) as verified, so the user isn't locked out of the tab they are using.
+// Switching it OFF takes two calls: without `code` it emails a fresh one and
+// answers { codeRequired: true }; with `code` it checks it and turns 2FA off. A
+// verified session alone isn't enough — someone at an unlocked, trusted laptop
+// must not be able to strip 2FA without access to the mailbox.
+app.post('/api/mfa/settings', mfaLimiter, requireAuth, async (req, res) => {
+  try {
+    const on = !!(req.body && req.body.enabled);
+    const jwk = cleanDeviceJwk(req.body && req.body.publicKey);
+    if (on) {
+      await markSessionVerified(req.uid, req.token.auth_time);
+      if (jwk) await trustDevice(req.uid, jwk, req.get('user-agent'));
+    } else if (await mfaIsOn(req.uid)) {
+      const authTime = req.token.auth_time;
+      if (!(req.body && req.body.code)) {
+        const snap = await mfaRef(req.uid).get();
+        const r = await issueCode(req.uid, authTime, 'disable', (snap.exists && snap.data()) || {});
+        if (r.status !== 200) return res.status(r.status).json({ ok: false, error: r.error });
+        return res.json({ ok: false, codeRequired: true, sent: true });
+      }
+      const result = await checkCode(req.uid, authTime, String(req.body.code), 'disable');
+      if (result.status !== 200) return res.status(result.status).json({ ok: false, codeRequired: true, error: result.error });
+      await editMfaClaims(req.uid, (c) => { delete c.mfaRequired; delete c.mfaSessions; });
+      await mfaRef(req.uid).set({ pending: null, challenge: null, trusted: {}, lockedUntil: null }, { mergeFields: ['pending', 'challenge', 'trusted', 'lockedUntil'] });
+    } else {
+      // 2FA was never really on (no claim) — nothing to protect, just tidy up.
+      await mfaRef(req.uid).set({ pending: null, challenge: null, trusted: {}, lockedUntil: null }, { mergeFields: ['pending', 'challenge', 'trusted', 'lockedUntil'] });
+    }
+    await db.collection('users').doc(req.uid).set({ mfaEnabled: on }, { merge: true });
+    res.json({ ok: true, enabled: on, refresh: true });
+  } catch (e) { console.error('mfa settings:', e.message); res.status(500).json({ ok: false, error: 'Could not update 2FA.' }); }
+});
+
+// Trusted devices, for Settings. `current` is the thumbprint of the key the
+// caller's browser holds (it sends its public key), so the list can say "this device".
+app.post('/api/mfa/devices', mfaLimiter, requireAuth, async (req, res) => {
+  try {
+    const user = await admin.auth().getUser(req.uid);
+    const snap = await mfaRef(req.uid).get();
+    const live = liveTrusted(((snap.exists && snap.data()) || {}).trusted, user.tokensValidAfterTime || '');
+    const mine = cleanDeviceJwk(req.body && req.body.publicKey);
+    const current = mine ? jwkThumbprint(mine) : '';
+    const devices = Object.entries(live)
+      .map(([id, t]) => ({ id, ua: t.ua || '', addedAt: t.addedAt, exp: t.exp, current: id === current }))
+      .sort((a, b) => b.addedAt - a.addedAt);
+    res.json({ ok: true, devices });
+  } catch (e) { console.error('mfa devices:', e.message); res.status(500).json({ ok: false, error: 'Could not load devices.' }); }
+});
+// Forget one trusted device ({ id }) or all of them ({ all: true }). It takes
+// effect at that device's next sign-in; sessions already verified stay so.
+app.post('/api/mfa/devices/remove', mfaLimiter, requireAuth, async (req, res) => {
+  try {
+    const ref = mfaRef(req.uid);
+    if (req.body && req.body.all === true) {
+      await ref.set({ trusted: {} }, { mergeFields: ['trusted'] });
+    } else {
+      const id = String((req.body && req.body.id) || '');
+      if (!/^[A-Za-z0-9_-]{43}$/.test(id)) return res.status(400).json({ ok: false, error: 'Unknown device.' });
+      await ref.update(new admin.firestore.FieldPath('trusted', id), admin.firestore.FieldValue.delete());
+    }
+    res.json({ ok: true });
+  } catch (e) { console.error('mfa devices remove:', e.message); res.status(500).json({ ok: false, error: 'Could not remove device.' }); }
+});
+
+// Boot-time backfill: anyone with users/{uid}.mfaEnabled from before enforcement
+// moved into the claim gets mfaRequired now, rather than at their next app load —
+// otherwise a stolen password works for them until they happen to open the app.
+async function backfillMfaClaims() {
+  let promoted = 0;
+  try {
+    const snap = await db.collection('users').where('mfaEnabled', '==', true).get();
+    for (const doc of snap.docs) {
+      const user = await admin.auth().getUser(doc.id).catch(() => null);
+      if (!user || (user.customClaims || {}).mfaRequired === true) continue;
+      await editMfaClaims(doc.id, (c) => { c.mfaRequired = true; });
+      promoted++;
+    }
+  } catch (e) { console.warn('[mfa] backfill failed:', e.message); }
+  if (promoted) console.log('[mfa] backfilled mfaRequired for', promoted, 'user(s)');
+}
 
 // ══════════════════════════════════════════════════════════════
 //  SUBSCRIPTIONS (Gumroad)  —  server-side verify + grant only
@@ -1191,7 +1508,7 @@ app.all('/api/cron/subscriptions', authLimiter, async (req, res) => {
   const secret = process.env.CRON_SECRET || '';
   if (!secret) return res.status(503).json({ error: 'CRON_SECRET is not set on the server.' });
   const given = req.get('X-Cron-Key') || (req.query && req.query.key) || '';
-  if (given !== secret) return res.status(403).json({ error: 'forbidden' });
+  if (!secretMatches(given, secret)) return res.status(403).json({ error: 'forbidden' });
   try {
     const r = await sweepSubscriptions();
     // Also heal any Gumroad sales whose ping never landed. Failure here must
@@ -1648,11 +1965,14 @@ app.post('/api/referral/claim', referralClaimLimiter, requireAuth, async (req, r
 //   * header  X-Admin-Secret: <ADMIN_SECRET>
 async function requireAdmin(req, res, next) {
   const secret = process.env.ADMIN_SECRET || '';
-  if (secret && req.get('X-Admin-Secret') === secret) { req.adminBy = 'secret'; return next(); }
+  if (secretMatches(req.get('X-Admin-Secret'), secret)) { req.adminBy = 'secret'; return next(); }
   const m = (req.headers.authorization || '').match(/^Bearer (.+)$/);
   if (!m) return res.status(401).json({ error: 'Admin auth required.' });
   try {
-    const decoded = await admin.auth().verifyIdToken(m[1]);
+    const v = await verifySession(m[1]);
+    if (v.error) return res.status(401).json({ error: v.error, code: v.code });
+    const decoded = v.decoded;
+    if (!mfaSatisfied(decoded)) return res.status(401).json({ error: 'Two-factor verification required.', code: 'mfa_required' });
     const isAdmin = (await db.collection('admins').doc(decoded.uid).get()).exists;
     if (!isAdmin) return res.status(403).json({ error: 'Not an admin.' });
     req.uid = decoded.uid; req.adminBy = decoded.email || decoded.uid;
@@ -1963,6 +2283,8 @@ app.listen(port, () => {
   console.log('etw-sync-backend listening on :' + port);
 tokens.startMeter();
 mt5.resumeAll();
+// Promote pre-claim 2FA users to the enforced claim (see backfillMfaClaims).
+setTimeout(() => { backfillMfaClaims().catch(() => {}); }, 3000);
 // Essential users linked MT5 Direct before it moved to Pro: stop them right after
 // the boot-time resume, then re-check once the resumes have settled.
 setTimeout(() => { sweepDirectPlans().catch(() => {}); }, 5000);

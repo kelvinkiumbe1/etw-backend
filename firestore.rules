@@ -7,7 +7,16 @@ service cloud.firestore {
     // ══════════════════════════════════════════════════
 
     function isAuthed() {
-      return request.auth != null;
+      return request.auth != null && mfaOk();
+    }
+
+    // Email 2FA, enforced here as well as in the backend (see mfaSatisfied in
+    // server.js). With 2FA on, a session only counts as signed in once its
+    // auth_time is in mfaSessions — i.e. it has entered a code or come from a
+    // trusted device. Every rule goes through isAuthed(), so this covers them all.
+    function mfaOk() {
+      return request.auth.token.get('mfaRequired', false) != true
+          || request.auth.token.auth_time in request.auth.token.get('mfaSessions', []);
     }
 
     // ── Subscription gate ─────────────────────────────────────────
@@ -208,7 +217,9 @@ service cloud.firestore {
       // btQuota is the backtest session-creation counter — Admin SDK only,
       // for the same reason as syncTokens: a client that could write it
       // could reset its own monthly limit.
-      return ['syncTokens', 'mt5Direct', 'mt5DirectAccounts', 'aiGuard', 'btQuota'];
+      // mfaEnabled mirrors the 2FA claim; only POST /api/mfa/settings may change
+      // it, so a session holding just the password can't switch 2FA off.
+      return ['syncTokens', 'mt5Direct', 'mt5DirectAccounts', 'aiGuard', 'btQuota', 'mfaEnabled'];
     }
     match /users/{uid} {
       allow read:   if isAuthed() && (request.auth.uid == uid || isAdmin());

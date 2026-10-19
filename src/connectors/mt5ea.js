@@ -44,6 +44,8 @@ function normalize(t, uid, accountId) {
 // Handle an EA push: { trades:[...] } + key (header or body). Returns count written.
 async function push(key, trades) {
   if (!key) { const e = new Error('Missing sync key'); e.status = 401; throw e; }
+  // The key is used as a document path, so only accept the shape register() mints.
+  if (!/^etw_[0-9a-f]{36}$/.test(String(key))) { const e = new Error('Invalid sync key'); e.status = 401; throw e; }
   const doc = await store.db.collection('eaKeys').doc(key).get();
   if (!doc.exists) { const e = new Error('Invalid sync key'); e.status = 401; throw e; }
   const { uid, accountId } = doc.data();
