@@ -101,6 +101,10 @@ async function releaseNewPeriodSlot(uid, accountKey, periodKey) {
 }
 
 async function findOrCreateAccount({ uid, login, password, server, platform }) {
+  // Only reuse an account this user created. Matching on login+server alone
+  // let anyone who knew a login take over another user's MetaApi account
+  // (and its trade history) without the password.
+  const name = `etw-${uid}-${login}`.slice(0, 64);
   try {
     const acApi = api.metatraderAccountApi;
     // SDK name varies by version: v27 uses getAccountsWithInfiniteScrollPagination / -ClassicPagination.
@@ -108,12 +112,12 @@ async function findOrCreateAccount({ uid, login, password, server, platform }) {
     if (lister) {
       const res = await lister.call(acApi, {});
       const list = Array.isArray(res) ? res : (res && (res.items || res.accounts)) || [];
-      const found = list.find(a => String(a.login) === String(login) && a.server === server);
+      const found = list.find(a => a.name === name && String(a.login) === String(login) && a.server === server);
       if (found) return found;
     }
   } catch (e) { console.warn('account lookup skipped:', e.message); }
   return api.metatraderAccountApi.createAccount({ // SDK:
-    name: `etw-${uid}-${login}`.slice(0, 64),
+    name,
     // cloud-g1 supports the cheaper "regular" reliability; cloud-g2 is high-reliability only.
     type: process.env.METAAPI_ACCOUNT_TYPE || 'cloud-g1',
     login: String(login),
