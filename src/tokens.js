@@ -322,6 +322,7 @@ async function meterTick() {
       for (const doc of psnap.docs) {
         const d = doc.data().mt5Direct || {};
         if ((d.pausedReason || '') !== 'market_closed') continue;   // manual pause: leave alone
+        if (d.engine === 'hosted') continue;                        // hosted worker schedules itself
         if ((d.mode || 'live') !== 'live') continue;
         try {
           // Re-anchor BEFORE reconnecting so the paused hours are never billed.
@@ -340,7 +341,7 @@ async function meterTick() {
       if (!Object.keys(accounts).length && data.mt5Direct) accounts.legacy = data.mt5Direct;
       for (const accountKey of Object.keys(accounts)) {
         const mt5 = accounts[accountKey] || {};
-        if (mt5.status !== 'connected') continue;
+        if (mt5.status !== 'connected' || mt5.engine === 'hosted') continue;
       const mode = mt5.mode || 'daily';
       try {
         // ── 2. Daily mode: pull if due, regardless of market hours (a pull

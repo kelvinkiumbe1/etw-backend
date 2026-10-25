@@ -63,6 +63,16 @@ CRON_SECRET=<copy from old service>
 MENTOR_EMAILS=<copy from old service>
 ETW_SITE_URL=https://etwiz.space
 APP_URL=https://etwiz.space
+
+# ── Hosted MT5 sync (our own worker instead of MetaApi) ────────────
+# MT5_CRED_KEY encrypts users' investor passwords. Generate it ONCE:
+#   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+# Changing or losing it means every hosted user must re-enter their password.
+MT5_CRED_KEY=<64 hex chars, generated once>
+# Shared with the worker machine only (worker.secret). Generate the same way.
+WORKER_SECRET=<64 hex chars>
+# Set to `hosted` to send new MT5 links to the worker. Leave unset to keep MetaApi.
+MT5_ENGINE=hosted
 ```
 
 ---

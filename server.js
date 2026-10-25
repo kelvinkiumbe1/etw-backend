@@ -24,6 +24,7 @@ const dxtrade = require('./src/connectors/dxtrade');
 const ctrader = require('./src/connectors/ctrader');
 const gumroad = require('./src/gumroad');
 const mt5ea = require('./src/connectors/mt5ea');
+const hosted = require('./src/hostedSync');
 const email = require('./src/email');
 const access = require('./src/access');
 const tokens = require('./src/tokens');
@@ -67,9 +68,12 @@ async function directPlanGate(uid) {
   catch (e) { console.warn('[mt5-pro] plan check failed for', uid, e.message); return 'unknown'; }
 }
 const PRO_HOLD_MSG = 'MT5 Direct auto-sync is on the Pro plan. Upgrade to Pro to resume syncing — your imported trades are safe.';
+// MetaApi-linked accounts only. Hosted accounts (engine: 'hosted') are open to
+// every plan and are gated by hostedSync.claim instead.
 function directAccountKeys(data) {
-  const keys = Object.keys((data && data.mt5DirectAccounts) || {});
-  if (!keys.length && data && data.mt5Direct) keys.push((data.mt5Direct && data.mt5Direct.accountKey) || 'legacy');
+  const accs = (data && data.mt5DirectAccounts) || {};
+  const keys = Object.keys(accs).filter((k) => !hosted.isHosted(accs[k]));
+  if (!Object.keys(accs).length && data && data.mt5Direct && !hosted.isHosted(data.mt5Direct)) keys.push((data.mt5Direct && data.mt5Direct.accountKey) || 'legacy');
   return keys;
 }
 // Stop (but do NOT forget) a linked account: credentials stay stored so an
@@ -89,8 +93,8 @@ async function releaseDirectForPro(uid) {
   try {
     const d = await db.collection('users').doc(uid).get(); const data = d.exists ? d.data() : {};
     const accs = data.mt5DirectAccounts || {};
-    let keys = Object.keys(accs).filter((k) => accs[k] && accs[k].status === 'pro_required');
-    if (!keys.length && data.mt5Direct && data.mt5Direct.status === 'pro_required') keys = [data.mt5Direct.accountKey || 'legacy'];
+    let keys = Object.keys(accs).filter((k) => accs[k] && accs[k].status === 'pro_required' && !hosted.isHosted(accs[k]));
+    if (!keys.length && data.mt5Direct && data.mt5Direct.status === 'pro_required' && !hosted.isHosted(data.mt5Direct)) keys = [data.mt5Direct.accountKey || 'legacy'];
     for (const k of keys) {
       await mt5.setStatus(uid, { status: 'connecting', error: null }, k).catch(() => {});
       mt5.resumeOne(uid, k)
@@ -102,6 +106,7 @@ async function releaseDirectForPro(uid) {
 }
 // Hold or release one user according to their current plan.
 async function enforceDirectPlan(uid) {
+  hosted.recheck(uid).catch((e) => console.warn('[hosted] recheck failed for', uid, e.message));
   const g = await directPlanGate(uid);
   if (g === 'pro') return releaseDirectForPro(uid);
   if (g !== 'locked') return;
@@ -262,6 +267,7 @@ const APPCHECK_EXEMPT = [
   /^\/api\/mt5\/trades/,
   /^\/api\/mt5-ea\/push/,
   /^\/api\/cron\//,
+  /^\/api\/worker\//,
   // Admin routes carry their own stronger auth (admin uid or ADMIN_SECRET) and
   // must stay callable from a terminal, where no App Check token exists.
   /^\/api\/admin\//,
@@ -293,11 +299,21 @@ async function requirePro(req, res, next) {
 }
 
 // ── MT5 / MT4 ──────────────────────────────────────────────
-app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requirePro, async (req, res) => {
+// MT5_ENGINE=hosted sends new links to our own worker (src/hostedSync.js) instead
+// of MetaApi. Hosted sync is on every plan (Essential 1 account, Pro 3); MetaApi
+// stays Pro-only. Accounts already on MetaApi keep running until re-linked.
+const HOSTED_ENGINE = String(process.env.MT5_ENGINE || '').toLowerCase() === 'hosted';
+const requireDirectPlan = HOSTED_ENGINE ? requireSub : requirePro;
+
+app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requireDirectPlan, async (req, res) => {
   const { login, password, server, platform, journalAccountId } = req.body || {};
   if (!login || !password || !server) return res.status(400).json({ error: 'login, password and server are required' });
+  if (!/^\d{1,20}$/.test(String(login).trim()) || String(server).length > 128 || String(password).length > 128) {
+    return res.status(400).json({ error: 'Check the login (numbers only), password and server.' });
+  }
+  if (HOSTED_ENGINE && !hosted.configured()) return res.status(503).json({ error: 'MT5 sync is not set up on the server yet.' });
 
-  // MT5 Direct is a Pro feature (requirePro above). Pro links up to three accounts.
+  // Pro links up to three accounts, Essential one.
   const accountKey = crypto.createHash('sha256')
     .update(String(platform || 'mt5') + '|' + String(login) + '|' + String(server).toLowerCase()).digest('hex').slice(0, 32);
   const accountLimit = access.isPro(req.access) ? 3 : 1;
@@ -314,6 +330,24 @@ app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requirePro, async 
     }
     console.error('mt5 account reservation:', e.message);
     return res.status(500).json({ error: 'Could not reserve an MT5 account slot. Please try again.' });
+  }
+
+  if (HOSTED_ENGINE) {
+    try {
+      // Moving an account off MetaApi: delete it there so it stops billing.
+      const prev = await db.collection('users').doc(req.uid).get();
+      const was = prev.exists && prev.data().mt5DirectAccounts && prev.data().mt5DirectAccounts[accountKey];
+      if (was && was.metaApiAccountId) {
+        await mt5.removeAccount(req.uid, accountKey).catch((e) => console.warn('[hosted] MetaApi removal failed:', e.message));
+      }
+      await hosted.link(req.uid, { accountKey, login: String(login).trim(), password: String(password), server: String(server).trim(), platform, journalAccountId });
+      return res.json({ ok: true, status: 'connecting', accountKey, accountLimit, engine: 'hosted' });
+    } catch (e) {
+      console.error('hosted link:', e.message);
+      if (reservation && reservation.reservedNewPeriodSlot) await mt5.releaseNewPeriodSlot(req.uid, accountKey, periodKey).catch(() => {});
+      await mt5.setStatus(req.uid, { status: 'error', error: 'Could not save your account. Please try again.' }, accountKey).catch(() => {});
+      return res.status(e.status || 500).json({ error: 'Could not save your account. Please try again.' });
+    }
   }
 
   // Direct sync runs as a daily pull so MetaApi accounts are not held deployed.
@@ -366,10 +400,50 @@ app.post('/api/mt5-direct/mode', authLimiter, requireAuth, requirePro, async (re
 });
 
 app.post('/api/mt5-direct/disconnect', requireAuth, async (req, res) => {
-  const accountKey = String((req.body && req.body.accountKey) || 'legacy');
+  let accountKey = String((req.body && req.body.accountKey) || '');
+  if (!/^[0-9a-f]{32}$|^legacy$/.test(accountKey)) {
+    // Old clients send no key; use the account the panel is showing.
+    const snap = await db.collection('users').doc(req.uid).get().catch(() => null);
+    accountKey = (snap && snap.exists && snap.data().mt5Direct && snap.data().mt5Direct.accountKey) || 'legacy';
+  }
+  try { await hosted.unlink(req.uid, accountKey); } catch (e) { console.warn('hosted unlink:', e.message); }
   try { await mt5.stopSync(req.uid, { forget: !!(req.body && req.body.forget), accountKey }); } catch (e) { console.warn(e.message); }
   await mt5.setStatus(req.uid, { status: 'disconnected' }, accountKey).catch(() => {});
   res.json({ ok: true });
+});
+
+// Hosted accounts only: move this account to the front of the worker's queue.
+app.post('/api/mt5-direct/sync-now', authLimiter, requireAuth, requireSub, async (req, res) => {
+  const accountKey = String((req.body && req.body.accountKey) || '');
+  if (!/^[0-9a-f]{32}$/.test(accountKey)) return res.status(400).json({ error: 'accountKey is required' });
+  try {
+    await hosted.syncNow(req.uid, accountKey);
+    await mt5.setStatus(req.uid, { syncNowAt: Date.now() }, accountKey).catch(() => {});
+    res.json({ ok: true });
+  } catch (e) {
+    if (!e.status) console.error('sync-now:', e.message);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Could not queue a sync.', retryInMin: e.retryInMin });
+  }
+});
+
+// ── Hosted MT5 worker (~/Desktop/wine/worker.py) ───────────
+// Authenticated by WORKER_SECRET. jobs hands out decrypted investor passwords,
+// so the secret must only ever live on the worker machine.
+function requireWorker(req, res, next) {
+  const secret = process.env.WORKER_SECRET || '';
+  if (!secret) return res.status(503).json({ error: 'WORKER_SECRET is not set on the server.' });
+  if (!secretMatches(req.get('X-Worker-Key'), secret)) return res.status(403).json({ error: 'forbidden' });
+  req.workerId = String(req.get('X-Worker-Id') || 'worker').replace(/[^\w.-]/g, '').slice(0, 64) || 'worker';
+  next();
+}
+const workerLimiter = rl(60 * 1000, 120, 'Too many requests.');
+app.post('/api/worker/jobs', workerLimiter, requireWorker, async (req, res) => {
+  try { res.json({ jobs: await hosted.claim(req.workerId, req.body && req.body.max) }); }
+  catch (e) { console.error('worker/jobs:', e.message); res.status(500).json({ error: 'claim failed' }); }
+});
+app.post('/api/worker/report', workerLimiter, requireWorker, async (req, res) => {
+  try { res.json(await hosted.report(req.workerId, req.body || {})); }
+  catch (e) { if (!e.status) console.error('worker/report:', e.message); res.status(e.status || 500).json({ error: e.message }); }
 });
 
 // ── MT5 EA (FREE — no MetaApi) ─────────────────────────────

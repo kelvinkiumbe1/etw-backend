@@ -328,17 +328,17 @@ async function findDormant(days) {
   return out;
 }
 
-async function removeAccount(uid) {
-  const d = await _readStatus(uid);
+async function removeAccount(uid, accountKey) {
+  const d = await _readStatus(uid, accountKey || 'legacy');
   if (!d || !d.metaApiAccountId) return false;
-  await stopSync(uid, { forget: false }).catch(() => {});
+  await stopSync(uid, { forget: false, accountKey }).catch(() => {});
   const account = await api.metatraderAccountApi.getAccount(d.metaApiAccountId); // SDK:
   try { await account.undeploy(); } catch (e) {}
   await account.remove();
   // Null the id so a future connect provisions fresh rather than chasing an
   // account that no longer exists.
-  await setStatus(uid, { metaApiAccountId: null, prunedAt: Date.now() });
-  console.log('mt5: pruned dormant MetaApi account for', uid);
+  await setStatus(uid, { metaApiAccountId: null, prunedAt: Date.now() }, accountKey);
+  console.log('mt5: removed MetaApi account for', uid, accountKey || '');
   return true;
 }
 

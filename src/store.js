@@ -29,6 +29,38 @@ async function existingTickets(uid, source, accountId, accountKey) {
   return s;
 }
 
+// Per-uid index of stored tickets, for the EA push path. The EA posts one deal
+// per request, so a 300-deal backfill used to read the user's whole trades
+// collection 300 times. The index is read once, kept for INDEX_TTL_MS and
+// updated in place as trades are written. Keyed `${source}|${accountId}`; the
+// set holds tickets, plus `pos:<positionId>` for trades that carry one.
+const INDEX_TTL_MS = 60 * 1000;
+const tradeIndexes = new Map();   // uid -> { at, map: Map<string, Set<string>> }
+
+function indexAdd(map, t) {
+  if (t.ticket == null) return;
+  const k = (t.source || '') + '|' + (t.accountId || '');
+  if (!map.has(k)) map.set(k, new Set());
+  map.get(k).add(String(t.ticket));
+  if (t.positionId) map.get(k).add('pos:' + t.positionId);
+}
+
+async function tradeIndex(uid) {
+  const hit = tradeIndexes.get(uid);
+  if (hit && Date.now() - hit.at < INDEX_TTL_MS) return hit.map;
+  const snap = await db.collection('trades').where('uid', '==', uid).get();
+  const map = new Map();
+  snap.forEach(d => indexAdd(map, d.data()));
+  tradeIndexes.set(uid, { at: Date.now(), map });
+  if (tradeIndexes.size > 500) tradeIndexes.delete(tradeIndexes.keys().next().value);
+  return map;
+}
+
+function indexTrades(uid, trades) {
+  const hit = tradeIndexes.get(uid);
+  if (hit) trades.forEach(t => indexAdd(hit.map, t));
+}
+
 async function writeTrades(trades) {
   let n = 0;
   for (let i = 0; i < trades.length; i += 400) {
@@ -43,4 +75,4 @@ async function writeTrades(trades) {
   return n;
 }
 
-module.exports = { init, setStatus, existingTickets, writeTrades, get db() { return db; } };
+module.exports = { init, setStatus, existingTickets, tradeIndex, indexTrades, writeTrades, get db() { return db; } };
