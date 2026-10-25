@@ -27,7 +27,10 @@ const ACTIVE_EVERY = 15 * MIN;            // trades in the last 24h, or position
 const IDLE_EVERY = 60 * MIN;
 const DORMANT_EVERY = 6 * 60 * MIN;       // nothing for 14 days
 const RETRY_EVERY = 10 * MIN;             // worker-side failure (timeout, EA didn't start)
-const SYNC_NOW_COOLDOWN = 60 * MIN;
+// HOSTED_SYNC_NOW_COOLDOWN_MIN on Render overrides the wait between "Sync now"
+// presses (0 = none, e.g. while testing). Remove it to go back to 60.
+const cooldownMin = String(process.env.HOSTED_SYNC_NOW_COOLDOWN_MIN || '').trim() === '' ? NaN : Number(process.env.HOSTED_SYNC_NOW_COOLDOWN_MIN);
+const SYNC_NOW_COOLDOWN = (Number.isFinite(cooldownMin) && cooldownMin >= 0 ? cooldownMin : 60) * MIN;
 const MAX_LOGIN_FAILS = 3;                // then stop until the user re-enters details
 
 const ref = (id) => store.db.collection(COL).doc(id);
