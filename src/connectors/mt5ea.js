@@ -118,6 +118,11 @@ async function push(key, trades) {
     });
   if (k.hosted) docs.forEach(t => { t.mt5AccountKey = k.accountKey; });
   if (docs.length) { await store.writeTrades(docs); store.indexTrades(uid, docs); }
+  if (k.hosted && docs.length) {
+    // Required here, not at the top: hostedSync requires this module.
+    await require('../hostedSync').noteWeekendTrades(uid, k.accountKey, docs)
+      .catch((e) => console.warn('[hosted] weekend flag:', e.message));
+  }
 
   const last = statusAt.get(key) || 0;
   if (Date.now() - last > STATUS_EVERY_MS) {

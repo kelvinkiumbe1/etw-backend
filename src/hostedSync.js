@@ -205,6 +205,35 @@ async function claim(workerId, max) {
   return jobs;
 }
 
+// ── Weekend traders ────────────────────────────────────────────────────────
+// Crypto CFDs trade through the weekend, so an account that has closed a
+// trade on a weekend recently keeps its normal schedule then. closeTime comes
+// from the EA in broker server time ("2026.10.24 14:05:00", usually UTC+0..+3).
+// Saturday always counts; Sunday only before 20:00, since on a UTC-clocked
+// server forex trades can close from Sunday ~21:00 once the market reopens.
+const WEEKEND_TRADER_FOR = 30 * 24 * 60 * MIN;
+
+function weekendCloseAt(closeTime) {
+  const m = /^(\d{4})[.-](\d{2})[.-](\d{2})[ T](\d{2})/.exec(String(closeTime || ''));
+  if (!m) return 0;
+  const at = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4]);
+  const day = new Date(at).getUTCDay();
+  return (day === 6 || (day === 0 && +m[4] < 20)) ? at : 0;
+}
+
+// Called from the EA push path with the trades it just wrote for a hosted key.
+async function noteWeekendTrades(uid, accountKey, trades) {
+  const latest = Math.max(0, ...trades.map((t) => weekendCloseAt(t.closeTime)));
+  if (!latest || latest < Date.now() - WEEKEND_TRADER_FOR) return;
+  const r = ref(docId(uid, accountKey));
+  await store.db.runTransaction(async (tx) => {
+    const s = await tx.get(r);
+    if (s.exists && (s.data().lastWeekendTradeAt || 0) < latest) tx.update(r, { lastWeekendTradeAt: latest });
+  });
+}
+
+const tradesWeekends = (d, now) => (d.lastWeekendTradeAt || 0) > now - WEEKEND_TRADER_FOR;
+
 function nextDue(d, now) {
   const quiet = now - (d.lastActivityAt || d.createdAt || now);
   let every = IDLE_EVERY;
@@ -212,8 +241,8 @@ function nextDue(d, now) {
   else if (quiet > 14 * 24 * 60 * MIN) every = DORMANT_EVERY;
   let due = now + every;
   // Weekend: one run after the Friday close collects the last trades; then
-  // nothing until the market reopens.
-  if (marketClosed(now)) {
+  // nothing until the market reopens, unless the account trades weekends.
+  if (marketClosed(now) && !tradesWeekends(d, now)) {
     due = now + 60 * MIN;
     while (marketClosed(due)) due += 60 * MIN;
   }
@@ -263,4 +292,4 @@ async function report(workerId, { jobId, leaseId, result, sent, failed, openPosi
   return { ok: true, nextDueAt: patch.dueAt };
 }
 
-module.exports = { configured, link, unlink, syncNow, isHosted, recheck, claim, report, nextDue, encrypt, decrypt, COL };
+module.exports = { configured, link, unlink, syncNow, isHosted, recheck, claim, report, nextDue, noteWeekendTrades, weekendCloseAt, encrypt, decrypt, COL };
