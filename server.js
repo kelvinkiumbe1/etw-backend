@@ -302,7 +302,7 @@ async function requirePro(req, res, next) {
 // MT5_ENGINE=hosted sends new links to our own worker (src/hostedSync.js) instead
 // of MetaApi. Hosted sync is on every plan (Essential 1 account, Pro 3); MetaApi
 // stays Pro-only. Accounts already on MetaApi keep running until re-linked.
-const HOSTED_ENGINE = String(process.env.MT5_ENGINE || '').toLowerCase() === 'hosted';
+const HOSTED_ENGINE = String(process.env.MT5_ENGINE || '').trim().toLowerCase() === 'hosted';
 const requireDirectPlan = HOSTED_ENGINE ? requireSub : requirePro;
 
 app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requireDirectPlan, async (req, res) => {
@@ -430,7 +430,7 @@ app.post('/api/mt5-direct/sync-now', authLimiter, requireAuth, requireSub, async
 // Authenticated by WORKER_SECRET. jobs hands out decrypted investor passwords,
 // so the secret must only ever live on the worker machine.
 function requireWorker(req, res, next) {
-  const secret = process.env.WORKER_SECRET || '';
+  const secret = String(process.env.WORKER_SECRET || '').trim();
   if (!secret) return res.status(503).json({ error: 'WORKER_SECRET is not set on the server.' });
   if (!secretMatches(req.get('X-Worker-Key'), secret)) return res.status(403).json({ error: 'forbidden' });
   req.workerId = String(req.get('X-Worker-Id') || 'worker').replace(/[^\w.-]/g, '').slice(0, 64) || 'worker';
