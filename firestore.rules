@@ -7,7 +7,23 @@ service cloud.firestore {
     // ══════════════════════════════════════════════════
 
     function isAuthed() {
-      return request.auth != null;
+      return request.auth != null && mfaOk();
+    }
+
+    // Email 2FA, enforced here as well as in the backend (see mfaSatisfied in
+    // server.js). With 2FA on, a session only counts as signed in once its
+    // auth_time is in mfaSessions — i.e. it has entered a code or come from a
+    // trusted device. Every rule goes through isAuthed(), so this covers them all.
+    function mfaOk() {
+      return request.auth.token.get('mfaRequired', false) != true
+          || request.auth.token.auth_time in request.auth.token.get('mfaSessions', []);
+    }
+
+    // An email address only proves who someone is once it is verified: anyone
+    // can sign up with an address they don't own, e.g. a website visitor's.
+    function verifiedEmail() {
+      return request.auth.token.get('email_verified', false) == true
+          ? request.auth.token.get('email', '') : '';
     }
 
     // ── Subscription gate ─────────────────────────────────────────
@@ -354,8 +370,10 @@ service cloud.firestore {
       // could reset its own monthly limit.
       // referral / referredBy hold the referral code, bonus days earned/banked
       // and who referred this user — rewards are access, so Admin SDK only.
+      // mfaEnabled mirrors the 2FA claim; only POST /api/mfa/settings may change
+      // it, so a session holding just the password can't switch 2FA off.
       return ['syncTokens', 'mt5Direct', 'mt5DirectAccounts', 'aiGuard', 'btQuota',
-              'referral', 'referredBy'];
+              'referral', 'referredBy', 'mfaEnabled'];
     }
     match /users/{uid} {
       allow read:   if isAuthed() && (request.auth.uid == uid || isAdmin());
@@ -405,14 +423,16 @@ service cloud.firestore {
       // Website (landing page) chat: a guest may GET their own ticket by its id
       // (the id lives only in that visitor's browser) but may never LIST tickets,
       // so nobody can query out every visitor's email and messages.
-      allow get: if (isAuthed() && (resource.data.uid == request.auth.uid || resource.data.userEmail == request.auth.token.email || isAdmin()))
+      allow get: if (isAuthed() && (resource.data.uid == request.auth.uid || (verifiedEmail() != '' && resource.data.userEmail == verifiedEmail()) || isAdmin()))
         || (resource.data.uid == 'guest' && resource.data.source == 'landing_page');
-      allow list: if isAuthed() && (resource.data.uid == request.auth.uid || resource.data.userEmail == request.auth.token.email || isAdmin());
+      allow list: if isAuthed() && (resource.data.uid == request.auth.uid || (verifiedEmail() != '' && resource.data.userEmail == verifiedEmail()) || isAdmin());
 
       allow create: if (isAuthed() && isClaimingOwn() && uidIsValid())
         || isPublicLandingTicket();
 
-      allow update: if (isAuthed() && (resource.data.uid == request.auth.uid || isAdmin()))
+      // The owner may not hand the ticket to someone else or re-label whose it is.
+      allow update: if (isAuthed() && (isAdmin() || (resource.data.uid == request.auth.uid
+            && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['uid', 'userEmail', 'source']))))
         || isPublicLandingTicketUpdate(ticketId);
 
       allow delete: if isAdmin()
@@ -425,9 +445,13 @@ service cloud.firestore {
           || isAdmin()
         )) || isGuestLandingTicket(ticketId);
 
+        // A user's message must say it is from them: only admins may post as
+        // 'support', so nobody can fake a reply from ETW Support.
         allow create: if (isAuthed() && (
-          get(/databases/$(database)/documents/supportTickets/$(ticketId)).data.uid
-            == request.auth.uid
+          (get(/databases/$(database)/documents/supportTickets/$(ticketId)).data.uid
+              == request.auth.uid
+            && request.resource.data.role == 'user'
+            && request.resource.data.uid == request.auth.uid)
           || isAdmin()
         )) || isPublicLandingMessage(ticketId);
 
@@ -452,11 +476,16 @@ service cloud.firestore {
     //  Mentor mode is a PRO feature: only a Pro account can issue an invite.
     //  Accepting one (mentorRelationships/mentorChat below) needs any active
     //  plan — a Pro mentor's student must not be blocked mid-relationship.
+    //  Anyone signed in may open an invite by its code, but only the mentor may
+    //  list theirs. An invite can never be moved to another mentor: that would
+    //  let its owner attach students to someone else and read their playbooks.
     match /mentorInvites/{code} {
-      allow read: if isAuthed();
+      allow get: if isAuthed();
+      allow list: if isAuthed() && resource.data.mentorUid == request.auth.uid;
       allow create: if hasPro() &&
         request.resource.data.mentorUid == request.auth.uid;
-      allow update: if isAuthed() && resource.data.mentorUid == request.auth.uid;
+      allow update: if isAuthed() && resource.data.mentorUid == request.auth.uid
+        && request.resource.data.mentorUid == request.auth.uid;
       allow delete: if isAuthed() && resource.data.mentorUid == request.auth.uid;
     }
 
@@ -590,6 +619,7 @@ service cloud.firestore {
                       && (request.resource.data.parentId == null
                           || (request.resource.data.parentId is string
                               && request.resource.data.parentId.size() > 0))
+                      && (!('uid' in request.resource.data) || request.resource.data.uid == request.auth.uid)
                       && (
                            !('isOwner' in request.resource.data)
                            || request.resource.data.isOwner == false
@@ -609,14 +639,15 @@ service cloud.firestore {
                       && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likedByOwner'])
                       && request.resource.data.likedByOwner is bool;
 
+        // The page owner may remove any comment on their page; anyone else only
+        // their own (comments carry the author's uid; older ones don't, so only
+        // the owner can remove those).
         allow delete: if hasSub()
                       && commentCol.matches('comments_[A-Za-z0-9]+')
                       && (
-                           resource.data.isOwner != true
-                           ||
-                           (isAuthed()
-                             && get(/databases/$(database)/documents/publicShares/$(shareId)).data.uid
-                                  == request.auth.uid)
+                           get(/databases/$(database)/documents/publicShares/$(shareId)).data.uid
+                             == request.auth.uid
+                           || resource.data.get('uid', '') == request.auth.uid
                          );
       }
     }
