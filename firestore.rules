@@ -7,16 +7,7 @@ service cloud.firestore {
     // ══════════════════════════════════════════════════
 
     function isAuthed() {
-      return request.auth != null && mfaOk();
-    }
-
-    // Email 2FA, enforced here as well as in the backend (see mfaSatisfied in
-    // server.js). With 2FA on, a session only counts as signed in once its
-    // auth_time is in mfaSessions — i.e. it has entered a code or come from a
-    // trusted device. Every rule goes through isAuthed(), so this covers them all.
-    function mfaOk() {
-      return request.auth.token.get('mfaRequired', false) != true
-          || request.auth.token.auth_time in request.auth.token.get('mfaSessions', []);
+      return request.auth != null;
     }
 
     // ── Subscription gate ─────────────────────────────────────────
@@ -58,23 +49,49 @@ service cloud.firestore {
           && request.resource.data.uid.size() > 0;
     }
 
+    // Keep this list in sync with ADMIN_EMAILS in admin-support.html.
     function isAdmin() {
-      return isAuthed() &&
-        exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+      return isAuthed() && (
+        (
+          'email' in request.auth.token
+          && request.auth.token.email in [
+            'nekesasarah847@gmail.com'
+          ]
+        )
+        || exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    // A relationship only counts while it exists AND the mentor hasn't blocked
+    // it — a blocked student loses all cross-visibility at once (playbooks,
+    // chat, presence) and the mentor stops seeing the student's journal.
+    function relLive(relId) {
+      return exists(/databases/$(database)/documents/mentorRelationships/$(relId))
+        && get(/databases/$(database)/documents/mentorRelationships/$(relId)).data.get('blockedByMentor', false) != true;
     }
 
     function isMentorOf(studentUid) {
-      return isAuthed() &&
-        exists(/databases/$(database)/documents/mentorRelationships/$(request.auth.uid + '_' + studentUid));
+      return isAuthed() && relLive(request.auth.uid + '_' + studentUid);
     }
 
     function isStudentOf(mentorUid) {
-      return isAuthed() &&
-        exists(/databases/$(database)/documents/mentorRelationships/$(mentorUid + '_' + request.auth.uid));
+      return isAuthed() && relLive(mentorUid + '_' + request.auth.uid);
     }
 
     function isInRelationshipWith(uid) {
       return isMentorOf(uid) || isStudentOf(uid);
+    }
+
+    // ── Self-service account deletion ─────────────────────────────
+    // A user who has signed the exit form (accountDeletions/{uid}) may wipe
+    // records the normal rules keep server-owned or append-only, so deleting
+    // an account from Settings removes everything — exactly like deleting it
+    // by hand in the Firebase console. Nothing here lets anyone READ or WRITE
+    // someone else's data, or write server-owned fields; it only unlocks
+    // DELETE of the requester's own records once they've asked to leave.
+    function deletionRequested() {
+      return isAuthed()
+          && exists(/databases/$(database)/documents/accountDeletions/$(request.auth.uid));
     }
 
     // ── Public landing-page ticket validation ─────────────────────
@@ -122,22 +139,29 @@ service cloud.firestore {
     //  TRADES COLLECTION
     // ══════════════════════════════════════════════════
     match /trades/{tradeId} {
+      // Mentor → student journal stays visible. Student → mentor journal does
+      // NOT: a student sees only the mentor's playbooks (below) — the linked
+      // example trades come from the mentor's own published playbook snapshot.
       allow read:   if hasSub() && (
         isOwner() ||
-        isMentorOf(resource.data.uid) ||
-        isStudentOf(resource.data.uid)
+        isMentorOf(resource.data.uid)
       );
       allow create: if hasSub() && isClaimingOwn() && uidIsValid() && hasRequiredFields();
       allow update: if hasSub() && isOwner() && isClaimingOwn() && uidIsValid();
       // Deleting own data stays allowed after a lapse — nobody should be locked
       // out of removing their own records.
       allow delete: if isAuthed() && isOwner();
+      // Account deletion: a lapsed user must still be able to FIND their
+      // trades in order to delete them.
+      allow read: if deletionRequested() && isOwner();
     }
 
     // ══════════════════════════════════════════════════
     //  PLAYBOOKS COLLECTION
     // ══════════════════════════════════════════════════
     match /playbooks/{playbookId} {
+      // A connected student can read their mentor's playbooks (Mentor Mode ›
+      // Student › Playbooks); the mentor can read their students' playbooks.
       allow read:   if hasSub() && (
         isOwner() ||
         isMentorOf(resource.data.uid) ||
@@ -146,6 +170,7 @@ service cloud.firestore {
       allow create: if hasSub() && isClaimingOwn() && uidIsValid();
       allow update: if hasSub() && isOwner() && isClaimingOwn() && uidIsValid();
       allow delete: if isAuthed() && isOwner();
+      allow read:   if deletionRequested() && isOwner();
     }
 
     // ══════════════════════════════════════════════════
@@ -156,18 +181,128 @@ service cloud.firestore {
       allow create: if hasSub() && isClaimingOwn() && uidIsValid();
       allow update: if hasSub() && isOwner() && isClaimingOwn() && uidIsValid();
       allow delete: if isAuthed() && isOwner();
+      allow read:   if deletionRequested() && isOwner();
     }
 
     // ══════════════════════════════════════════════════
     //  PUBLIC SHARES COLLECTION
     // ══════════════════════════════════════════════════
     match /publicShares/{shareId} {
-      // Anyone can VIEW a shared page (that's the point) — but only a paying
-      // account can publish one.
-      allow read:   if true;
+      // MEMBERS-ONLY: a shared journal / playbook is readable only with an
+      // ACTIVE subscription (hasSub() checks the server-set `subscribed` claim
+      // AND that `expiresAt` is still in the future). A saved link, a copied
+      // page or an old open tab therefore gets nothing once the membership
+      // ends — the data is never sent. Renewing restores access instantly.
+      // (Admins keep read for support/moderation.)
+      allow read:   if hasSub() || isAdmin();
       allow create: if hasSub() && isClaimingOwn() && uidIsValid();
       allow update: if hasSub() && isOwner() && isClaimingOwn() && uidIsValid();
       allow delete: if isAuthed() && isOwner();
+      allow read:   if deletionRequested() && isOwner();
+    }
+
+    // ══════════════════════════════════════════════════
+    //  MONTHLY SCORES — the live competition (no server needed)
+    // ══════════════════════════════════════════════════
+    // Doc id: YYYY-MM_uid. Each user's Journal writes ONLY its own doc, only while that month is open
+    // (from 14h before the 1st, for UTC+14, until 12:05 UTC on the 1st of the next month, when the month
+    // has ended everywhere). After that it is frozen. Values are range- and consistency-checked: the
+    // rank must match the score thresholds, eligibility must match the 5-trade minimum, and a doc can
+    // only be public under the user's opted-in leaderboard name. Public docs are readable by anyone —
+    // they hold only display name, photo, rank, score, trade count and thoroughness (never trades/P&L).
+    function scoreMonthOpen(month) {
+      let y = int(month.split('-')[0]);
+      let m = int(month.split('-')[1]);
+      let opens = timestamp.date(y, m, 1) - duration.value(14, 'h');
+      let closes = timestamp.date(y + int((m - (m % 12)) / 12), (m % 12) + 1, 1)
+                   + duration.value(12, 'h') + duration.value(5, 'm');
+      return request.time >= opens && request.time < closes;
+    }
+    function tierMatches(t, s, n) {
+      return (n < 5 && t == 0) || (n >= 5 && (
+                (t == 0 && s < 200) || (t == 1 && s >= 200 && s < 400) || (t == 2 && s >= 400 && s < 600) ||
+                (t == 3 && s >= 600 && s < 750) || (t == 4 && s >= 750 && s < 880) || (t == 5 && s >= 880)));
+    }
+    function validScore(id) {
+      let d = request.resource.data;
+      return d.keys().hasOnly(['uid','month','public','name','photoURL','score','tradeAvg','trades',
+                               'tierIndex','tier','eligible','tz','updatedAt'])
+          && d.uid == request.auth.uid
+          && d.month is string && d.month.matches('^20[0-9]{2}-(0[1-9]|1[0-2])$')
+          && id == d.month + '_' + request.auth.uid
+          && scoreMonthOpen(d.month)
+          && d.score is int && d.score >= 0 && d.score <= 1000
+          && d.tradeAvg is int && d.tradeAvg >= 0 && d.tradeAvg <= 100
+          && d.trades is int && d.trades >= 0 && d.trades <= 5000
+          && d.tierIndex is int && d.tierIndex >= 0 && d.tierIndex <= 5
+          && tierMatches(d.tierIndex, d.score, d.trades)
+          && d.tier == ['Starter','Bronze','Silver','Gold','Platinum','Diamond'][d.tierIndex]
+          && d.eligible == (d.trades >= 5)
+          && d.public is bool
+          && d.name is string && d.name.size() <= 30
+          && d.photoURL is string && d.photoURL.size() <= 2000
+          && (d.photoURL == '' || d.photoURL.matches('^https://[^ "<>]+$'))
+          && d.tz is string && d.tz.size() <= 64
+          && d.updatedAt is int
+          && (d.public == false
+              || (get(/databases/$(database)/documents/leaderboardProfiles/$(request.auth.uid)).data.showOnLeaderboard == true
+                  && d.name == get(/databases/$(database)/documents/leaderboardProfiles/$(request.auth.uid)).data.displayName));
+    }
+    match /monthlyScores/{id} {
+      allow read: if resource.data.public == true
+                  || (isAuthed() && resource.data.uid == request.auth.uid);
+      allow create: if hasSub() && validScore(id);
+      allow update: if hasSub() && resource.data.uid == request.auth.uid && validScore(id);
+      allow delete: if deletionRequested() && resource.data.uid == request.auth.uid;
+    }
+
+    // ══════════════════════════════════════════════════
+    //  MONTHLY WINNERS (legacy — no longer used by the pages; kept so old data stays readable)
+    // ══════════════════════════════════════════════════
+    // Top-3 docs (doc id: YYYY-MM) are CREATED by the Admin SDK only
+    // (finalize-monthly-winners.js). Anyone, even signed out, can read a month
+    // once it is published. Admins can also read drafts and, from the client,
+    // may ONLY flip the publish flag (the "Make public" button).
+    // The public list query must include where('published','==',true).
+    match /monthlyWinners/{month} {
+      allow read:   if resource.data.published == true || isAdmin();
+      allow create, delete: if false;
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['published', 'publishedAt'])
+        && request.resource.data.published is bool;
+    }
+
+    // Each winner entry holds: rank, name, photoURL (their Journal profile
+    // photo, copied by the server from Firebase Auth — blank = show initial),
+    // points, trades, tier, tierIndex.
+
+    // Points per user per month (doc id: uid_YYYY-MM, fields uid, month, points,
+    // tradePoints, notebookPoints, trades, quality, tier, ...). Recomputed from
+    // the live journal by finalize-monthly-winners.js (Admin SDK) so nobody can
+    // award themselves points; a user can read only their own.
+    match /monthlyPoints/{id} {
+      allow read:  if isAuthed() && resource.data.uid == request.auth.uid;
+      allow create, update: if false;
+      allow delete: if deletionRequested() && resource.data.uid == request.auth.uid;
+    }
+
+    // Leaderboard opt-in: the user chooses whether they may appear publicly
+    // and under what display name. Nothing else can be stored here, apart from
+    // their time zone (tz), which the month-end job uses to put trades and
+    // session preps on the same calendar day the user sees in the app.
+    match /leaderboardProfiles/{uid} {
+      allow read:   if isAuthed() && request.auth.uid == uid;
+      allow create, update: if hasSub() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['uid', 'displayName', 'showOnLeaderboard', 'updatedAt', 'tz'])
+        && (!('tz' in request.resource.data)
+            || (request.resource.data.tz is string && request.resource.data.tz.size() <= 64))
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() >= 2
+        && request.resource.data.displayName.size() <= 30
+        && request.resource.data.showOnLeaderboard is bool;
+      allow delete: if isAuthed() && request.auth.uid == uid;
     }
 
     // ══════════════════════════════════════════════════
@@ -217,9 +352,10 @@ service cloud.firestore {
       // btQuota is the backtest session-creation counter — Admin SDK only,
       // for the same reason as syncTokens: a client that could write it
       // could reset its own monthly limit.
-      // mfaEnabled mirrors the 2FA claim; only POST /api/mfa/settings may change
-      // it, so a session holding just the password can't switch 2FA off.
-      return ['syncTokens', 'mt5Direct', 'mt5DirectAccounts', 'aiGuard', 'btQuota', 'mfaEnabled'];
+      // referral / referredBy hold the referral code, bonus days earned/banked
+      // and who referred this user — rewards are access, so Admin SDK only.
+      return ['syncTokens', 'mt5Direct', 'mt5DirectAccounts', 'aiGuard', 'btQuota',
+              'referral', 'referredBy'];
     }
     match /users/{uid} {
       allow read:   if isAuthed() && (request.auth.uid == uid || isAdmin());
@@ -228,7 +364,8 @@ service cloud.firestore {
       allow update: if isAuthed() && request.auth.uid == uid
                     && !request.resource.data.diff(resource.data).affectedKeys()
                           .hasAny(serverOwnedUserFields());
-      allow delete: if false;
+      // Only after the exit form is signed (Settings › Delete account).
+      allow delete: if deletionRequested() && request.auth.uid == uid;
     }
 
     // ══════════════════════════════════════════════════
@@ -252,6 +389,9 @@ service cloud.firestore {
       allow read: if hasSub() &&
         isMentorOf(uid) &&
         collection in ['trades', 'playbooks'];
+      // Account deletion: the owner may list and delete EVERY sub-collection
+      // (incl. private tokens and the sync ledger), with or without a plan.
+      allow list, delete: if deletionRequested() && request.auth.uid == uid;
     }
 
     // ══════════════════════════════════════════════════
@@ -261,8 +401,13 @@ service cloud.firestore {
       // Read own tickets by uid OR by matching verified email (compatibility path
       // for tickets created under the same email but a different auth uid); admins
       // read all; guests read their own landing-page ticket.
-      allow read: if (isAuthed() && (resource.data.uid == request.auth.uid || resource.data.userEmail == request.auth.token.email || isAdmin()))
+      //
+      // Website (landing page) chat: a guest may GET their own ticket by its id
+      // (the id lives only in that visitor's browser) but may never LIST tickets,
+      // so nobody can query out every visitor's email and messages.
+      allow get: if (isAuthed() && (resource.data.uid == request.auth.uid || resource.data.userEmail == request.auth.token.email || isAdmin()))
         || (resource.data.uid == 'guest' && resource.data.source == 'landing_page');
+      allow list: if isAuthed() && (resource.data.uid == request.auth.uid || resource.data.userEmail == request.auth.token.email || isAdmin());
 
       allow create: if (isAuthed() && isClaimingOwn() && uidIsValid())
         || isPublicLandingTicket();
@@ -270,7 +415,8 @@ service cloud.firestore {
       allow update: if (isAuthed() && (resource.data.uid == request.auth.uid || isAdmin()))
         || isPublicLandingTicketUpdate(ticketId);
 
-      allow delete: if isAdmin();
+      allow delete: if isAdmin()
+        || (deletionRequested() && resource.data.uid == request.auth.uid);
 
       match /messages/{msgId} {
         allow read: if (isAuthed() && (
@@ -285,7 +431,9 @@ service cloud.firestore {
           || isAdmin()
         )) || isPublicLandingMessage(ticketId);
 
-        allow update, delete: if false;
+        allow update: if false;
+        allow delete: if deletionRequested()
+          && get(/databases/$(database)/documents/supportTickets/$(ticketId)).data.uid == request.auth.uid;
       }
     }
 
@@ -315,40 +463,96 @@ service cloud.firestore {
     // ══════════════════════════════════════════════════
     //  MENTOR RELATIONSHIPS
     // ══════════════════════════════════════════════════
+    //  Doc id is ALWAYS mentorUid + '_' + studentUid. Only the two people in
+    //  it can read it (single get or a query filtered on mentorUid/studentUid —
+    //  the old blanket `allow list` exposed every student's name and email).
+    //  A student creates it by redeeming a REAL invite code of that mentor, so
+    //  nobody can attach themselves to an arbitrary mentor to read their
+    //  playbooks. Only the mentor can block (blockedByMentor) and a blocked
+    //  student can neither edit nor delete the doc to undo the block.
+    function relFieldsOk(d) {
+      return d.keys().hasOnly(['mentorUid', 'mentorName', 'studentUid', 'studentName', 'studentEmail',
+                               'connectedAt', 'active', 'inviteCode'])
+          && d.mentorUid is string && d.mentorUid.size() > 0
+          && d.studentUid is string && d.studentUid.size() > 0
+          && (!('mentorName'   in d) || (d.mentorName   is string && d.mentorName.size()   <= 120))
+          && (!('studentName'  in d) || (d.studentName  is string && d.studentName.size()  <= 120))
+          && (!('studentEmail' in d) || (d.studentEmail is string && d.studentEmail.size() <= 200))
+          && (!('active'       in d) || d.active == true);
+    }
+    function inviteBelongsTo(code, mentorUid) {
+      return code is string && code.size() >= 6 && code.size() <= 32
+          && exists(/databases/$(database)/documents/mentorInvites/$(code))
+          && get(/databases/$(database)/documents/mentorInvites/$(code)).data.mentorUid == mentorUid
+          && get(/databases/$(database)/documents/mentorInvites/$(code)).data.get('active', true) != false;
+    }
     match /mentorRelationships/{relationId} {
       allow read: if isAuthed() && (
         resource.data.mentorUid  == request.auth.uid ||
         resource.data.studentUid == request.auth.uid
       );
-      allow list: if isAuthed();
-      allow create: if hasSub() &&
-        request.resource.data.studentUid == request.auth.uid;
-      allow update: if hasSub() &&
-        resource.data.studentUid == request.auth.uid &&
-        request.resource.data.studentUid == request.auth.uid;
+      allow create: if hasSub()
+        && request.resource.data.studentUid == request.auth.uid
+        && request.resource.data.mentorUid != request.auth.uid
+        && relationId == request.resource.data.mentorUid + '_' + request.auth.uid
+        && relFieldsOk(request.resource.data)
+        && inviteBelongsTo(request.resource.data.get('inviteCode', ''), request.resource.data.mentorUid);
+      // Student re-redeeming the code (setDoc on an existing, NOT blocked doc).
+      allow update: if hasSub()
+        && resource.data.studentUid == request.auth.uid
+        && resource.data.get('blockedByMentor', false) != true
+        && request.resource.data.studentUid == resource.data.studentUid
+        && request.resource.data.mentorUid  == resource.data.mentorUid
+        && relFieldsOk(request.resource.data);
+      // Mentor blocking a student: only the block fields may change.
+      allow update: if isAuthed()
+        && resource.data.mentorUid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['active', 'blockedByMentor', 'disconnectedAt', 'disconnectedBy']);
       allow delete: if isAuthed() && (
-        resource.data.mentorUid  == request.auth.uid ||
-        resource.data.studentUid == request.auth.uid
+        resource.data.mentorUid == request.auth.uid ||
+        (resource.data.studentUid == request.auth.uid && resource.data.get('blockedByMentor', false) != true) ||
+        (deletionRequested() && resource.data.studentUid == request.auth.uid)
       );
     }
 
     // ══════════════════════════════════════════════════
     //  MENTOR CHAT
     // ══════════════════════════════════════════════════
+    //  Text is a plain UTF-8 string, so any number of emojis (incl. skin tones,
+    //  ZWJ sequences and flags) is allowed — capped at 4000 chars like support
+    //  chat. A blocked student can no longer read or send; the mentor keeps
+    //  read access to the history.
+    function chatRel(relationId) {
+      return get(/databases/$(database)/documents/mentorRelationships/$(relationId)).data;
+    }
+    function chatMsgOk(relationId) {
+      let d = request.resource.data;
+      let r = chatRel(relationId);
+      return d.ts is int
+          && d.role in ['mentor', 'student']
+          && (d.role == 'mentor') == (r.mentorUid == request.auth.uid)
+          && (!('text' in d) || (d.text is string && d.text.size() <= 4000))
+          && (!('imageUrl' in d) || (d.imageUrl is string && d.imageUrl.matches('^https://[^ "<>]+$') && d.imageUrl.size() <= 2000))
+          && (('text' in d && d.text.size() > 0) || 'imageUrl' in d)
+          && (!('senderUid' in d) || d.senderUid == request.auth.uid)
+          && (!('uid' in d) || d.uid == request.auth.uid);
+    }
     match /mentorChat/{relationId}/messages/{msgId} {
       allow read: if isAuthed() && (
-        get(/databases/$(database)/documents/mentorRelationships/$(relationId)).data.mentorUid
-          == request.auth.uid ||
-        get(/databases/$(database)/documents/mentorRelationships/$(relationId)).data.studentUid
-          == request.auth.uid
+        chatRel(relationId).mentorUid == request.auth.uid ||
+        (chatRel(relationId).studentUid == request.auth.uid
+          && chatRel(relationId).get('blockedByMentor', false) != true)
       );
-      allow create: if hasSub() && (
-        get(/databases/$(database)/documents/mentorRelationships/$(relationId)).data.mentorUid
-          == request.auth.uid ||
-        get(/databases/$(database)/documents/mentorRelationships/$(relationId)).data.studentUid
-          == request.auth.uid
-      );
-      allow update, delete: if false;
+      allow create: if hasSub()
+        && chatRel(relationId).get('blockedByMentor', false) != true
+        && (chatRel(relationId).mentorUid == request.auth.uid ||
+            chatRel(relationId).studentUid == request.auth.uid)
+        && chatMsgOk(relationId);
+      allow update: if false;
+      allow delete: if deletionRequested()
+        && (chatRel(relationId).mentorUid == request.auth.uid ||
+            chatRel(relationId).studentUid == request.auth.uid);
     }
 
     // ══════════════════════════════════════════════════
@@ -357,22 +561,26 @@ service cloud.firestore {
     match /publicInteractions/{shareId} {
       allow read, write: if false;
 
+      // Likes & comments follow the journal: members only.
       match /likes/{likeId} {
-        allow read: if true;
-        allow create: if request.resource.data.count is int
+        allow read: if hasSub();
+        allow create: if hasSub()
+                      && request.resource.data.count is int
                       && request.resource.data.count == 1
                       && request.resource.data.itemId is string
                       && request.resource.data.itemId.size() > 0;
-        allow update: if request.resource.data.count is int
+        allow update: if hasSub()
+                      && request.resource.data.count is int
                       && (request.resource.data.count == resource.data.count + 1
                           || request.resource.data.count == resource.data.count - 1);
         allow delete: if false;
       }
 
       match /{commentCol}/{commentId} {
-        allow read: if commentCol.matches('comments_[A-Za-z0-9]+');
+        allow read: if hasSub() && commentCol.matches('comments_[A-Za-z0-9]+');
 
-        allow create: if commentCol.matches('comments_[A-Za-z0-9]+')
+        allow create: if hasSub()
+                      && commentCol.matches('comments_[A-Za-z0-9]+')
                       && request.resource.data.text is string
                       && request.resource.data.text.size() > 0
                       && request.resource.data.text.size() <= 500
@@ -392,7 +600,8 @@ service cloud.firestore {
                                   == request.auth.uid)
                          );
 
-        allow update: if commentCol.matches('comments_[A-Za-z0-9]+')
+        allow update: if hasSub()
+                      && commentCol.matches('comments_[A-Za-z0-9]+')
                       && isAuthed()
                       && get(/databases/$(database)/documents/publicShares/$(shareId)).data.uid
                            == request.auth.uid
@@ -400,7 +609,8 @@ service cloud.firestore {
                       && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likedByOwner'])
                       && request.resource.data.likedByOwner is bool;
 
-        allow delete: if commentCol.matches('comments_[A-Za-z0-9]+')
+        allow delete: if hasSub()
+                      && commentCol.matches('comments_[A-Za-z0-9]+')
                       && (
                            resource.data.isOwner != true
                            ||
@@ -433,6 +643,7 @@ service cloud.firestore {
     match /mentors/{uid} {
       allow read: if isAuthed();
       allow write: if isAuthed() && request.auth.uid == uid && isMentorEmail();
+      allow delete: if deletionRequested() && request.auth.uid == uid;
     }
 
     // Session slots: mentors manage their own; students only READ
@@ -497,6 +708,64 @@ service cloud.firestore {
       match /{sub}/{docId} {
         allow read, write: if sub != 'participants' && canUseSpaces();
       }
+    }
+
+    // ══════════════════════════════════════════════════
+    //  MENTORS PLAYBOOKS — directory for the Playbooks › "Mentors playbooks" tab
+    // ══════════════════════════════════════════════════
+    //  Each doc only POINTS at a mentor's public playbook snapshot
+    //  ({ shareIds:[…] or shareId, name, role, photoURL, order, hidden }); each playbook is
+    //  read from /publicShares/{shareId} (already readable above) and is kept
+    //  current by the mentor's own app. Subscribers can read the list; only an
+    //  admin can add, edit or remove mentors. Vincent ETW is built into the app,
+    //  so this collection can stay empty until you add a second mentor.
+    match /mentorPlaybooks/{id} {
+      allow read:  if hasSub() || isAdmin();
+      allow write: if isAdmin()
+                   && ((request.resource.data.get('shareId', '') is string
+                        && request.resource.data.get('shareId', '').size() > 0
+                        && request.resource.data.get('shareId', '').size() <= 128)
+                       || (request.resource.data.get('shareIds', []) is list
+                           && request.resource.data.get('shareIds', []).size() > 0
+                           && request.resource.data.get('shareIds', []).size() <= 20));
+      allow delete: if isAdmin();
+    }
+
+    // ══════════════════════════════════════════════════
+    //  REFERRAL PROGRAM — server-owned (Admin SDK only)
+    // ══════════════════════════════════════════════════
+    //  Codes, referral links and bonus-day awards are created, paid and clawed
+    //  back only by the backend after a verified Gumroad sale. The app reads
+    //  them through /api/referral/me, so clients get no direct access at all.
+    match /referralCodes/{code} {
+      allow read, write: if false;
+    }
+    match /referrals/{referredUid} {
+      allow read, write: if false;
+    }
+
+    // ══════════════════════════════════════════════════
+    //  ACCOUNT DELETIONS — signed exit forms (Settings › Delete account)
+    // ══════════════════════════════════════════════════
+    //  Doc id = the leaving user's uid. The user creates it (with their
+    //  answers, signature and the PDF copy) BEFORE their data is wiped, and
+    //  may update its status while still signed in. After the account is
+    //  gone only admins can read it — it is ETW's record of why they left.
+    match /accountDeletions/{uid} {
+      allow create: if isAuthed() && request.auth.uid == uid
+        && request.resource.data.uid == uid
+        && request.resource.data.keys().hasAll(['uid', 'email', 'reason', 'signedName', 'createdAt'])
+        && request.resource.data.reason is string && request.resource.data.reason.size() <= 200
+        && request.resource.data.signedName is string
+        && request.resource.data.signedName.size() >= 2 && request.resource.data.signedName.size() <= 120;
+      // The owner may update it while still signed in (status changes, or
+      // re-signing the form when a previous attempt was interrupted).
+      allow update: if isAuthed() && request.auth.uid == uid
+        && request.resource.data.uid == uid
+        && request.resource.data.signedName is string
+        && request.resource.data.signedName.size() >= 2 && request.resource.data.signedName.size() <= 120;
+      allow read:   if isAdmin() || (isAuthed() && request.auth.uid == uid);
+      allow delete: if isAdmin();
     }
 
     // ══════════════════════════════════════════════════
