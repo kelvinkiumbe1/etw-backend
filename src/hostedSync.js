@@ -86,7 +86,7 @@ async function link(uid, { accountKey, login, password, server, platform, journa
   await mt5.setStatus(uid, {
     status: 'connecting', engine: 'hosted', platform: platform === 'mt4' ? 'mt4' : 'mt5',
     login: String(login), server: String(server), journalAccountId: journalAccountId || '',
-    error: null, queuedAt: Date.now(), metaApiAccountId: null,
+    error: null, errorCode: null, masterPassword: null, syncing: false, queuedAt: Date.now(), metaApiAccountId: null,
   }, accountKey);
   return { ok: true };
 }
@@ -203,7 +203,8 @@ async function claim(workerId, max) {
       jobId: doc.id, leaseId, login: d.login, server: d.server, platform: d.platform,
       password, syncKey: d.eaKey,
     });
-    if (!d.everSynced) await mt5.setStatus(d.uid, { status: 'connecting', syncing: true }, d.accountKey).catch(() => {});
+    // Lets the journal show "Syncing now…" for every run, not just the first.
+    await mt5.setStatus(d.uid, d.everSynced ? { syncing: true, syncStartedAt: now } : { status: 'connecting', syncing: true, syncStartedAt: now }, d.accountKey).catch(() => {});
   }
   return jobs;
 }
@@ -253,9 +254,14 @@ function nextDue(d, now) {
 }
 
 const LOGIN_MSG = 'The broker rejected the login, investor password or server. Check them and connect again.';
+const BAD_PASSWORD_MSG = 'The broker says this login or investor password is wrong. Check them in MT5 and connect again.';
+const UNKNOWN_SERVER_MSG = (server) => 'We could not find a broker server called "' + server + '". Copy the server name exactly as MT5 shows it '
+  + '(File → Login to Trade Account, e.g. "ICMarketsSC-MT5-2") and connect again.';
 
-// result: done | send_failed | not_connected | ea_failed | timeout
-async function report(workerId, { jobId, leaseId, result, sent, failed, openPositions, durationMs, detail }) {
+// result: done | send_failed | not_connected | unknown_server | ea_failed | timeout
+// access: which password the terminal logged in with — 'investor' (read-only,
+// what we ask for) or 'trading' (the master password). '' when unknown.
+async function report(workerId, { jobId, leaseId, result, sent, failed, openPositions, durationMs, detail, access }) {
   const r = ref(String(jobId || ''));
   const snap = await r.get();
   if (!snap.exists) return { ok: true, gone: true };          // unlinked mid-run
@@ -271,7 +277,14 @@ async function report(workerId, { jobId, leaseId, result, sent, failed, openPosi
     patch.openPositions = Math.max(0, Number(openPositions) || 0);
     if (sent > 0) patch.lastActivityAt = now;
     patch.dueAt = nextDue(Object.assign({}, d, patch), now);
-    status = { status: 'connected', syncing: false, error: null, lastSyncAt: now, nextSyncAt: patch.dueAt, pausedReason: null };
+    status = { status: 'connected', syncing: false, error: null, lastSyncAt: now, nextSyncAt: patch.dueAt, pausedReason: null, errorCode: null, lastSent: sent };
+    if (access === 'trading' || access === 'investor') status.masterPassword = access === 'trading';
+  } else if (result === 'unknown_server') {
+    // The worker searched MT5's broker directory and found no such server.
+    // Retrying won't help until the user fixes the name.
+    patch.loginFails = MAX_LOGIN_FAILS;
+    patch.dueAt = Number.MAX_SAFE_INTEGER;
+    status = { status: 'error', syncing: false, error: UNKNOWN_SERVER_MSG(d.server), errorCode: 'unknown_server' };
   } else if (result === 'not_connected') {
     patch.loginFails = (d.loginFails || 0) + 1;
     // A broker that is briefly down looks the same as a wrong password. A
@@ -279,15 +292,19 @@ async function report(workerId, { jobId, leaseId, result, sent, failed, openPosi
     // once; an account that has synced before gets a few retries first.
     const giveUp = !d.everSynced || patch.loginFails >= MAX_LOGIN_FAILS;
     patch.dueAt = giveUp ? Number.MAX_SAFE_INTEGER : now + RETRY_EVERY * patch.loginFails;
-    if (giveUp) { patch.loginFails = MAX_LOGIN_FAILS; status = { status: 'error', syncing: false, error: LOGIN_MSG }; }
+    const badPassword = detail === 'invalid_account';
+    if (giveUp) {
+      patch.loginFails = MAX_LOGIN_FAILS;
+      status = { status: 'error', syncing: false, error: badPassword ? BAD_PASSWORD_MSG : LOGIN_MSG, errorCode: badPassword ? 'bad_password' : 'login_failed' };
+    } else status = { syncing: false };
   } else {
     // send_failed / ea_failed / timeout are on our side, not the user's.
     patch.workerFails = (d.workerFails || 0) + 1;
     patch.dueAt = now + RETRY_EVERY * Math.min(patch.workerFails, 6);
     console.warn('[hosted]', jobId, result, 'x' + patch.workerFails, String(detail || '').slice(0, 200));
-    if (!d.everSynced && patch.workerFails >= 3) {
-      status = { status: 'error', syncing: false, error: 'We could not sync this account yet. We will keep retrying — no action needed.' };
-    }
+    status = (!d.everSynced && patch.workerFails >= 3)
+      ? { status: 'error', syncing: false, error: 'We could not sync this account yet. We will keep retrying — no action needed.' }
+      : { syncing: false };
   }
   await r.update(patch);
   if (status) await mt5.setStatus(d.uid, status, d.accountKey);
