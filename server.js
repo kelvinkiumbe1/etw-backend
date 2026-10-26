@@ -63,8 +63,47 @@ tokens.init({
 // ── MT5 Direct = Pro only ──────────────────────────────────
 // 'pro' → sync; 'locked' → active Essential (or lapsed) plan, hold the sync;
 // 'unknown' → the plan lookup failed, skip this one pull and try again later.
+// ── Independent accounts ("spaces") ──────────────────────────
+// One login can own several fully independent journals. The main journal keeps
+// the login's uid; every other account lives under the data uid
+// `${uid}__${accountId}` (accountId = the doc id in users/{uid}/accounts).
+// Broker connections, synced trades and their status all live under that data
+// uid, so every connector below just receives it in place of the login uid.
+// Plans, tokens of identity and subscriptions always belong to the login, so
+// any plan lookup goes through ownerUid().
+const SPACE_SEP = '__';
+function ownerUid(id) { return String(id || '').split(SPACE_SEP)[0]; }
+function isSpaceUid(id) { return String(id || '').indexOf(SPACE_SEP) > 0; }
+const _spaceOk = new Map();   // `${uid}/${accountId}` -> expiry (ms) of a positive ownership check
+async function dataUidFor(req) {
+  const raw = String(req.get('X-ETW-Space') || (req.body && req.body.etwSpace) || (req.query && req.query.etwSpace) || '').trim();
+  if (!raw) return req.uid;
+  if (!/^[A-Za-z0-9]{6,40}$/.test(raw)) { const e = new Error('Invalid account.'); e.status = 400; throw e; }
+  const key = req.uid + '/' + raw;
+  const exp = _spaceOk.get(key);
+  if (!exp || exp < Date.now()) {
+    const snap = await db.collection('users').doc(req.uid).collection('accounts').doc(raw).get();
+    if (!snap.exists) { const e = new Error('That account no longer exists.'); e.status = 404; throw e; }
+    _spaceOk.set(key, Date.now() + 10 * 60 * 1000);
+  }
+  return req.uid + SPACE_SEP + raw;
+}
+// Express middleware: resolves req.duid (data uid) for the routes that store
+// per-account data (broker links). Everything else keeps using req.uid.
+async function withSpace(req, res, next) {
+  try { req.duid = await dataUidFor(req); next(); }
+  catch (e) { res.status(e.status || 500).json({ error: e.status ? e.message : 'Could not resolve the account.' }); }
+}
+// Every independent account a login owns (data uids, main excluded).
+async function spacesOf(uid) {
+  try {
+    const snap = await db.collection('users').doc(uid).collection('accounts').get();
+    return snap.docs.map((d) => uid + SPACE_SEP + d.id);
+  } catch (e) { return []; }
+}
+
 async function directPlanGate(uid) {
-  try { const a = await access.accessFor(uid, null); return (a.active && access.isPro(a)) ? 'pro' : 'locked'; }
+  try { const a = await access.accessFor(ownerUid(uid), null); return (a.active && access.isPro(a)) ? 'pro' : 'locked'; }
   catch (e) { console.warn('[mt5-pro] plan check failed for', uid, e.message); return 'unknown'; }
 }
 const PRO_HOLD_MSG = 'MT5 Direct auto-sync is on the Pro plan. Upgrade to Pro to resume syncing — your imported trades are safe.';
@@ -104,8 +143,13 @@ async function releaseDirectForPro(uid) {
     if (keys.length) console.log('[mt5-pro] resumed MT5 Direct sync after Pro upgrade for', uid, keys.join(','));
   } catch (e) { console.warn('[mt5-pro] release failed for', uid, e.message); }
 }
-// Hold or release one user according to their current plan.
+// Hold or release one user according to their current plan — the login's own
+// journal and, when called with a login uid, every independent account it owns.
 async function enforceDirectPlan(uid) {
+  await enforceDirectPlanOne(uid);
+  if (!isSpaceUid(uid)) for (const s of await spacesOf(uid)) await enforceDirectPlanOne(s).catch(() => {});
+}
+async function enforceDirectPlanOne(uid) {
   hosted.recheck(uid).catch((e) => console.warn('[hosted] recheck failed for', uid, e.message));
   const g = await directPlanGate(uid);
   if (g === 'pro') return releaseDirectForPro(uid);
@@ -308,7 +352,7 @@ const HOSTED_ENGINE = String(process.env.MT5_ENGINE || '').trim().toLowerCase() 
 // Auto-sync is a Pro feature on both engines (admin decision 2026-10-26).
 const requireDirectPlan = requirePro;
 
-app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requireDirectPlan, async (req, res) => {
+app.post('/api/mt5-direct/connect', authLimiter, requireAuth, withSpace, requireDirectPlan, async (req, res) => {
   const { login, password, server, platform, journalAccountId } = req.body || {};
   if (!login || !password || !server) return res.status(400).json({ error: 'login, password and server are required' });
   if (!/^\d{1,20}$/.test(String(login).trim()) || String(server).length > 128 || String(password).length > 128) {
@@ -323,7 +367,7 @@ app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requireDirectPlan,
   const periodKey = String(req.access.expiresAt || req.access.periodStart || req.access.plan || 'active');
   let reservation;
   try {
-    reservation = await mt5.reserveAccount(req.uid, accountKey, {
+    reservation = await mt5.reserveAccount(req.duid, accountKey, {
       status: 'connecting', platform: platform || 'mt5', login: String(login), server,
       error: null, journalAccountId: journalAccountId || '',
     }, accountLimit, periodKey);
@@ -338,17 +382,17 @@ app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requireDirectPlan,
   if (HOSTED_ENGINE) {
     try {
       // Moving an account off MetaApi: delete it there so it stops billing.
-      const prev = await db.collection('users').doc(req.uid).get();
+      const prev = await db.collection('users').doc(req.duid).get();
       const was = prev.exists && prev.data().mt5DirectAccounts && prev.data().mt5DirectAccounts[accountKey];
       if (was && was.metaApiAccountId) {
-        await mt5.removeAccount(req.uid, accountKey).catch((e) => console.warn('[hosted] MetaApi removal failed:', e.message));
+        await mt5.removeAccount(req.duid, accountKey).catch((e) => console.warn('[hosted] MetaApi removal failed:', e.message));
       }
-      await hosted.link(req.uid, { accountKey, login: String(login).trim(), password: String(password), server: String(server).trim(), platform, journalAccountId });
+      await hosted.link(req.duid, { accountKey, login: String(login).trim(), password: String(password), server: String(server).trim(), platform, journalAccountId });
       return res.json({ ok: true, status: 'connecting', accountKey, accountLimit, engine: 'hosted' });
     } catch (e) {
       console.error('hosted link:', e.message);
-      if (reservation && reservation.reservedNewPeriodSlot) await mt5.releaseNewPeriodSlot(req.uid, accountKey, periodKey).catch(() => {});
-      await mt5.setStatus(req.uid, { status: 'error', error: 'Could not save your account. Please try again.' }, accountKey).catch(() => {});
+      if (reservation && reservation.reservedNewPeriodSlot) await mt5.releaseNewPeriodSlot(req.duid, accountKey, periodKey).catch(() => {});
+      await mt5.setStatus(req.duid, { status: 'error', error: 'Could not save your account. Please try again.' }, accountKey).catch(() => {});
       return res.status(e.status || 500).json({ error: 'Could not save your account. Please try again.' });
     }
   }
@@ -356,22 +400,22 @@ app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requireDirectPlan,
   // Direct sync runs as a daily pull so MetaApi accounts are not held deployed.
   let mode = 'daily';
   try {
-    const prev = await db.collection('users').doc(req.uid).get();
+    const prev = await db.collection('users').doc(req.duid).get();
     mode = ((prev.exists && prev.data().mt5DirectAccounts &&
       prev.data().mt5DirectAccounts[accountKey] &&
       prev.data().mt5DirectAccounts[accountKey].mode) || 'daily');
   } catch (e) {}
-  await mt5.setStatus(req.uid, { status: 'connecting', platform: platform || 'mt5', login: String(login), server, error: null, accountKey, mode, journalAccountId: journalAccountId || '' }, accountKey);
+  await mt5.setStatus(req.duid, { status: 'connecting', platform: platform || 'mt5', login: String(login), server, error: null, accountKey, mode, journalAccountId: journalAccountId || '' }, accountKey);
   res.json({ ok: true, status: 'connecting', accountKey, accountLimit });
-  mt5.startSync({ uid: req.uid, login: String(login), password, server, platform: platform || 'mt5', accountId: journalAccountId || '', accountKey })
+  mt5.startSync({ uid: req.duid, login: String(login), password, server, platform: platform || 'mt5', accountId: journalAccountId || '', accountKey })
     .then(async (r) => {
-      await mt5.setStatus(req.uid, { status: 'connected' }, accountKey).catch(() => {});
+      await mt5.setStatus(req.duid, { status: 'connected' }, accountKey).catch(() => {});
     })
     .catch(async (e) => {
       console.error('mt5 startSync:', e.message);
-      await mt5.setStatus(req.uid, { status: 'error', error: mt5.friendlyError(e) }, accountKey).catch(() => {});
+      await mt5.setStatus(req.duid, { status: 'error', error: mt5.friendlyError(e) }, accountKey).catch(() => {});
       if (reservation && reservation.reservedNewPeriodSlot) {
-        await mt5.releaseNewPeriodSlot(req.uid, accountKey, periodKey).catch((releaseError) => {
+        await mt5.releaseNewPeriodSlot(req.duid, accountKey, periodKey).catch((releaseError) => {
           console.error('mt5 reservation rollback:', releaseError.message);
         });
       }
@@ -379,22 +423,22 @@ app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requireDirectPlan,
 });
 // Daily mode is the only supported direct-sync mode. This endpoint remains for
 // old clients that may still send a mode preference.
-app.post('/api/mt5-direct/mode', authLimiter, requireAuth, requirePro, async (req, res) => {
+app.post('/api/mt5-direct/mode', authLimiter, requireAuth, withSpace, requirePro, async (req, res) => {
   const mode = String((req.body && req.body.mode) || '').toLowerCase();
   if (mode !== 'daily') return res.status(400).json({ error: "only daily sync is supported" });
   const accountKey = String((req.body && req.body.accountKey) || 'legacy');
   try {
-    const snap = await db.collection('users').doc(req.uid).get();
+    const snap = await db.collection('users').doc(req.duid).get();
     const data = snap.exists ? snap.data() : {};
     const d = (data.mt5DirectAccounts && data.mt5DirectAccounts[accountKey]) || data.mt5Direct || {};
     const was = d.mode || 'daily';
     if (was === mode) return res.json({ ok: true, mode, unchanged: true });
 
-    await mt5.setStatus(req.uid, { mode }, accountKey);
+    await mt5.setStatus(req.duid, { mode }, accountKey);
 
     // Only reshape the connection if one exists. Switching while disconnected
     // just records the preference for the next connect.
-    if (d.status === 'paused') mt5.resumeOne(req.uid, accountKey).catch((e) => console.error('mode resume:', e.message));
+    if (d.status === 'paused') mt5.resumeOne(req.duid, accountKey).catch((e) => console.error('mode resume:', e.message));
     res.json({ ok: true, mode });
   } catch (e) {
     console.error('mt5 mode:', e.message);
@@ -402,26 +446,26 @@ app.post('/api/mt5-direct/mode', authLimiter, requireAuth, requirePro, async (re
   }
 });
 
-app.post('/api/mt5-direct/disconnect', requireAuth, async (req, res) => {
+app.post('/api/mt5-direct/disconnect', requireAuth, withSpace, async (req, res) => {
   let accountKey = String((req.body && req.body.accountKey) || '');
   if (!/^[0-9a-f]{32}$|^legacy$/.test(accountKey)) {
     // Old clients send no key; use the account the panel is showing.
-    const snap = await db.collection('users').doc(req.uid).get().catch(() => null);
+    const snap = await db.collection('users').doc(req.duid).get().catch(() => null);
     accountKey = (snap && snap.exists && snap.data().mt5Direct && snap.data().mt5Direct.accountKey) || 'legacy';
   }
-  try { await hosted.unlink(req.uid, accountKey); } catch (e) { console.warn('hosted unlink:', e.message); }
-  try { await mt5.stopSync(req.uid, { forget: !!(req.body && req.body.forget), accountKey }); } catch (e) { console.warn(e.message); }
-  await mt5.setStatus(req.uid, { status: 'disconnected' }, accountKey).catch(() => {});
+  try { await hosted.unlink(req.duid, accountKey); } catch (e) { console.warn('hosted unlink:', e.message); }
+  try { await mt5.stopSync(req.duid, { forget: !!(req.body && req.body.forget), accountKey }); } catch (e) { console.warn(e.message); }
+  await mt5.setStatus(req.duid, { status: 'disconnected' }, accountKey).catch(() => {});
   res.json({ ok: true });
 });
 
 // Hosted accounts only: move this account to the front of the worker's queue.
-app.post('/api/mt5-direct/sync-now', authLimiter, requireAuth, requireSub, async (req, res) => {
+app.post('/api/mt5-direct/sync-now', authLimiter, requireAuth, withSpace, requireSub, async (req, res) => {
   const accountKey = String((req.body && req.body.accountKey) || '');
   if (!/^[0-9a-f]{32}$/.test(accountKey)) return res.status(400).json({ error: 'accountKey is required' });
   try {
-    await hosted.syncNow(req.uid, accountKey);
-    await mt5.setStatus(req.uid, { syncNowAt: Date.now() }, accountKey).catch(() => {});
+    await hosted.syncNow(req.duid, accountKey);
+    await mt5.setStatus(req.duid, { syncNowAt: Date.now() }, accountKey).catch(() => {});
     res.json({ ok: true });
   } catch (e) {
     if (!e.status) console.error('sync-now:', e.message);
@@ -451,9 +495,9 @@ app.post('/api/worker/report', workerLimiter, requireWorker, async (req, res) =>
 
 // ── MT5 EA (FREE — no MetaApi) ─────────────────────────────
 // register: Firebase-auth'd, mints a key for the active account.
-app.post('/api/mt5-ea/register', authLimiter, requireAuth, requireSub, async (req, res) => {
+app.post('/api/mt5-ea/register', authLimiter, requireAuth, withSpace, requireSub, async (req, res) => {
   try {
-    const key = await mt5ea.register(req.uid, (req.body && req.body.journalAccountId) || '');
+    const key = await mt5ea.register(req.duid, (req.body && req.body.journalAccountId) || '');
     res.json({ ok: true, key });
   } catch (e) { console.error('ea register:', e.message); res.status(500).json({ error: e.message }); }
 });
@@ -468,38 +512,38 @@ app.post('/api/mt5/trades', eaLimiter, eaPush);   // matches the EA's default Se
 app.post('/api/mt5-ea/push', eaLimiter, eaPush);
 
 // ── TradeLocker ────────────────────────────────────────────
-app.post('/api/tradelocker/connect', authLimiter, requireAuth, requireSub, async (req, res) => {
+app.post('/api/tradelocker/connect', authLimiter, requireAuth, withSpace, requireSub, async (req, res) => {
   const { email, password, server, env, journalAccountId } = req.body || {};
   if (!email || !password || !server) return res.status(400).json({ error: 'email, password and server are required' });
-  await store.setStatus(req.uid, 'tradelocker', { status: 'connecting', server: env || 'demo', error: null });
+  await store.setStatus(req.duid, 'tradelocker', { status: 'connecting', server: env || 'demo', error: null });
   res.json({ ok: true, status: 'connecting' });
-  tradelocker.startSync({ uid: req.uid, email, password, server, env: env === 'live' ? 'live' : 'demo', accountId: journalAccountId || '' })
-    .catch(async (e) => { console.error('tradelocker:', e.message); await store.setStatus(req.uid, 'tradelocker', { status: 'error', error: tradelocker.friendlyError(e) }).catch(() => {}); });
+  tradelocker.startSync({ uid: req.duid, email, password, server, env: env === 'live' ? 'live' : 'demo', accountId: journalAccountId || '' })
+    .catch(async (e) => { console.error('tradelocker:', e.message); await store.setStatus(req.duid, 'tradelocker', { status: 'error', error: tradelocker.friendlyError(e) }).catch(() => {}); });
 });
-app.post('/api/tradelocker/disconnect', requireAuth, async (req, res) => {
-  try { await tradelocker.stopSync(req.uid); } catch (e) {}
-  await store.setStatus(req.uid, 'tradelocker', { status: 'disconnected' }).catch(() => {});
+app.post('/api/tradelocker/disconnect', requireAuth, withSpace, async (req, res) => {
+  try { await tradelocker.stopSync(req.duid); } catch (e) {}
+  await store.setStatus(req.duid, 'tradelocker', { status: 'disconnected' }).catch(() => {});
   res.json({ ok: true });
 });
 
 // ── DXtrade ────────────────────────────────────────────────
-app.post('/api/dxtrade/connect', authLimiter, requireAuth, requireSub, async (req, res) => {
+app.post('/api/dxtrade/connect', authLimiter, requireAuth, withSpace, requireSub, async (req, res) => {
   const { webUrl, username, password, domain, journalAccountId } = req.body || {};
   if (!webUrl || !username || !password) return res.status(400).json({ error: 'webUrl, username and password are required' });
-  await store.setStatus(req.uid, 'dxtrade', { status: 'connecting', error: null });
+  await store.setStatus(req.duid, 'dxtrade', { status: 'connecting', error: null });
   res.json({ ok: true, status: 'connecting' });
-  dxtrade.startSync({ uid: req.uid, webUrl, username, password, domain, accountId: journalAccountId || '' })
-    .catch(async (e) => { console.error('dxtrade:', e.message); await store.setStatus(req.uid, 'dxtrade', { status: 'error', error: dxtrade.friendlyError(e) }).catch(() => {}); });
+  dxtrade.startSync({ uid: req.duid, webUrl, username, password, domain, accountId: journalAccountId || '' })
+    .catch(async (e) => { console.error('dxtrade:', e.message); await store.setStatus(req.duid, 'dxtrade', { status: 'error', error: dxtrade.friendlyError(e) }).catch(() => {}); });
 });
-app.post('/api/dxtrade/disconnect', requireAuth, async (req, res) => {
-  try { await dxtrade.stopSync(req.uid); } catch (e) {}
-  await store.setStatus(req.uid, 'dxtrade', { status: 'disconnected' }).catch(() => {});
+app.post('/api/dxtrade/disconnect', requireAuth, withSpace, async (req, res) => {
+  try { await dxtrade.stopSync(req.duid); } catch (e) {}
+  await store.setStatus(req.duid, 'dxtrade', { status: 'disconnected' }).catch(() => {});
   res.json({ ok: true });
 });
 
 // ── cTrader (OAuth) ────────────────────────────────────────
-app.get('/api/ctrader/auth', authLimiter, requireAuth, requireSub, async (req, res) => {
-  try { res.json({ ok: true, url: ctrader.createAuthUrl(req.uid, (req.query && req.query.journalAccountId) || '') }); }
+app.get('/api/ctrader/auth', authLimiter, requireAuth, withSpace, requireSub, async (req, res) => {
+  try { res.json({ ok: true, url: ctrader.createAuthUrl(req.duid, (req.query && req.query.journalAccountId) || '') }); }
   catch (e) { res.status(400).json({ error: ctrader.friendlyError(e) }); }
 });
 app.get('/api/ctrader/callback', async (req, res) => {
@@ -510,8 +554,8 @@ app.get('/api/ctrader/callback', async (req, res) => {
   try { await ctrader.handleCallback(code, state); close('cTrader connected ✓'); }
   catch (e) { console.error('ctrader callback:', e.message); close('cTrader connect failed: ' + e.message); }
 });
-app.post('/api/ctrader/disconnect', requireAuth, async (req, res) => {
-  try { await ctrader.disconnect(req.uid); } catch (e) {}
+app.post('/api/ctrader/disconnect', requireAuth, withSpace, async (req, res) => {
+  try { await ctrader.disconnect(req.duid); } catch (e) {}
   res.json({ ok: true });
 });
 
