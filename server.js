@@ -30,6 +30,46 @@ const access = require('./src/access');
 const tokens = require('./src/tokens');
 const aiGuard = require('./src/aiGuard');
 
+// ══ PLANS: Essential · Pro · Ultra ═══════════════════════════════════
+// Ultra includes everything in Pro, so every existing Pro gate (access.isPro,
+// requirePro, Firestore hasPro) also lets Ultra through. The plan claim rides in
+// the ID token (grantSubscription sets it), so req.token.plan is authoritative
+// for a request; planFor() falls back to the access lookup.
+const PLAN_LIMITS = {
+  //            independent journal accounts · MT5 per account · AI chat messages/day · AI calls/day (hidden safety cap) · trade replays/month
+  essential: { accounts: 2,  mt5PerAccount: 1, aiMessages: 0,  aiCalls: 0,   replays: 0 },
+  pro:       { accounts: 3,  mt5PerAccount: 1, aiMessages: 5,  aiCalls: 150, replays: 10 },
+  ultra:     { accounts: 10, mt5PerAccount: 1, aiMessages: 20, aiCalls: 600, replays: Infinity },
+};
+// What the pricing page advertises for the daily AI allowance.
+const AI_CREDITS = { pro: 500, ultra: 10000 };
+const PLAN_TITLE = { essential: 'Essential', pro: 'Pro', ultra: 'Ultra' };
+function planTitle(p) { return PLAN_TITLE[String(p || '').toLowerCase()] || 'Essential'; }
+function limitsFor(p) {
+  const L = PLAN_LIMITS[p] || PLAN_LIMITS.essential;
+  return { accounts: L.accounts, mt5PerAccount: L.mt5PerAccount, aiMessages: L.aiMessages, aiCredits: AI_CREDITS[p] || 0,
+           replays: L.replays === Infinity ? null : L.replays, voice: p === 'ultra', backtesting: p === 'ultra' ? 'unlimited' : p === 'pro' ? 3 : 0, backtestCloudBackup: p === 'ultra', universityUnlimited: p === 'ultra', prioritySupport: p === 'ultra' };
+}
+function tokenPlan(tok) {
+  if (!tok || tok.subscribed !== true) return null;
+  if (tok.expiresAt && Date.now() >= Number(tok.expiresAt)) return null;
+  const p = String(tok.plan || 'essential').toLowerCase();
+  return PLAN_LIMITS[p] ? p : 'essential';
+}
+function planOfAccess(a) {
+  if (!a || a.active === false) return null;
+  const p = String(a.plan || 'essential').toLowerCase();
+  return PLAN_LIMITS[p] ? p : 'essential';
+}
+async function planFor(req) {
+  const t = tokenPlan(req.token);
+  if (t) return t;
+  try { return planOfAccess(req.access || await access.accessFor(req.uid, req.token)); } catch (e) { return null; }
+}
+const _accessIsPro = access.isPro.bind(access);
+access.isPro = (a) => !!a && (String(a.plan || '').toLowerCase() === 'ultra' || _accessIsPro(a));
+access.isUltra = (a) => !!a && a.active !== false && String(a.plan || '').toLowerCase() === 'ultra';
+
 initFirebase();
 const db = admin.firestore();
 store.init(db);
@@ -86,13 +126,25 @@ async function dataUidFor(req) {
     if (!snap.exists) { const e = new Error('That account no longer exists.'); e.status = 404; throw e; }
     _spaceOk.set(key, Date.now() + 10 * 60 * 1000);
   }
+  // Plan limit: accounts are counted oldest first (the main one is #1), so an
+  // account past the plan's allowance is locked until the user upgrades.
+  const plan = (await planFor(req)) || 'essential';
+  const allowed = PLAN_LIMITS[plan].accounts;
+  const all = await db.collection('users').doc(req.uid).collection('accounts').orderBy('created', 'asc').get().catch(() => null);
+  if (all) {
+    const idx = all.docs.findIndex((d) => d.id === raw);
+    if (idx >= allowed) {
+      const e = new Error('Your ' + planTitle(plan) + ' plan includes ' + allowed + ' accounts. Upgrade to use this one.');
+      e.status = 402; e.code = 'account_limit'; throw e;
+    }
+  }
   return req.uid + SPACE_SEP + raw;
 }
 // Express middleware: resolves req.duid (data uid) for the routes that store
 // per-account data (broker links). Everything else keeps using req.uid.
 async function withSpace(req, res, next) {
   try { req.duid = await dataUidFor(req); next(); }
-  catch (e) { res.status(e.status || 500).json({ error: e.status ? e.message : 'Could not resolve the account.' }); }
+  catch (e) { res.status(e.status || 500).json({ error: e.status ? e.message : 'Could not resolve the account.', code: e.code || undefined }); }
 }
 // Every independent account a login owns (data uids, main excluded).
 async function spacesOf(uid) {
@@ -103,7 +155,14 @@ async function spacesOf(uid) {
 }
 
 async function directPlanGate(uid) {
-  try { const a = await access.accessFor(ownerUid(uid), null); return (a.active && access.isPro(a)) ? 'pro' : 'locked'; }
+  try {
+    const a = await access.accessFor(ownerUid(uid), null);
+    if (a.active && access.isPro(a)) return 'pro';
+    // Ultra lives in the custom claim; check it directly in case the access
+    // lookup does not know the plan name yet.
+    try { const u = await admin.auth().getUser(ownerUid(uid)); if (tokenPlan(u.customClaims || {}) === 'ultra') return 'pro'; } catch (e) {}
+    return 'locked';
+  }
   catch (e) { console.warn('[mt5-pro] plan check failed for', uid, e.message); return 'unknown'; }
 }
 const PRO_HOLD_MSG = 'MT5 Direct auto-sync is on the Pro plan. Upgrade to Pro to resume syncing — your imported trades are safe.';
@@ -202,6 +261,7 @@ app.use(cors({
 }));
 app.use('/api/ai/groq', express.json({ limit: '8mb' })); // AI vision payloads (base64 images) exceed 1mb
 app.use('/api/ai/transcribe', express.json({ limit: '25mb' })); // base64 voice audio
+app.use('/api/backtest/backup', express.json({ limit: '24mb' })); // Ultra backtesting cloud backup
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' })); // Gumroad pings are form-encoded
 
@@ -338,10 +398,19 @@ async function requireSub(req, res, next) {
 async function requirePro(req, res, next) {
   try {
     const a = await access.accessFor(req.uid, req.token);
+    if (tokenPlan(req.token) === 'ultra') { req.access = Object.assign({}, a, { active: true, plan: 'ultra' }); return next(); }
     if (!a.active) return res.status(402).json({ error: 'A subscription is required to use this feature.', code: 'subscription_required' });
     if (!access.isPro(a)) return res.status(402).json({ error: 'This feature is on the Pro plan.', code: 'pro_required', plan: a.plan || null });
     req.access = a; next();
   } catch (e) { console.error('requirePro:', e.message); res.status(500).json({ error: 'Access check failed.' }); }
+}
+async function requireUltra(req, res, next) {
+  try {
+    const plan = await planFor(req);
+    if (!plan) return res.status(402).json({ error: 'A subscription is required to use this feature.', code: 'subscription_required' });
+    if (plan !== 'ultra') return res.status(402).json({ error: 'This feature is on the Ultra plan.', code: 'ultra_required', plan });
+    next();
+  } catch (e) { console.error('requireUltra:', e.message); res.status(500).json({ error: 'Access check failed.' }); }
 }
 
 // ── MT5 / MT4 ──────────────────────────────────────────────
@@ -360,10 +429,11 @@ app.post('/api/mt5-direct/connect', authLimiter, requireAuth, withSpace, require
   }
   if (HOSTED_ENGINE && !hosted.configured()) return res.status(503).json({ error: 'MT5 sync is not set up on the server yet.' });
 
-  // Pro links up to three accounts.
+  // One MT5 / MT4 account per journal account, on every plan (an Ultra user
+  // gets more journal accounts, not more MT5 links inside one).
   const accountKey = crypto.createHash('sha256')
     .update(String(platform || 'mt5') + '|' + String(login) + '|' + String(server).toLowerCase()).digest('hex').slice(0, 32);
-  const accountLimit = access.isPro(req.access) ? 3 : 1;
+  const accountLimit = 1;
   const periodKey = String(req.access.expiresAt || req.access.periodStart || req.access.plan || 'active');
   let reservation;
   try {
@@ -505,7 +575,8 @@ app.post('/api/mt5-ea/register', authLimiter, requireAuth, withSpace, requireSub
 async function eaPush(req, res) {
   const key = req.headers['x-etw-key'] || (req.body && req.body.key) || '';
   const trades = (req.body && req.body.trades) || [];
-  try { const saved = await mt5ea.push(key, trades); res.json({ ok: true, saved }); }
+  const meta = { login: (req.body && req.body.login) || '', server: (req.body && req.body.server) || '' };
+  try { const saved = await mt5ea.push(key, trades, meta); res.json({ ok: true, saved }); }
   catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 }
 app.post('/api/mt5/trades', eaLimiter, eaPush);   // matches the EA's default ServerURL path
@@ -562,7 +633,62 @@ app.post('/api/ctrader/disconnect', requireAuth, withSpace, async (req, res) => 
 // ── AI proxy (Groq) ────────────────────────────────────────
 // Keeps the Groq key server-side (was hardcoded in the client). Firebase-auth'd
 // + rate-limited. Transparent pass-through of the OpenAI-style chat body.
-app.post('/api/ai/groq', aiLimiter, requireAuth, requirePro, async (req, res) => {
+// ── ETW AI daily allowance ────────────────────────────────────────────
+// A "message" is one user turn in the chat (typed, voice or image). The app
+// tags every request of that turn with X-ETW-AI-Turn, so retries and the extra
+// calls one answer needs are counted once. Background AI work (insights,
+// tagging) carries no turn and only counts toward a hidden daily safety cap.
+// Resets at 00:00 UTC. Stored on users/{uid}.aiUsage (server-owned field).
+function utcDay(t) { return new Date(t || Date.now()).toISOString().slice(0, 10); }
+function nextUtcMidnight() { const d = new Date(); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1); }
+function aiLimitMessage(plan, limit) {
+  const credits = AI_CREDITS[plan] ? ' (' + AI_CREDITS[plan].toLocaleString('en-US') + ' daily credits)' : '';
+  return 'Your daily ETW AI credits are used up — ' + limit + ' of ' + limit + ' messages today on ' + planTitle(plan) + credits + '. '
+    + 'They refresh tomorrow at 00:00 UTC, so come back then'
+    + (plan === 'ultra' ? '.' : ', or upgrade to Ultra for 20 messages a day.');
+}
+async function aiQuota(req, res, next) {
+  const plan = (await planFor(req)) || 'pro';
+  const L = PLAN_LIMITS[plan] || PLAN_LIMITS.pro;
+  const turn = String(req.get('X-ETW-AI-Turn') || '').replace(/[^\w-]/g, '').slice(0, 40);
+  const ref = db.collection('users').doc(req.uid);
+  try {
+    const out = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      const u = (snap.exists && snap.data().aiUsage) || {};
+      const day = utcDay();
+      const turns = (u.day === day && Array.isArray(u.turns)) ? u.turns.slice() : [];
+      let calls = u.day === day ? Number(u.calls || 0) : 0;
+      if (turn && turns.indexOf(turn) < 0) {
+        if (turns.length >= L.aiMessages) return { blocked: true, used: turns.length };
+        turns.push(turn);
+      }
+      if (calls >= L.aiCalls) return { blocked: true, used: turns.length };
+      calls++;
+      tx.set(ref, { aiUsage: { day, turns, calls, limit: L.aiMessages, plan, resetAt: nextUtcMidnight(), updatedAt: Date.now() } }, { merge: true });
+      return { used: turns.length };
+    });
+    if (out.blocked) {
+      return res.status(402).json({ error: aiLimitMessage(plan, L.aiMessages), code: 'ai_daily_limit', plan, limit: L.aiMessages, used: out.used, resetAt: nextUtcMidnight() });
+    }
+    next();
+  } catch (e) {
+    console.warn('[ai quota] check failed, allowing:', e.message);   // never block on our own fault
+    next();
+  }
+}
+app.get('/api/ai/usage', requireAuth, async (req, res) => {
+  const plan = (await planFor(req)) || null;
+  const L = PLAN_LIMITS[plan] || PLAN_LIMITS.essential;
+  try {
+    const snap = await db.collection('users').doc(req.uid).get();
+    const u = (snap.exists && snap.data().aiUsage) || {};
+    const used = u.day === utcDay() && Array.isArray(u.turns) ? u.turns.length : 0;
+    res.json({ ok: true, plan, limit: L.aiMessages, used, left: Math.max(0, L.aiMessages - used), credits: AI_CREDITS[plan] || 0, resetAt: nextUtcMidnight(), voice: plan === 'ultra' });
+  } catch (e) { res.status(500).json({ error: 'Lookup failed.' }); }
+});
+
+app.post('/api/ai/groq', aiLimiter, requireAuth, requirePro, aiQuota, async (req, res) => {
   const key = process.env.GROQ_API_KEY || '';
   if (!key) return res.status(503).json({ error: 'AI is not configured on the server.' });
   const body = req.body || {};
@@ -620,7 +746,7 @@ app.post('/api/ai/groq', aiLimiter, requireAuth, requirePro, async (req, res) =>
 // ── Speech-to-text proxy (Groq Whisper) ────────────────────
 // Accepts base64 audio from the browser (the in-browser Google speech service
 // is blocked on some networks) and returns { text }. Reuses the Groq key.
-app.post('/api/ai/transcribe', aiLimiter, requireAuth, requirePro, async (req, res) => {
+app.post('/api/ai/transcribe', aiLimiter, requireAuth, requireUltra, async (req, res) => {   // voice = Ultra
   const key = process.env.GROQ_API_KEY || '';
   if (!key) return res.status(503).json({ error: 'AI is not configured on the server.' });
   const b = req.body || {};
@@ -1576,7 +1702,7 @@ async function sendReceiptEmail(uid, order, expiresAt) {
     const user = await admin.auth().getUser(uid);
     if (!user.email) return;
     const isUpgrade = order.kind === 'upgrade';
-    const planName = (order.plan === 'pro' ? 'Pro' : 'Essential');
+    const planName = planTitle(order.plan);
     const body = isUpgrade
       ? `<p>You're on <b>Pro</b> — Mentor mode, ETW AI and Trade Replay are unlocked right now.</p>
          <p>You paid only the difference (<b>${money(order.amount, order.currency)}</b>), and your end date is unchanged: <b>${nice(expiresAt)}</b>.</p>`
@@ -1609,7 +1735,7 @@ async function notifyExpired(uid, ref, sub) {
         to: user.email, toName: user.displayName || '',
         subject: 'Your ETW Journal subscription has ended',
         html: emailShell('Your subscription has ended',
-          `<p>Your <b>${sub.plan === 'pro' ? 'Pro' : 'Essential'}</b> plan ended on <b>${nice(sub.expiresAt)}</b>, so journalling, broker sync and analytics are locked for now.</p>
+          `<p>Your <b>${planTitle(sub.plan)}</b> plan ended on <b>${nice(sub.expiresAt)}</b>, so journalling, broker sync and analytics are locked for now.</p>
            <p><b>Nothing has been deleted.</b> Every trade, note and playbook is exactly where you left it and comes straight back the moment you resubscribe.</p>`,
           'Reactivate my plan', APP_URL + '/payment.html'),
       });
@@ -1647,7 +1773,7 @@ async function sweepSubscriptions() {
         to: user.email, toName: user.displayName || '',
         subject: 'Your ETW Journal plan ends in ' + left + ' day' + (left === 1 ? '' : 's'),
         html: emailShell('Your plan is about to end',
-          `<p>Your <b>${sub.plan === 'pro' ? 'Pro' : 'Essential'}</b> plan ends on <b>${nice(sub.expiresAt)}</b> — that's ${left} day${left === 1 ? '' : 's'} away.</p>
+          `<p>Your <b>${planTitle(sub.plan)}</b> plan ends on <b>${nice(sub.expiresAt)}</b> — that's ${left} day${left === 1 ? '' : 's'} away.</p>
            <p>Nothing renews automatically, so pay again before then to keep going. Your trades stay exactly where they are either way; they just become read-only until you're back.</p>`,
           'Pay for another period', APP_URL + '/payment.html'),
       });
@@ -1877,7 +2003,7 @@ async function reconcileGumroadSales(days = 3) {
 //    Pro, monthly → yearly) only tops up the difference, and every award is
 //    idempotent on the sale id, so Gumroad retries/reconciles cannot double pay.
 //  * A refund or chargeback of the paying sale claws the bonus back.
-const REFERRAL_BASE_DAYS = { essential: 7, pro: 15 };
+const REFERRAL_BASE_DAYS = { essential: 7, pro: 15, ultra: 15 };
 const REFERRAL_LONG_CYCLE_BONUS = 5;              // quarterly or yearly
 const REFERRAL_DAY_MS = 24 * 60 * 60 * 1000;
 const REFERRAL_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';   // no 0/O/1/I
@@ -2170,7 +2296,7 @@ app.post('/api/admin/grant', authLimiter, requireAdmin, async (req, res) => {
   try {
     const b = req.body || {};
     const plan = String(b.plan || 'pro').toLowerCase();
-    if (plan !== 'pro' && plan !== 'essential') return res.status(400).json({ error: "plan must be 'pro' or 'essential'" });
+    if (!PLAN_LIMITS[plan]) return res.status(400).json({ error: "plan must be 'essential', 'pro' or 'ultra'" });
     // Duration: whole days (default 30), or hours for short passes ({hours: 2}).
     const hours = parseFloat(b.hours);
     const durMs = (isFinite(hours) && hours > 0)
@@ -2198,7 +2324,7 @@ app.post('/api/admin/grant', authLimiter, requireAdmin, async (req, res) => {
         to: user.email, toName: user.displayName || '',
         subject: 'Your ETW Journal access is active',
         html: emailShell('You’re in',
-          `<p>Your <b>${plan === 'pro' ? 'Pro' : 'Essential'}</b> access to ETW Journal is active until <b>${nice(expiresAt)}</b>.</p>
+          `<p>Your <b>${planTitle(plan)}</b> access to ETW Journal is active until <b>${nice(expiresAt)}</b>.</p>
            <p>Nothing to pay — just sign in and start journalling.</p>`,
           'Open ETW Journal', APP_URL + '/journal.html'),
       }).catch((e) => ({ ok: false, reason: 'threw', body: e.message }));
@@ -2376,11 +2502,12 @@ app.get('/api/subscribe/me', requireAuth, async (req, res) => {
       // Firestore rules — which read expiresAt from the token — denied every
       // read. The backend would still let them in; only their data vanished.
       const stale = !c.subscribed || (c.expiresAt && Date.now() > Number(c.expiresAt) - 7 * DAY_MS);
-      if (stale) await grantSubscription(req.uid, 'pro', 'yearly', { comp: true });
-      return res.json({ access: true, comp: true, plan: 'pro', pro: true });
+      if (stale || c.plan !== 'ultra') await grantSubscription(req.uid, 'ultra', 'yearly', { comp: true });
+      return res.json({ access: true, comp: true, plan: 'ultra', pro: true, ultra: true, limits: limitsFor('ultra') });
     }
     const a = await access.accessFor(req.uid, null);   // null = always read fresh claims
-    const out = { access: a.active, plan: a.plan || null, pro: access.isPro(a), expiresAt: a.expiresAt || null };
+    const p = tokenPlan(req.token) || planOfAccess(a);
+    const out = { access: a.active, plan: p || a.plan || null, pro: access.isPro(a) || p === 'ultra', ultra: p === 'ultra', expiresAt: a.expiresAt || null, limits: p ? limitsFor(p) : null };
 
     // Keep the Brevo audience current (no-op unless BREVO_LIST_ID is set).
     syncBrevoContact(req.uid).catch(() => {});
@@ -2401,7 +2528,7 @@ app.get('/api/subscribe/me', requireAuth, async (req, res) => {
     // mid-cycle price difference, so upgrading means: subscribe to Pro, then
     // cancel the Essential membership from the Gumroad receipt — the pricing
     // page explains this next to the button.
-    if (a.active && !access.isPro(a)) out.upgrade = { via: 'gumroad' };
+    if (a.active && p !== 'ultra') out.upgrade = { via: 'gumroad', to: out.pro ? 'ultra' : 'pro' };
     res.json(out);
   } catch (e) {
     console.error('subscribe/me:', e.message);
@@ -2414,11 +2541,54 @@ app.get('/api/subscribe/me', requireAuth, async (req, res) => {
 // notifications (Web Push + email) + the 1-hour reminder sweep.
 require('./src/mentorship').mount(app, requireAuth, db);
 
-// ── Backtest session quota (server-enforced) ─────────────────
-// Essential: 3 sessions/cycle, Pro: 10/cycle. Deletes never decrement the
-// counter. Reuses access.accessFor() so plan/expiresAt resolve exactly the
-// same way they do for every other subscription-gated route.
-require('./src/backtestQuota').mount(app, requireAuth, db, access);
+// ── Trade Replay allowance ─────────────────────────────────────────────
+// Pro: 10 different trades per calendar month (UTC); replaying a trade again
+// in the same month is free. Ultra: unlimited. Essential: no Trade Replay.
+const replayLimiter = rl(60 * 1000, 30, 'Too many requests.');
+function monthKey(t) { return new Date(t || Date.now()).toISOString().slice(0, 7); }
+function nextMonthStart() { const d = new Date(); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1); }
+app.get('/api/replay/quota', replayLimiter, requireAuth, async (req, res) => {
+  const plan = (await planFor(req)) || null;
+  if (plan === 'ultra') return res.json({ ok: true, plan, unlimited: true });
+  const limit = (PLAN_LIMITS[plan] || PLAN_LIMITS.essential).replays;
+  const snap = await db.collection('users').doc(req.uid).get().catch(() => null);
+  const q = (snap && snap.exists && snap.data().replayQuota) || {};
+  const used = q.month === monthKey() && Array.isArray(q.ids) ? q.ids.length : 0;
+  res.json({ ok: true, plan, limit, used, left: Math.max(0, limit - used), resetAt: nextMonthStart() });
+});
+app.post('/api/replay/consume', replayLimiter, requireAuth, requirePro, async (req, res) => {
+  const plan = (await planFor(req)) || 'pro';
+  if (plan === 'ultra') return res.json({ ok: true, plan, unlimited: true });
+  const limit = PLAN_LIMITS[plan].replays;
+  const want = [...new Set(((req.body && req.body.ids) || []).map(String).filter((x) => /^[\w-]{1,120}$/.test(x)))].slice(0, 60);
+  if (!want.length) return res.status(400).json({ error: 'ids[] is required' });
+  const ref = db.collection('users').doc(req.uid);
+  try {
+    const out = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      const q = (snap.exists && snap.data().replayQuota) || {};
+      const month = monthKey();
+      const ids = q.month === month && Array.isArray(q.ids) ? q.ids.slice() : [];
+      const fresh = want.filter((x) => ids.indexOf(x) < 0);
+      if (ids.length + fresh.length > limit) return { blocked: true, used: ids.length, need: fresh.length };
+      const next = ids.concat(fresh);
+      tx.set(ref, { replayQuota: { month, ids: next, limit, updatedAt: Date.now() } }, { merge: true });
+      return { used: next.length };
+    });
+    if (out.blocked) {
+      const left = Math.max(0, limit - out.used);
+      return res.status(402).json({
+        code: 'replay_limit', plan, limit, used: out.used, left, resetAt: nextMonthStart(),
+        error: 'Your Pro plan includes ' + limit + ' trade replays a month and ' + (left ? 'only ' + left + ' ' + (left === 1 ? 'is' : 'are') + ' left — this needs ' + out.need : 'you have used them all') + '. They reset on the 1st. Upgrade to Ultra for unlimited Trade Replay.',
+      });
+    }
+    res.json({ ok: true, plan, limit, used: out.used, left: Math.max(0, limit - out.used), resetAt: nextMonthStart() });
+  } catch (e) { console.warn('[replay quota]', e.message); res.json({ ok: true, plan, degraded: true }); }
+});
+
+// ── Backtesting: Pro gets 3 sessions a cycle, Ultra unlimited + cloud backup ──
+// Essential has no backtesting. Deletes never decrement the counter.
+require('./src/backtestQuota').mount(app, requireAuth, db, access, planFor);
 
 // ── Dormant MetaApi account pruning ────────────────────────────────
 // An idle registered account costs $0.00105/hr ($0.77/mo); deleting it stops
