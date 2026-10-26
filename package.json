@@ -18,6 +18,7 @@
     "express": "^4.19.2",
     "express-rate-limit": "^8.6.0",
     "firebase-admin": "^12.6.0",
+    "lzma-purejs-requirejs": "^1.0.0",
     "metaapi.cloud-sdk": "^27.1.0",
     "ws": "^8.21.1"
   }

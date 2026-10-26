@@ -805,6 +805,36 @@ app.get('/api/market/eodhd', marketLimiter, requireAuth, requireSub, async (req,
   }
 });
 
+// ── Dukascopy: NDX100 (Nasdaq 100 CFD) for Backtesting and Trade Replay ──
+// Minute data back to ~2013 at the CFD price brokers quote. Same gate as the
+// other market routes. from / to are milliseconds; interval is one of
+// 1m 5m 15m 30m 1h 4h 1d 1w. Long ranges are cut to what one chart can hold
+// (meta.truncated, meta.to says where it stopped).
+app.get('/api/market/dukascopy', marketLimiter, requireAuth, requireSub, async (req, res) => {
+  const duka = require('./src/dukascopy');
+  const q = req.query || {};
+  if (!q.symbol || !q.interval) return res.status(400).json({ error: 'symbol and interval are required' });
+  if (!duka.instrumentFor(q.symbol)) return res.status(404).json({ error: 'No Dukascopy data for ' + String(q.symbol).slice(0, 20) });
+  if (!duka.PLAN[q.interval]) return res.status(400).json({ error: 'interval must be one of ' + Object.keys(duka.PLAN).join(', ') });
+  const from = Number(q.from) || 0, to = Number(q.to) || Date.now();
+  const cacheKey = 'duka:' + duka.instrumentFor(q.symbol).code + ':' + q.interval + ':' + from + ':' + to;
+  const hit = mktGet(cacheKey);
+  if (hit) { MKT_HITS++; res.set('X-Cache', 'HIT'); return res.status(hit.status).type('application/json').send(hit.body); }
+  MKT_MISS++;
+  try {
+    const out = await duka.getCandles({ symbol: q.symbol, interval: q.interval, from, to });
+    const body = JSON.stringify(out);
+    if (out.candles.length && !out.meta.missingFiles) {
+      const isPast = to < Date.now() - 24 * 3600 * 1000;
+      mktSet(cacheKey, body, 200, isPast ? 30 * 24 * 3600 * 1000 : 5 * 60 * 1000);
+    }
+    res.set('X-Cache', 'MISS').type('application/json').send(body);
+  } catch (e) {
+    console.error('dukascopy:', e.message);
+    res.status(e.status || 502).json({ error: e.message });
+  }
+});
+
 // Definitive check for one symbol: actually fetch candles and report what EODHD
 // said. Search matches on name and is unreliable for index codes, and a plan
 // without the .INDX entitlement fails only at fetch time — this distinguishes
