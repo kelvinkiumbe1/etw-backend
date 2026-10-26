@@ -149,7 +149,7 @@ async function planFor(uid, cache) {
       const allowed = mine.docs.map((d) => d.data())
         .sort((x, y) => (x.createdAt || 0) - (y.createdAt || 0))
         .slice(0, limit).map((d) => d.accountKey);
-      p = { ok: true, allowed };
+      p = { ok: true, allowed, pro: access.isPro(a) };
     }
   } catch (e) { p = { ok: false, reason: 'unknown' }; }
   cache.set(uid, p);
@@ -202,6 +202,7 @@ async function claim(workerId, max) {
     jobs.push({
       jobId: doc.id, leaseId, login: d.login, server: d.server, platform: d.platform,
       password, syncKey: d.eaKey,
+      pro: !!plan.pro,                      // the worker keeps live terminals for Pro accounts first
     });
     // Lets the journal show "Syncing now…" for every run, not just the first.
     await mt5.setStatus(d.uid, d.everSynced ? { syncing: true, syncStartedAt: now } : { status: 'connecting', syncing: true, syncStartedAt: now }, d.accountKey).catch(() => {});
@@ -253,15 +254,46 @@ function nextDue(d, now) {
   return due;
 }
 
-const LOGIN_MSG = 'The broker rejected the login, investor password or server. Check them and connect again.';
 const BAD_PASSWORD_MSG = 'The broker says this login or investor password is wrong. Check them in MT5 and connect again.';
-const UNKNOWN_SERVER_MSG = (server) => 'We could not find a broker server called "' + server + '". Copy the server name exactly as MT5 shows it '
-  + '(File → Login to Trade Account, e.g. "ICMarketsSC-MT5-2") and connect again.';
+const UNKNOWN_SERVER_MSG = (server, near) => 'We could not find a broker server called "' + server + '". '
+  + (near.length ? 'Did you mean ' + near.map((n) => '"' + n + '"').join(' or ') + '? ' : '')
+  + 'Copy the server name exactly as MT5 shows it (File → Login to Trade Account, e.g. "ICMarketsSC-MT5-2") and connect again.';
+const UNREACHABLE_MSG = (server) => 'We cannot reach the broker server "' + server + '" right now. We will keep trying — no action needed.';
+
+// "Did you mean": servers other accounts have synced from, close to what the
+// user typed. Spaces, dashes and case are ignored, so "Atlasfunded" finds
+// "AtlasFunded-Server" and "FundedNext-Server2" finds "FundedNext-Server".
+const squash = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+function editDistance(a, b) {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[b.length];
+}
+async function suggestServers(server) {
+  const typed = squash(server);
+  if (!typed) return [];
+  const snap = await store.db.collection(COL).where('everSynced', '==', true).get();
+  const names = [...new Set(snap.docs.map((d) => d.data().server).filter((n) => n && squash(n) !== typed))];
+  return names
+    .map((n) => {
+      const k = squash(n);
+      const close = k.startsWith(typed) || typed.startsWith(k);
+      return { n, d: close ? 0 : editDistance(typed, k) };
+    })
+    .filter((x) => x.d <= Math.max(2, Math.floor(typed.length / 6)))
+    .sort((x, y) => x.d - y.d || x.n.length - y.n.length)
+    .slice(0, 2)
+    .map((x) => x.n);
+}
 
 // result: done | send_failed | not_connected | unknown_server | ea_failed | timeout
 // access: which password the terminal logged in with — 'investor' (read-only,
 // what we ask for) or 'trading' (the master password). '' when unknown.
-async function report(workerId, { jobId, leaseId, result, sent, failed, openPositions, durationMs, detail, access }) {
+async function report(workerId, { jobId, leaseId, result, sent, failed, openPositions, durationMs, detail, access, live }) {
   const r = ref(String(jobId || ''));
   const snap = await r.get();
   if (!snap.exists) return { ok: true, gone: true };          // unlinked mid-run
@@ -277,34 +309,42 @@ async function report(workerId, { jobId, leaseId, result, sent, failed, openPosi
     patch.openPositions = Math.max(0, Number(openPositions) || 0);
     if (sent > 0) patch.lastActivityAt = now;
     patch.dueAt = nextDue(Object.assign({}, d, patch), now);
-    status = { status: 'connected', syncing: false, error: null, lastSyncAt: now, nextSyncAt: patch.dueAt, pausedReason: null, errorCode: null, lastSent: sent };
+    status = { status: 'connected', syncing: false, error: null, lastSyncAt: now, nextSyncAt: patch.dueAt, pausedReason: null, errorCode: null, lastSent: sent, live: !!live };
     if (access === 'trading' || access === 'investor') status.masterPassword = access === 'trading';
   } else if (result === 'unknown_server') {
     // The worker searched MT5's broker directory and found no such server.
     // Retrying won't help until the user fixes the name.
     patch.loginFails = MAX_LOGIN_FAILS;
     patch.dueAt = Number.MAX_SAFE_INTEGER;
-    status = { status: 'error', syncing: false, error: UNKNOWN_SERVER_MSG(d.server), errorCode: 'unknown_server' };
-  } else if (result === 'not_connected') {
+    const near = await suggestServers(d.server).catch(() => []);
+    status = { status: 'error', syncing: false, error: UNKNOWN_SERVER_MSG(d.server, near), errorCode: 'unknown_server', suggestions: near, live: false };
+  } else if (result === 'not_connected' && detail === 'invalid_account') {
+    // The broker answered and said no. A first link is almost always the
+    // details, so say so at once; an account that has synced before gets a
+    // few retries in case the broker is mid-maintenance.
     patch.loginFails = (d.loginFails || 0) + 1;
-    // A broker that is briefly down looks the same as a wrong password. A
-    // first-time link that fails is almost always the details, so say so at
-    // once; an account that has synced before gets a few retries first.
     const giveUp = !d.everSynced || patch.loginFails >= MAX_LOGIN_FAILS;
     patch.dueAt = giveUp ? Number.MAX_SAFE_INTEGER : now + RETRY_EVERY * patch.loginFails;
-    const badPassword = detail === 'invalid_account';
     if (giveUp) {
       patch.loginFails = MAX_LOGIN_FAILS;
-      status = { status: 'error', syncing: false, error: badPassword ? BAD_PASSWORD_MSG : LOGIN_MSG, errorCode: badPassword ? 'bad_password' : 'login_failed' };
-    } else status = { syncing: false };
+      status = { status: 'error', syncing: false, error: BAD_PASSWORD_MSG, errorCode: 'bad_password', live: false };
+    } else status = { syncing: false, live: false };
+  } else if (result === 'not_connected') {
+    // No answer from the broker (down, network, or still connecting). Not the
+    // user's details, so never stop: back off, and tell a new link why it waits.
+    patch.workerFails = (d.workerFails || 0) + 1;
+    patch.dueAt = now + RETRY_EVERY * Math.min(patch.workerFails, 6);
+    status = (!d.everSynced && patch.workerFails >= 2)
+      ? { status: 'error', syncing: false, error: UNREACHABLE_MSG(d.server), errorCode: 'broker_unreachable', live: false }
+      : { syncing: false, live: false };
   } else {
     // send_failed / ea_failed / timeout are on our side, not the user's.
     patch.workerFails = (d.workerFails || 0) + 1;
     patch.dueAt = now + RETRY_EVERY * Math.min(patch.workerFails, 6);
     console.warn('[hosted]', jobId, result, 'x' + patch.workerFails, String(detail || '').slice(0, 200));
     status = (!d.everSynced && patch.workerFails >= 3)
-      ? { status: 'error', syncing: false, error: 'We could not sync this account yet. We will keep retrying — no action needed.' }
-      : { syncing: false };
+      ? { status: 'error', syncing: false, error: 'We could not sync this account yet. We will keep retrying — no action needed.', live: false }
+      : { syncing: false, live: false };
   }
   await r.update(patch);
   if (status) await mt5.setStatus(d.uid, status, d.accountKey);
