@@ -199,9 +199,11 @@ app.get('/', (_req, res) => res.json({
 // auth_time is fixed for the life of a sign-in and survives token refreshes, so a
 // fresh sign-in with a stolen password gets a new auth_time that is not on the
 // list, and is refused here and by the Firestore rules until a code is entered.
-function mfaSatisfied(decoded) {
-  if (!decoded || decoded.mfaRequired !== true) return true;
-  return Array.isArray(decoded.mfaSessions) && decoded.mfaSessions.includes(decoded.auth_time);
+// RETIRED: email 2FA has been switched off for everyone. Every session passes,
+// whatever mfaRequired / mfaSessions an old token still carries (the boot-time
+// cleanup below strips those claims; tokens refresh within the hour).
+function mfaSatisfied(/* decoded */) {
+  return true;
 }
 
 // Verify an ID token AND that its session hasn't been revoked. Plain
@@ -1176,6 +1178,8 @@ function checkCode(uid, authTime, code, purpose) {
 // `refresh: true` tells the client its claims changed and it must fetch a new
 // ID token (getIdToken(true)) before Firestore will let it in.
 app.post('/api/mfa/gate', mfaLimiter, requireAuthPreMfa, async (req, res) => {
+  // 2FA retired: no session is ever asked for a code.
+  return res.json({ required: false });
   try {
     const body = req.body || {};
     const authTime = req.token.auth_time;
@@ -1251,6 +1255,13 @@ async function mfaIsOn(uid) {
 // verified session alone isn't enough — someone at an unlocked, trusted laptop
 // must not be able to strip 2FA without access to the mailbox.
 app.post('/api/mfa/settings', mfaLimiter, requireAuth, async (req, res) => {
+  // 2FA retired: it can no longer be switched on. Any call simply makes sure
+  // it is off for this account (claims removed, doc flag cleared).
+  try {
+    await editMfaClaims(req.uid, (c) => { delete c.mfaRequired; delete c.mfaSessions; });
+    await db.collection('users').doc(req.uid).set({ mfaEnabled: false }, { merge: true });
+    return res.json({ ok: true, enabled: false, refresh: true });
+  } catch (e) { console.error('mfa settings:', e.message); return res.status(500).json({ ok: false, error: 'Could not update settings.' }); }
   try {
     const on = !!(req.body && req.body.enabled);
     const jwk = cleanDeviceJwk(req.body && req.body.publicKey);
@@ -1309,21 +1320,29 @@ app.post('/api/mfa/devices/remove', mfaLimiter, requireAuth, async (req, res) =>
   } catch (e) { console.error('mfa devices remove:', e.message); res.status(500).json({ ok: false, error: 'Could not remove device.' }); }
 });
 
-// Boot-time backfill: anyone with users/{uid}.mfaEnabled from before enforcement
-// moved into the claim gets mfaRequired now, rather than at their next app load —
-// otherwise a stolen password works for them until they happen to open the app.
+// Boot-time cleanup (2FA retired): strip the 2FA claims from every account
+// that still carries them and clear the users/{uid}.mfaEnabled flag, so no
+// account is held back by an old 2FA setting. Other claims (subscription,
+// plan, expiry) are kept exactly as they are. Safe to run on every boot.
 async function backfillMfaClaims() {
-  let promoted = 0;
+  let cleared = 0;
   try {
+    let pageToken;
+    do {
+      const page = await admin.auth().listUsers(1000, pageToken);
+      for (const u of page.users) {
+        const c = u.customClaims || {};
+        if (!('mfaRequired' in c) && !('mfaSessions' in c)) continue;
+        await editMfaClaims(u.uid, (cl) => { delete cl.mfaRequired; delete cl.mfaSessions; });
+        cleared++;
+      }
+      pageToken = page.pageToken;
+    } while (pageToken);
     const snap = await db.collection('users').where('mfaEnabled', '==', true).get();
-    for (const doc of snap.docs) {
-      const user = await admin.auth().getUser(doc.id).catch(() => null);
-      if (!user || (user.customClaims || {}).mfaRequired === true) continue;
-      await editMfaClaims(doc.id, (c) => { c.mfaRequired = true; });
-      promoted++;
-    }
-  } catch (e) { console.warn('[mfa] backfill failed:', e.message); }
-  if (promoted) console.log('[mfa] backfilled mfaRequired for', promoted, 'user(s)');
+    for (const doc of snap.docs) await doc.ref.set({ mfaEnabled: false }, { merge: true });
+    if (snap.size) console.log('[mfa] cleared mfaEnabled flag for', snap.size, 'user(s)');
+  } catch (e) { console.warn('[mfa] cleanup failed:', e.message); }
+  if (cleared) console.log('[mfa] removed 2FA claims from', cleared, 'user(s)');
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -2357,7 +2376,7 @@ app.listen(port, () => {
   console.log('etw-sync-backend listening on :' + port);
 tokens.startMeter();
 mt5.resumeAll();
-// Promote pre-claim 2FA users to the enforced claim (see backfillMfaClaims).
+// 2FA retired: remove leftover 2FA claims/flags from every account (see backfillMfaClaims).
 setTimeout(() => { backfillMfaClaims().catch(() => {}); }, 3000);
 // Essential users linked MT5 Direct before it moved to Pro: stop them right after
 // the boot-time resume, then re-check once the resumes have settled.
