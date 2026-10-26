@@ -134,17 +134,19 @@ async function recheck(uid) {
 }
 
 // ── Worker side ────────────────────────────────────────────────────────────
-// Plan check per user, cached for one claim call. Essential syncs its oldest
-// linked account; Pro syncs up to three. A lapsed plan holds every account
-// (password kept) and re-checks once a day.
+// Plan check per user, cached for one claim call. Auto-sync is Pro only: Pro
+// syncs up to three linked accounts (oldest first); Essential and a lapsed plan
+// hold every account (password kept) and re-check once a day, or at once on
+// an upgrade (recheck()).
 async function planFor(uid, cache) {
   if (cache.has(uid)) return cache.get(uid);
   let p;
   try {
     const a = await access.accessFor(uid, null);
     if (!a.active) p = { ok: false, reason: 'subscription_required' };
+    else if (!access.isPro(a)) p = { ok: false, reason: 'pro_required' };
     else {
-      const limit = access.isPro(a) ? 3 : 1;
+      const limit = 3;
       const mine = await store.db.collection(COL).where('uid', '==', uid).get();
       const allowed = mine.docs.map((d) => d.data())
         .sort((x, y) => (x.createdAt || 0) - (y.createdAt || 0))
@@ -158,7 +160,8 @@ async function planFor(uid, cache) {
 
 const HOLD_MSG = {
   subscription_required: 'Sync is paused because your subscription is not active. It resumes automatically when you renew.',
-  plan_limit: 'Your plan syncs 1 MT5 account. Upgrade to Pro to sync up to 3, or disconnect another account.',
+  pro_required: 'Auto-sync is a Pro feature. Upgrade to Pro and syncing resumes automatically — no need to reconnect. Your imported trades are safe.',
+  plan_limit: 'Pro syncs up to 3 MT5 accounts. Disconnect another account to sync this one.',
 };
 
 // Claim up to `max` due accounts for this worker. Each is leased in its own

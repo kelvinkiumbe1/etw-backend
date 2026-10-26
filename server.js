@@ -305,7 +305,8 @@ async function requirePro(req, res, next) {
 // of MetaApi. Hosted sync is on every plan (Essential 1 account, Pro 3); MetaApi
 // stays Pro-only. Accounts already on MetaApi keep running until re-linked.
 const HOSTED_ENGINE = String(process.env.MT5_ENGINE || '').trim().toLowerCase() === 'hosted';
-const requireDirectPlan = HOSTED_ENGINE ? requireSub : requirePro;
+// Auto-sync is a Pro feature on both engines (admin decision 2026-10-26).
+const requireDirectPlan = requirePro;
 
 app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requireDirectPlan, async (req, res) => {
   const { login, password, server, platform, journalAccountId } = req.body || {};
@@ -315,7 +316,7 @@ app.post('/api/mt5-direct/connect', authLimiter, requireAuth, requireDirectPlan,
   }
   if (HOSTED_ENGINE && !hosted.configured()) return res.status(503).json({ error: 'MT5 sync is not set up on the server yet.' });
 
-  // Pro links up to three accounts, Essential one.
+  // Pro links up to three accounts.
   const accountKey = crypto.createHash('sha256')
     .update(String(platform || 'mt5') + '|' + String(login) + '|' + String(server).toLowerCase()).digest('hex').slice(0, 32);
   const accountLimit = access.isPro(req.access) ? 3 : 1;
