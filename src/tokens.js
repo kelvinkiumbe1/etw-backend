@@ -242,6 +242,11 @@ async function refundConnect(uid, amount, { accountKey, note } = {}) {
 // sweep that fires twice inside one hour bills nothing the second time because
 // elapsedHours floors to 0.
 async function meterUser(uid) {
+  // Extra (independent) accounts hold no token balance of their own — their
+  // syncs are daily pulls, which are never billed. The retired hourly "live"
+  // mode must never run against one, or its empty balance would read as
+  // depleted and stop a sync the user is entitled to.
+  if (String(uid).indexOf('__') > 0) return { skipped: 'account_space' };
   const db = store.db;
   const uref = userRef(uid);
   const r = rates();
