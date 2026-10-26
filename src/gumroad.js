@@ -6,6 +6,8 @@
 //   GUMROAD_PRODUCT_ESSENTIAL  the Essential membership product — permalink,
 //                              product id, or the full product URL; all accepted
 //   GUMROAD_PRODUCT_PRO        same, for the Pro membership product
+//   GUMROAD_PRODUCT_ULTRA      same, for the Ultra membership product (optional;
+//                              plus GUMROAD_PRODUCT_ULTRA_QUARTERLY / _YEARLY)
 //
 // There is no server-side order creation: the pricing page links straight to the
 // Gumroad product with ?uid=<firebase uid> attached, Gumroad runs the checkout,
@@ -32,6 +34,9 @@ function normalizeKey(v) {
 // yearly ones are optional extras (they are SEPARATE Gumroad products, since
 // one product can't sell two cadences at two prices).
 const PRODUCTS = [
+  { env: 'GUMROAD_PRODUCT_ULTRA_YEARLY',        plan: 'ultra',     cycle: 'yearly' },
+  { env: 'GUMROAD_PRODUCT_ULTRA_QUARTERLY',     plan: 'ultra',     cycle: 'quarterly' },
+  { env: 'GUMROAD_PRODUCT_ULTRA',               plan: 'ultra',     cycle: null },
   { env: 'GUMROAD_PRODUCT_ESSENTIAL_YEARLY',    plan: 'essential', cycle: 'yearly' },
   { env: 'GUMROAD_PRODUCT_PRO_YEARLY',          plan: 'pro',       cycle: 'yearly' },
   { env: 'GUMROAD_PRODUCT_ESSENTIAL_QUARTERLY', plan: 'essential', cycle: 'quarterly' },

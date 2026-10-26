@@ -3,8 +3,8 @@
 // bypassed with dev tools:
 //   • Pro plan verified with access.assertAccess (fresh claims, same source
 //     of truth as /api/subscribe/me)
-//   • one-session-per-calendar-month + one-upcoming-at-a-time enforced inside
-//     a Firestore transaction
+//   • Pro: one session per calendar month + one upcoming at a time, enforced
+//     inside a Firestore transaction. Ultra: unlimited bookings.
 //   • mentors are notified by Web Push (FCM) AND email the moment a booking
 //     lands, even with the portal closed
 //   • a sweep runs every minute and sends a ~1-hour reminder (push + email)
@@ -18,6 +18,15 @@ const email = require('./email');
 let db = null;
 const SITE = (process.env.ETW_SITE_URL || 'https://etwiz.space').replace(/\/$/, '');
 const DAY_NAMES = { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' };
+
+// Ultra = unlimited bookings. The plan lives in the custom claims (fresh from
+// Auth, so a just-finished upgrade counts without waiting for a token refresh).
+async function ultraPlan(uid, token) {
+  const live = (c) => !!c && c.subscribed === true && String(c.plan || '').toLowerCase() === 'ultra'
+    && !(c.expiresAt && Date.now() >= Number(c.expiresAt));
+  try { const u = await admin.auth().getUser(uid); if (live(u.customClaims || {})) return true; } catch (e) {}
+  return live(token);
+}
 
 const monthKey = (ms) => { const d = new Date(ms); return d.getUTCFullYear() + '-' + d.getUTCMonth(); };
 const fmtWhen = (ms) => new Date(ms).toLocaleString('en-GB', DAY_NAMES) + ' UTC';
@@ -89,17 +98,20 @@ function mount(app, requireAuth, database) {
     res.json({ mentor: mentorEmails().includes(em) });
   });
 
-  // ── BOOK — Pro only, one per calendar month, one upcoming at a time ──
+  // ── BOOK — Pro: one per calendar month, one upcoming at a time. Ultra: unlimited ──
   app.post('/api/mentorship/book', requireAuth, async (req, res) => {
     const uid = req.uid;
     const slotId = String((req.body && req.body.slotId) || '');
     const agenda = String((req.body && req.body.agenda) || '').slice(0, 500).trim();
     if (!slotId) return res.status(400).json({ error: 'slotId required' });
 
-    try {
-      await access.assertAccess(uid, { pro: true });   // throws 402 pro_required
-    } catch (e) {
-      return res.status(e.status || 402).json({ error: '1-on-1 mentorship is on the Pro plan. Upgrade to book a session.' });
+    const ultra = await ultraPlan(uid, req.token);
+    if (!ultra) {
+      try {
+        await access.assertAccess(uid, { pro: true });   // throws 402 pro_required
+      } catch (e) {
+        return res.status(e.status || 402).json({ error: '1-on-1 mentorship is on the Pro plan (one session a month) and unlimited on Ultra. Upgrade to book a session.' });
+      }
     }
 
     try {
@@ -112,13 +124,13 @@ function mount(app, requireAuth, database) {
         if (!(slot.startMs > Date.now())) throw { status: 409, msg: 'That time is already in the past.' };
         if (slot.mentorUid === uid) throw { status: 400, msg: 'You cannot book your own slot.' };
 
-        const mine = await tx.get(db.collection('mentorSlots').where('studentUid', '==', uid));
+        const mine = ultra ? { docs: [] } : await tx.get(db.collection('mentorSlots').where('studentUid', '==', uid));
         for (const d of mine.docs) {
           const s = d.data();
           if (s.status === 'booked' && s.startMs + ((s.durationMin || 45) + 15) * 60000 > Date.now())
             throw { status: 409, msg: 'You already have an upcoming session booked — one at a time.' };
           if ((s.status === 'booked' || s.status === 'done') && monthKey(s.startMs) === monthKey(slot.startMs))
-            throw { status: 409, msg: 'Your Pro plan includes one session per month, and this month\'s is used. You can book again next month.' };
+            throw { status: 409, msg: 'Your Pro plan includes one session per month, and this month\'s is used. You can book again next month, or upgrade to Ultra for unlimited sessions.' };
         }
 
         tx.update(slotRef, {
