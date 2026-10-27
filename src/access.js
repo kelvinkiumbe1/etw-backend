@@ -17,7 +17,13 @@ const claimActive = (c) => !!c && c.subscribed === true && (!c.expiresAt || Date
 // fast path — no extra Firebase round-trip. But an ID token can be up to an hour
 // stale, so when it looks inactive we re-read the user record before rejecting:
 // somebody who paid 30 seconds ago must not be bounced by their cached token.
+// Independent journal accounts store their data under '<uid>__<accountId>'
+// (server.js SPACE_SEP); the subscription belongs to the login, so callers that
+// only have such a data uid (the EA push path, hosted sync) are resolved to it.
+const ownerUid = (id) => String(id || '').split('__')[0];
+
 async function accessFor(uid, tokenClaims) {
+  uid = ownerUid(uid);
   if (claimActive(tokenClaims)) {
     return { active: true, plan: tokenClaims.plan || 'essential', expiresAt: tokenClaims.expiresAt || null };
   }
@@ -27,7 +33,8 @@ async function accessFor(uid, tokenClaims) {
   return { active: claimActive(c), plan: c.plan || null, expiresAt: c.expiresAt || null };
 }
 
-const isPro = (a) => !!a && a.active === true && a.plan === 'pro';
+// Ultra includes everything in Pro. An expired plan is never Pro, whatever its name.
+const isPro = (a) => !!a && a.active === true && (a.plan === 'pro' || String(a.plan || '').toLowerCase() === 'ultra');
 
 // Throwing variant for non-Express callers (e.g. the EA push path, which is
 // authed by an X-ETW-Key header rather than a Firebase token).
@@ -38,4 +45,4 @@ async function assertAccess(uid, { pro = false } = {}) {
   return a;
 }
 
-module.exports = { accessFor, assertAccess, isComp, isPro, claimActive, COMP_EMAILS };
+module.exports = { accessFor, assertAccess, isComp, isPro, claimActive, ownerUid, COMP_EMAILS };

@@ -66,8 +66,7 @@ async function planFor(req) {
   if (t) return t;
   try { return planOfAccess(req.access || await access.accessFor(req.uid, req.token)); } catch (e) { return null; }
 }
-const _accessIsPro = access.isPro.bind(access);
-access.isPro = (a) => !!a && (String(a.plan || '').toLowerCase() === 'ultra' || _accessIsPro(a));
+// access.isPro itself counts Ultra (and only while the plan is active).
 access.isUltra = (a) => !!a && a.active !== false && String(a.plan || '').toLowerCase() === 'ultra';
 
 initFirebase();
