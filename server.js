@@ -649,6 +649,7 @@ function aiLimitMessage(plan, limit) {
 }
 async function aiQuota(req, res, next) {
   const plan = (await planFor(req)) || 'pro';
+  req.aiPlan = plan;
   const L = PLAN_LIMITS[plan] || PLAN_LIMITS.pro;
   const turn = String(req.get('X-ETW-AI-Turn') || '').replace(/[^\w-]/g, '').slice(0, 40);
   const ref = db.collection('users').doc(req.uid);
@@ -689,9 +690,16 @@ app.get('/api/ai/usage', requireAuth, async (req, res) => {
 });
 
 app.post('/api/ai/groq', aiLimiter, requireAuth, requirePro, aiQuota, async (req, res) => {
-  const key = process.env.GROQ_API_KEY || '';
+  // Ultra can run on its own Groq key (GROQ_API_KEY_ULTRA) so its requests have
+  // their own rate-limit bucket and never queue behind other plans.
+  const ultra = req.aiPlan === 'ultra';
+  const key = (ultra && process.env.GROQ_API_KEY_ULTRA) || process.env.GROQ_API_KEY || '';
   if (!key) return res.status(503).json({ error: 'AI is not configured on the server.' });
   const body = req.body || {};
+  // Reasoning depth for gpt-oss models: Ultra picks per question (light for quick
+  // answers = faster, deeper for long analyses); "high" is Ultra-only.
+  const effort = ['low', 'medium', 'high'].includes(body.reasoning_effort) ? body.reasoning_effort : null;
+  const reasoning = effort && /gpt-oss/.test(String(body.model || 'openai/gpt-oss-120b')) && (effort !== 'high' || ultra) ? { reasoning_effort: effort } : {};
   if (!Array.isArray(body.messages) || !body.messages.length) return res.status(400).json({ error: 'messages[] is required' });
   const wantStream = body.stream === true;
   try {
@@ -705,7 +713,8 @@ app.post('/api/ai/groq', aiLimiter, requireAuth, requirePro, aiQuota, async (req
         model: body.model || 'openai/gpt-oss-120b',
         messages: body.messages,
         temperature: typeof body.temperature === 'number' ? body.temperature : 0.7,
-        max_tokens: Math.min(Number(body.max_tokens) || 1024, 8192),
+        max_tokens: Math.min(Number(body.max_tokens) || 1024, ultra ? 8192 : 4096),
+        ...reasoning,
         ...(body.response_format ? { response_format: body.response_format } : {}),
         ...(wantStream ? { stream: true } : {}),
       }),
