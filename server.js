@@ -67,7 +67,9 @@ async function planFor(req) {
   try { return planOfAccess(req.access || await access.accessFor(req.uid, req.token)); } catch (e) { return null; }
 }
 const _accessIsPro = access.isPro.bind(access);
-access.isPro = (a) => !!a && (String(a.plan || '').toLowerCase() === 'ultra' || _accessIsPro(a));
+// Ultra counts as Pro — but only while the plan is live. A lapsed Ultra keeps
+// plan:'ultra' on its record, and must not keep Pro features or look "current".
+access.isPro = (a) => !!a && a.active !== false && (String(a.plan || '').toLowerCase() === 'ultra' || _accessIsPro(a));
 access.isUltra = (a) => !!a && a.active !== false && String(a.plan || '').toLowerCase() === 'ultra';
 
 initFirebase();
@@ -2516,7 +2518,12 @@ app.get('/api/subscribe/me', requireAuth, async (req, res) => {
     }
     const a = await access.accessFor(req.uid, null);   // null = always read fresh claims
     const p = tokenPlan(req.token) || planOfAccess(a);
-    const out = { access: a.active, plan: p || a.plan || null, pro: access.isPro(a) || p === 'ultra', ultra: p === 'ultra', expiresAt: a.expiresAt || null, limits: p ? limitsFor(p) : null };
+    // A lapsed plan is reported as lapsed: pro/ultra are false and the old plan
+    // name moves to lastPlan, so the pricing page offers every plan to buy again.
+    const live = !!a.active && !!p;
+    const out = { access: !!a.active, plan: live ? p : null, lastPlan: live ? null : (a.plan || null), expired: !a.active && !!a.plan,
+                  pro: live && (p === 'pro' || p === 'ultra'), ultra: live && p === 'ultra',
+                  expiresAt: a.expiresAt || null, limits: live ? limitsFor(p) : null };
 
     // Keep the Brevo audience current (no-op unless BREVO_LIST_ID is set).
     syncBrevoContact(req.uid).catch(() => {});
