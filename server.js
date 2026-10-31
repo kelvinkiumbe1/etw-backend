@@ -632,6 +632,48 @@ async function eaPush(req, res) {
   catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 }
 app.post('/api/mt5/trades', eaLimiter, eaPush);   // matches the EA's default ServerURL path
+// EA → live open-positions snapshot (sent every ~30s and on each trade change).
+app.post('/api/mt5/positions', eaLimiter, async (req, res) => {
+  const b = req.body || {};
+  const key = req.headers['x-etw-key'] || b.key || '';
+  try {
+    const n = await mt5ea.positions(key, b.positions, { login: b.login, server: b.server, currency: b.currency, balance: b.balance, equity: b.equity });
+    res.json({ ok: true, n });
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+// Dashboard → Recent activity → Open positions: the trader's REAL open
+// positions, straight from the broker side. cTrader is read live; MT5 comes
+// from the ETW EA's snapshots (fresh = under 3 minutes old).
+app.get('/api/broker/positions', marketLimiter, requireAuth, withSpace, async (req, res) => {
+  const out = { ok: true, positions: [], sources: [], at: Date.now() };
+  const jid = String((req.query && req.query.journalAccountId) || '');
+  try {
+    const u = await db.collection('users').doc(req.duid).get();
+    const ud = u.exists ? u.data() : {};
+    if (ud.ctrader && ud.ctrader.status === 'connected' && ctrader.configured() && (!jid || !ud.ctrader.journalAccountId || ud.ctrader.journalAccountId === jid)) {
+      try {
+        const list = await ctrader.getPositions(req.duid);
+        list.forEach((p) => out.positions.push(Object.assign({ source: 'ctrader' }, p)));
+        out.sources.push({ source: 'ctrader', ok: true, count: list.length });
+      } catch (e) { out.sources.push({ source: 'ctrader', ok: false, error: 'cTrader did not answer — try again in a moment.' }); }
+    }
+    const bp = await db.collection('brokerPositions').doc(req.duid).get();
+    const mt5 = (bp.exists && bp.data().mt5) || {};
+    Object.keys(mt5).forEach((slot) => {
+      const s = mt5[slot] || {};
+      if (jid && s.accountId && s.accountId !== jid) return;
+      const fresh = Date.now() - (+s.at || 0) < 3 * 60 * 1000;
+      out.sources.push({ source: 'mt5', ok: fresh, login: s.login || '', at: s.at || 0, count: (s.positions || []).length, stale: !fresh });
+      if (!fresh) return;   // an EA that stopped reporting: don't show old positions as live
+      (s.positions || []).forEach((p) => out.positions.push(Object.assign({ source: 'mt5', broker: 'MT5', account: (s.server ? s.server + ' ' : '') + (s.login || '') }, p)));
+    });
+    res.set('Cache-Control', 'no-store');
+    res.json(out);
+  } catch (e) {
+    console.error('broker/positions:', e.message);
+    res.status(500).json({ ok: false, error: 'Could not load open positions.' });
+  }
+});
 app.post('/api/mt5-ea/push', eaLimiter, eaPush);
 
 // ── TradeLocker ────────────────────────────────────────────
@@ -699,6 +741,23 @@ function aiLimitMessage(plan, limit) {
     + 'They refresh tomorrow at 00:00 UTC, so come back then'
     + (plan === 'ultra' ? '.' : ', or upgrade to Ultra for 20 messages a day.');
 }
+// How many daily messages one AI request costs (1–4). The server weighs the
+// request itself — its size and reasoning depth — and takes the client's
+// X-ETW-AI-Cost hint (paged reviews, long analyses) only as a floor, so a
+// client can make a request cost more but never less than it really is.
+function aiWeight(req) {
+  const body = req.body || {};
+  let chars = 0;
+  try { chars = JSON.stringify(body.messages || []).length; } catch (e) {}
+  let w = 1;
+  if (chars > 70000) w++;
+  if (chars > 140000) w++;
+  if (body.reasoning_effort === 'high') w++;
+  if (Array.isArray(body.messages) && body.messages.some((m) => Array.isArray(m && m.content) && m.content.some((c) => c && c.type === 'image_url'))) w++;
+  const hint = Math.floor(Number(req.get('X-ETW-AI-Cost')) || 0);
+  if (hint > w) w = hint;
+  return Math.max(1, Math.min(4, w));
+}
 async function aiQuota(req, res, next) {
   const plan = (await planFor(req)) || 'pro';
   req.aiPlan = plan;
@@ -712,9 +771,14 @@ async function aiQuota(req, res, next) {
       const day = utcDay();
       const turns = (u.day === day && Array.isArray(u.turns)) ? u.turns.slice() : [];
       let calls = u.day === day ? Number(u.calls || 0) : 0;
-      if (turn && turns.indexOf(turn) < 0) {
-        if (turns.length >= L.aiMessages) return { blocked: true, used: turns.length };
-        turns.push(turn);
+      if (turn) {
+        // A heavy request counts as more than one message: entries turn, turn#2,
+        // turn#3… are charged once each, so a turn that grows heavier (a big
+        // review after a light call) is topped up, never double-charged.
+        const have = turns.filter((x) => x === turn || x.indexOf(turn + '#') === 0).length;
+        const want = aiWeight(req);
+        if (!have && turns.length >= L.aiMessages) return { blocked: true, used: turns.length };
+        for (let k = have + 1; k <= want && turns.length < L.aiMessages; k++) turns.push(k === 1 ? turn : turn + '#' + k);
       }
       if (calls >= L.aiCalls) return { blocked: true, used: turns.length };
       calls++;
@@ -837,6 +901,9 @@ app.post('/api/ai/transcribe', aiLimiter, requireAuth, requireUltra, async (req,
     res.json({ text: (data && data.text) || '' });
   } catch (e) { console.error('transcribe proxy:', e.message); res.status(502).json({ error: 'Transcription upstream error.' }); }
 });
+
+// ── ETW AI market pulse: live news, TradingView technicals, trader sentiment ──
+require('./src/marketPulse').mount(app, { requireAuth, requireSub, limiter: marketLimiter });
 
 // ── Economic calendar (Forex Factory weekly feed) ──────────
 // Forex Factory publishes the current week as JSON. Browsers can't read it
