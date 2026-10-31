@@ -66,7 +66,10 @@ async function planFor(req) {
   if (t) return t;
   try { return planOfAccess(req.access || await access.accessFor(req.uid, req.token)); } catch (e) { return null; }
 }
-// access.isPro itself counts Ultra (and only while the plan is active).
+const _accessIsPro = access.isPro.bind(access);
+// Ultra counts as Pro — but only while the plan is live. A lapsed Ultra keeps
+// plan:'ultra' on its record, and must not keep Pro features or look "current".
+access.isPro = (a) => !!a && a.active !== false && (String(a.plan || '').toLowerCase() === 'ultra' || _accessIsPro(a));
 access.isUltra = (a) => !!a && a.active !== false && String(a.plan || '').toLowerCase() === 'ultra';
 
 initFirebase();
@@ -648,6 +651,7 @@ function aiLimitMessage(plan, limit) {
 }
 async function aiQuota(req, res, next) {
   const plan = (await planFor(req)) || 'pro';
+  req.aiPlan = plan;
   const L = PLAN_LIMITS[plan] || PLAN_LIMITS.pro;
   const turn = String(req.get('X-ETW-AI-Turn') || '').replace(/[^\w-]/g, '').slice(0, 40);
   const ref = db.collection('users').doc(req.uid);
@@ -688,9 +692,16 @@ app.get('/api/ai/usage', requireAuth, async (req, res) => {
 });
 
 app.post('/api/ai/groq', aiLimiter, requireAuth, requirePro, aiQuota, async (req, res) => {
-  const key = process.env.GROQ_API_KEY || '';
+  // Ultra can run on its own Groq key (GROQ_API_KEY_ULTRA) so its requests have
+  // their own rate-limit bucket and never queue behind other plans.
+  const ultra = req.aiPlan === 'ultra';
+  const key = (ultra && process.env.GROQ_API_KEY_ULTRA) || process.env.GROQ_API_KEY || '';
   if (!key) return res.status(503).json({ error: 'AI is not configured on the server.' });
   const body = req.body || {};
+  // Reasoning depth for gpt-oss models: Ultra picks per question (light for quick
+  // answers = faster, deeper for long analyses); "high" is Ultra-only.
+  const effort = ['low', 'medium', 'high'].includes(body.reasoning_effort) ? body.reasoning_effort : null;
+  const reasoning = effort && /gpt-oss/.test(String(body.model || 'openai/gpt-oss-120b')) && (effort !== 'high' || ultra) ? { reasoning_effort: effort } : {};
   if (!Array.isArray(body.messages) || !body.messages.length) return res.status(400).json({ error: 'messages[] is required' });
   const wantStream = body.stream === true;
   try {
@@ -704,7 +715,8 @@ app.post('/api/ai/groq', aiLimiter, requireAuth, requirePro, aiQuota, async (req
         model: body.model || 'openai/gpt-oss-120b',
         messages: body.messages,
         temperature: typeof body.temperature === 'number' ? body.temperature : 0.7,
-        max_tokens: Math.min(Number(body.max_tokens) || 1024, 8192),
+        max_tokens: Math.min(Number(body.max_tokens) || 1024, ultra ? 8192 : 4096),
+        ...reasoning,
         ...(body.response_format ? { response_format: body.response_format } : {}),
         ...(wantStream ? { stream: true } : {}),
       }),
@@ -2506,7 +2518,12 @@ app.get('/api/subscribe/me', requireAuth, async (req, res) => {
     }
     const a = await access.accessFor(req.uid, null);   // null = always read fresh claims
     const p = tokenPlan(req.token) || planOfAccess(a);
-    const out = { access: a.active, plan: p || a.plan || null, pro: access.isPro(a) || p === 'ultra', ultra: p === 'ultra', expiresAt: a.expiresAt || null, limits: p ? limitsFor(p) : null };
+    // A lapsed plan is reported as lapsed: pro/ultra are false and the old plan
+    // name moves to lastPlan, so the pricing page offers every plan to buy again.
+    const live = !!a.active && !!p;
+    const out = { access: !!a.active, plan: live ? p : null, lastPlan: live ? null : (a.plan || null), expired: !a.active && !!a.plan,
+                  pro: live && (p === 'pro' || p === 'ultra'), ultra: live && p === 'ultra',
+                  expiresAt: a.expiresAt || null, limits: live ? limitsFor(p) : null };
 
     // Keep the Brevo audience current (no-op unless BREVO_LIST_ID is set).
     syncBrevoContact(req.uid).catch(() => {});
