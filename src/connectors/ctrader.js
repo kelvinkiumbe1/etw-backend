@@ -224,4 +224,19 @@ async function getBars(uid, { symbol, tf, from, to, accountId }) {
   return engine.fetchTrendbars({ clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, accessToken: t.accessToken, ctid, env, symbolName: symbol, tf, from, to });
 }
 
-module.exports = { init, configured, createAuthUrl, handleCallback, disconnect, syncUser, friendlyError, getBars };
+
+// Live open positions for the dashboard (read-only), cached briefly so a
+// dashboard left open does not hammer cTrader.
+const _posCache = new Map();
+async function getPositions(uid) {
+  if (!configured()) return [];
+  const hit = _posCache.get(uid);
+  if (hit && Date.now() - hit.at < 20000) return hit.list;
+  const t = await ensureToken(uid);
+  const list = await engine.fetchOpenPositions({ clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, accessToken: t.accessToken });
+  _posCache.set(uid, { at: Date.now(), list });
+  if (_posCache.size > 2000) _posCache.delete(_posCache.keys().next().value);
+  return list;
+}
+
+module.exports = { init, configured, createAuthUrl, handleCallback, disconnect, syncUser, friendlyError, getBars, getPositions };

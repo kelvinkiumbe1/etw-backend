@@ -91,8 +91,39 @@ async function checkAccess(uid) {
   accessCache.set(uid, Date.now()); cap(accessCache);
 }
 
-// Handle an EA push: { trades:[...] } + key (header or body). Returns count written.
-async function push(key, trades) {
+// Every journal account syncs ONE MT5 account. The EA reports its MT5 login
+// (EA builds from this release on); the first login seen is bound to the
+// journal account, and a different MT5 account pushing into it is refused.
+// Older EAs that do not send a login keep working unchanged.
+const bindCache = new Map();     // uid -> { at, login }
+async function boundLogin(uid) {
+  const hit = bindCache.get(uid);
+  if (hit && Date.now() - hit.at < CACHE_MS) return hit.login;
+  let login = '';
+  const snap = await store.db.collection('eaKeys').where('uid', '==', uid).get();
+  snap.docs.forEach((d) => { const x = d.data(); if (!x.hosted && x.mt5Login && !login) login = String(x.mt5Login); });
+  bindCache.set(uid, { at: Date.now(), login }); cap(bindCache);
+  return login;
+}
+async function checkLogin(key, k, meta) {
+  const login = String((meta && meta.login) || '').replace(/[^0-9]/g, '').slice(0, 20);
+  if (!login || k.hosted) return;
+  if (k.mt5Login && String(k.mt5Login) === login) return;
+  const bound = k.mt5Login ? String(k.mt5Login) : await boundLogin(k.uid);
+  if (bound && bound !== login) {
+    const e = new Error('This journal account is already linked to MT5 account #' + bound
+      + '. Each journal account syncs one MT5 account — create another account in ETW Journal for #' + login + '.');
+    e.status = 403; e.code = 'mt5_account_limit'; throw e;
+  }
+  const server = String((meta && meta.server) || '').slice(0, 80);
+  await store.db.collection('eaKeys').doc(key).set({ mt5Login: login, mt5Server: server, boundAt: Date.now() }, { merge: true });
+  k.mt5Login = login;
+  keyCache.set(key, { at: Date.now(), data: k });
+  bindCache.set(k.uid, { at: Date.now(), login });
+}
+
+// Handle an EA push: { login, server, trades:[...] } + key (header or body). Returns count written.
+async function push(key, trades, meta) {
   if (!key) { const e = new Error('Missing sync key'); e.status = 401; throw e; }
   // The key is used as a document path, so only accept the shape register() mints.
   if (!/^etw_[0-9a-f]{36}$/.test(String(key))) { const e = new Error('Invalid sync key'); e.status = 401; throw e; }
@@ -102,6 +133,7 @@ async function push(key, trades) {
   // The key outlives the subscription, so re-check the owner's access on every
   // push — otherwise a lapsed account's EA would keep syncing forever.
   await checkAccess(uid);
+  await checkLogin(key, k, meta);
   const index = await store.tradeIndex(uid);
   const written = index.get('mt5-ea|' + (accountId || '')) || new Set();
   // Hosted accounts may replace a MetaApi link that already imported this
@@ -140,4 +172,41 @@ async function push(key, trades) {
   return docs.length;
 }
 
-module.exports = { register, registerHosted, revoke, push };
+
+// Live open positions from the user's own EA: a snapshot every ~30s and on
+// every trade change. Stored server-side only (brokerPositions/{uid}; no client
+// rules exist for that collection) and served to the dashboard by
+// GET /api/broker/positions. One slot per EA key, so several MT5 accounts on
+// different journal accounts never overwrite each other.
+function num(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
+async function positions(key, list, meta) {
+  if (!key || !/^etw_[0-9a-f]{36}$/.test(String(key))) { const e = new Error('Invalid sync key'); e.status = 401; throw e; }
+  const k = await keyData(key);
+  if (!k) { const e = new Error('Invalid sync key'); e.status = 401; throw e; }
+  await checkAccess(k.uid);
+  const clean = (Array.isArray(list) ? list : []).slice(0, 200).map((p) => ({
+    id: String(p.ticket || p.id || '').slice(0, 32),
+    pair: String(p.symbol || '').slice(0, 32),
+    dir: /sell|short/i.test(String(p.type || p.dir || '')) ? 'SHORT' : 'LONG',
+    lots: num(p.volume || p.lots),
+    entry: num(p.priceOpen || p.entry),
+    price: num(p.priceCurrent || p.price),
+    sl: num(p.sl), tp: num(p.tp),
+    pnl: num(p.profit != null ? p.profit : p.pnl), swap: num(p.swap),
+    openTime: String(p.time || p.openTime || '').slice(0, 25),
+  })).filter((p) => p.id && p.pair);
+  const slot = 'k' + require('crypto').createHash('sha256').update(String(key)).digest('hex').slice(0, 16);
+  await store.db.collection('brokerPositions').doc(k.uid).set({
+    mt5: { [slot]: {
+      at: Date.now(), accountId: k.accountId || '', hosted: !!k.hosted,
+      login: String((meta && meta.login) || k.mt5Login || '').slice(0, 20),
+      server: String((meta && meta.server) || k.mt5Server || '').slice(0, 80),
+      currency: String((meta && meta.currency) || '').slice(0, 6),
+      balance: num(meta && meta.balance), equity: num(meta && meta.equity),
+      positions: clean,
+    } },
+  }, { merge: true });
+  return clean.length;
+}
+
+module.exports = { register, registerHosted, revoke, push, positions };

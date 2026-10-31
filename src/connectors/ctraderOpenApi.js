@@ -12,6 +12,10 @@ const PT = {
   SYMBOLS_LIST_REQ: 2114, SYMBOLS_LIST_RES: 2115,
   SYMBOL_BY_ID_REQ: 2116, SYMBOL_BY_ID_RES: 2117,
   DEAL_LIST_REQ: 2133, DEAL_LIST_RES: 2134,
+  ORDER_LIST_REQ: 2175, ORDER_LIST_RES: 2176,
+  RECONCILE_REQ: 2124, RECONCILE_RES: 2125,
+  UNREALIZED_PNL_REQ: 2187, UNREALIZED_PNL_RES: 2188,
+  ORDER_LIST_BY_POSITION_ID_REQ: 2183, ORDER_LIST_BY_POSITION_ID_RES: 2184,
   TRENDBARS_REQ: 2137, TRENDBARS_RES: 2138,
   ERROR_RES: 2142, GET_ACCOUNTS_REQ: 2149, GET_ACCOUNTS_RES: 2150,
 };
@@ -39,10 +43,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Serialize ALL deal-list calls across users with a ~300ms gap, and retry with
 // backoff on a rate-limit error so the backfill completes instead of failing.
 let _dlGate = Promise.resolve();
-function throttledDealList(session, payload) {
+function throttledDealList(session, payload, reqType, resType) {
   const run = async () => {
     for (let attempt = 0; ; attempt++) {
-      try { return await session.request(PT.DEAL_LIST_REQ, PT.DEAL_LIST_RES, payload, 25000); }
+      try { return await session.request(reqType || PT.DEAL_LIST_REQ, resType || PT.DEAL_LIST_RES, payload, 25000); }
       catch (e) {
         const m = (e && e.message) || '';
         if (/rate limit|BLOCKED_PAYLOAD_TYPE|too many/i.test(m) && attempt < 6) { await sleep(2000 * (attempt + 1)); continue; }
@@ -176,8 +180,55 @@ async function discoverAccounts({ clientId, clientSecret, accessToken }) {
   return [];
 }
 
+// ── The SL / TP the trader actually placed ─────────────────────────────────
+// Deal records carry no SL/TP. The ORDER history does:
+//   • the order that opened the position carries the stopLoss / takeProfit set
+//     with it (absolute, or relative to the fill in 1/100000 of a price unit);
+//   • if the position was closed by its protection, the closing order is a
+//     STOP_LOSS_TAKE_PROFIT order carrying the levels in force at that moment —
+//     so an SL moved to breakeven or trailed is recorded where it really was.
+// Closing-order levels win over opening-order levels; nothing is invented.
+const OT_SLTP = 4;
+function num(v) { const n = Number(v); return Number.isFinite(n) && n !== 0 ? n : null; }
+function levelsFromOrders(orders, deal, direction, entry) {
+  if (!Array.isArray(orders)) return null;          // never looked up → caller falls back
+  const list = orders.filter(Boolean);
+  if (!list.length) return { sl: null, tp: null, closedBy: '', trailing: false, seen: true };   // looked up: none placed
+  const long = direction === 'LONG';
+  const closing = list.find((o) => deal.orderId != null && String(o.orderId) === String(deal.orderId))
+    || list.filter((o) => o.closingOrder).sort((a, b) => Number(b.utcLastUpdateTimestamp || 0) - Number(a.utcLastUpdateTimestamp || 0))[0] || null;
+  const opening = list.filter((o) => !o.closingOrder && Number(o.orderType) !== OT_SLTP)
+    .sort((a, b) => Number(a.utcLastUpdateTimestamp || a.tradeData && a.tradeData.openTimestamp || 0) - Number(b.utcLastUpdateTimestamp || b.tradeData && b.tradeData.openTimestamp || 0))[0] || null;
+  // Every SL/TP order the position ever had (they are amended in place, so the
+  // newest by update time is the level in force last).
+  const sltp = list.filter((o) => Number(o.orderType) === OT_SLTP)
+    .sort((a, b) => Number(b.utcLastUpdateTimestamp || 0) - Number(a.utcLastUpdateTimestamp || 0));
+  const fill = num(opening && opening.executionPrice) || num(entry);
+  const rel = (o, k, sign) => { const r = num(o && o[k]); return r && fill ? fill + sign * r / 100000 : null; };
+  let sl = null, tp = null, closedBy = '';
+  if (closing && Number(closing.orderType) === OT_SLTP) {
+    // A protection order fills at its stop (SL) or its limit (TP).
+    sl = num(closing.stopLoss) || num(closing.stopPrice);
+    tp = num(closing.takeProfit) || num(closing.limitPrice);
+    closedBy = closing.isStopOut ? 'stop_out' : '';
+  }
+  for (const o of sltp) { if (sl == null) sl = num(o.stopLoss) || num(o.stopPrice); if (tp == null) tp = num(o.takeProfit) || num(o.limitPrice); }
+  if (opening) {
+    if (sl == null) sl = num(opening.stopLoss) || rel(opening, 'relativeStopLoss', long ? -1 : 1);
+    if (tp == null) tp = num(opening.takeProfit) || rel(opening, 'relativeTakeProfit', long ? 1 : -1);
+  }
+  // A take-profit can only sit on the profit side of the entry.
+  if (tp != null && fill && (long ? tp <= fill : tp >= fill)) tp = null;
+  return { sl, tp, closedBy, trailing: !!((opening && opening.trailingStopLoss) || (closing && closing.trailingStopLoss)), seen: true };
+}
+function fmtPrice(n, ref) {
+  if (n == null) return '';
+  const d = String(ref || '').includes('.') ? String(ref).split('.')[1].length : 5;
+  return String(Number(n.toFixed(Math.max(2, Math.min(6, d + 1)))));
+}
+
 // Map one closed cTrader deal into the shared Firestore "trades" schema.
-function mapDeal(d, { uid, accountId, symbolMap, lotSizeMap, accountLabel, openTsByPos }) {
+function mapDeal(d, { uid, accountId, symbolMap, lotSizeMap, accountLabel, openTsByPos, ordersByPos }) {
   const close = d.closePositionDetail || {};
   const moneyDigits = close.moneyDigits != null ? close.moneyDigits : (d.moneyDigits != null ? d.moneyDigits : 2);
   const pnl = money((close.grossProfit || 0) + (close.swap || 0) + (close.commission || 0), moneyDigits);
@@ -198,19 +249,26 @@ function mapDeal(d, { uid, accountId, symbolMap, lotSizeMap, accountLabel, openT
   // (a long is closed by a SELL, a short by a BUY) — so invert it.
   const positionDir = side(d.tradeSide || tradeData.tradeSide) === 'LONG' ? 'SHORT' : 'LONG';
   const result = p > 0 ? 'WIN' : p < 0 ? 'LOSS' : 'BREAKEVEN';
-  // The closing deal's execution price is the realized exit. Record it as the
-  // take-profit on a win and the stop-loss on a loss; a breakeven keeps only the
-  // entry (both blank). cTrader's deal history does not carry the originally-set
-  // SL/TP order levels, so this reflects the actual price the position closed at.
   const exitPrice = d.executionPrice != null ? String(d.executionPrice) : '';
+  const entryStr = close.entryPrice != null ? String(close.entryPrice) : '';
+  // Real SL / TP from the order history (see levelsFromOrders). If the order
+  // history could not be read at all (ordersByPos === null) we fall back to the
+  // old behaviour — exit price as TP on a win / SL on a loss — so a temporary
+  // API failure never wipes levels; with order data, blanks mean "none placed".
+  const lv = ordersByPos ? levelsFromOrders(ordersByPos[String(d.positionId)], d, positionDir, entryStr) : null;
+  const slOut = lv ? fmtPrice(lv.sl, entryStr) : (result === 'LOSS' ? exitPrice : '');
+  const tpOut = lv ? fmtPrice(lv.tp, entryStr) : (result === 'WIN' ? exitPrice : '');
   return {
     uid,
     pair: symbolName,
     direction: positionDir,
-    entry: close.entryPrice != null ? String(close.entryPrice) : '',
+    entry: entryStr,
     closePrice: exitPrice,
-    sl: result === 'LOSS' ? exitPrice : '',
-    tp: result === 'WIN' ? exitPrice : '',
+    sl: slOut,
+    tp: tpOut,
+    // Where SL/TP came from: 'broker_orders' = read from cTrader's order history.
+    slTpSource: lv ? 'broker_orders' : 'exit_price',
+    ...(lv && lv.trailing ? { trailingStop: true } : {}),
     lot: String(r2(lot)),
     pnl: p,
     result,
@@ -231,6 +289,58 @@ function mapDeal(d, { uid, accountId, symbolMap, lotSizeMap, accountLabel, openT
     createdAt: Date.now(),
     updatedAt: Date.now(),
   };
+}
+
+// Order history for the positions closed in [from, to], grouped by positionId.
+// Walks the span in sub-1-week windows (same cap as deals), then asks per
+// position for anything still missing (a position opened before the window).
+// Returns null if the order history could not be read at all.
+async function fetchOrdersByPosition(session, ctid, closingDeals, { from, to }) {
+  const byPos = {};
+  const checked = new Set();
+  const want = new Set(closingDeals.map((d) => String(d.positionId || '')).filter(Boolean));
+  const add = (o) => { const pid = String(o && o.positionId || ''); if (!pid || !want.has(pid)) return; (byPos[pid] = byPos[pid] || []).push(o); };
+  const WINDOW = 7 * 24 * 60 * 60 * 1000 - 3600000;
+  let anyOk = false;
+  try {
+    // A position closed in the window may have been opened up to ~2 weeks before it.
+    const start = Math.max(0, from - 14 * 86400000);
+    for (let winStart = start; winStart < to; ) {
+      const winEnd = Math.min(winStart + WINDOW, to);
+      let cursor = winStart;
+      for (let page = 0; page < 20; page++) {
+        const res = await throttledDealList(session, { ctidTraderAccountId: ctid, fromTimestamp: cursor, toTimestamp: winEnd },
+          PT.ORDER_LIST_REQ, PT.ORDER_LIST_RES);
+        anyOk = true;
+        const list = res.order || [];
+        list.forEach(add);
+        if (!res.hasMore || !list.length) break;
+        const maxTs = list.reduce((m, o) => Math.max(m, Number(o.utcLastUpdateTimestamp || 0)), cursor);
+        if (maxTs <= cursor) break;
+        cursor = maxTs + 1;
+      }
+      winStart = winEnd;
+    }
+  } catch (e) {
+    console.warn('[ctrader] order history (range) failed for', ctid, '-', e.message);
+  }
+  // Fill gaps position by position (bounded so one sync can't stall).
+  const missing = [...want].filter((pid) => !(byPos[pid] || []).some((o) => !o.closingOrder));
+  for (const pid of missing.slice(0, 150)) {
+    try {
+      const res = await throttledDealList(session, { ctidTraderAccountId: ctid, positionId: Number(pid) },
+        PT.ORDER_LIST_BY_POSITION_ID_REQ, PT.ORDER_LIST_BY_POSITION_ID_RES);
+      anyOk = true;
+      const seenIds = new Set((byPos[pid] || []).map((o) => String(o.orderId)));
+      (res.order || []).forEach((o) => { if (!seenIds.has(String(o.orderId))) { o.positionId = o.positionId || Number(pid); add(o); } });
+      checked.add(pid);
+    } catch (e) { /* that position keeps whatever the range pass found */ }
+  }
+  if (!anyOk) return null;
+  // Positions we looked up but which truly have no orders get an empty list,
+  // which mapDeal reads as "no SL/TP placed" rather than "unknown".
+  want.forEach((pid) => { if (!byPos[pid] && checked.has(pid)) byPos[pid] = []; });
+  return byPos;
 }
 
 // Pull closed deals for a single account within [from, to], paging by maxRows.
@@ -288,7 +398,8 @@ async function fetchAccountDeals(session, account, { uid, from, to }) {
   const closingDeals = raw.filter((d) => d.closePositionDetail);
   // Resolve each traded symbol's lotSize (needed to convert volume → real lots).
   const lotSizeMap = await ensureLotSizes(session, ctid, closingDeals.map((d) => d.symbolId));
-  const out = closingDeals.map((d) => mapDeal(d, { uid, accountId: ctid, symbolMap, lotSizeMap, accountLabel, openTsByPos }));
+  const ordersByPos = closingDeals.length ? await fetchOrdersByPosition(session, ctid, closingDeals, { from, to }) : {};
+  const out = closingDeals.map((d) => mapDeal(d, { uid, accountId: ctid, symbolMap, lotSizeMap, accountLabel, openTsByPos, ordersByPos }));
   console.log('[ctrader] account', ctid, '(' + accountLabel + '):', seen, 'deals seen,', out.length, 'closed trades mapped');
   return { trades: out, accountLabel, ctid, isLive: !!account.isLive };
 }
@@ -384,4 +495,66 @@ async function fetchTrendbars({ clientId, clientSecret, accessToken, ctid, env, 
   } finally { session.close(); }
 }
 
-module.exports = { fetchClosedTrades, discoverAccounts, mapDeal, fetchTrendbars, PT };
+
+// ── Live open positions (dashboard → Recent activity → Open positions) ─────
+// Reconcile gives every open position (entry, SL/TP, volume, side, open time);
+// ProtoOAGetPositionUnrealizedPnLReq gives its floating P&L. Read-only.
+async function fetchOpenPositions({ clientId, clientSecret, accessToken }) {
+  const accounts = await discoverAccounts({ clientId, clientSecret, accessToken });
+  const out = [];
+  const byEnv = { live: [], demo: [] };
+  accounts.forEach((a) => (a.isLive ? byEnv.live : byEnv.demo).push(a));
+  for (const env of ['live', 'demo']) {
+    if (!byEnv[env].length) continue;
+    const session = new CtSession(env);
+    try {
+      await session.open();
+      await session.appAuth(clientId, clientSecret);
+      for (const acc of byEnv[env]) {
+        const ctid = Number(acc.ctidTraderAccountId);
+        try {
+          session.send(PT.ACCOUNT_AUTH_REQ, { ctidTraderAccountId: ctid, accessToken });
+          await session.wait(PT.ACCOUNT_AUTH_RES);
+          const rec = await session.request(PT.RECONCILE_REQ, PT.RECONCILE_RES, { ctidTraderAccountId: ctid }, 15000);
+          const pos = rec.position || [];
+          if (!pos.length) continue;
+          let symbolMap = (SYMBOL_CACHE[ctid] && SYMBOL_CACHE[ctid].map) || null;
+          if (!symbolMap) {
+            symbolMap = {};
+            try {
+              const sym = await session.request(PT.SYMBOLS_LIST_REQ, PT.SYMBOLS_LIST_RES, { ctidTraderAccountId: ctid, includeArchivedSymbols: false });
+              (sym.symbol || sym.lightSymbol || []).forEach((x) => { symbolMap[String(x.symbolId)] = x.symbolName || x.name || String(x.symbolId); });
+              SYMBOL_CACHE[ctid] = { map: symbolMap, ts: Date.now() };
+            } catch (e) {}
+          }
+          const lotMap = await ensureLotSizes(session, ctid, pos.map((p) => (p.tradeData || {}).symbolId));
+          const upnl = {};
+          try {
+            const u = await session.request(PT.UNREALIZED_PNL_REQ, PT.UNREALIZED_PNL_RES, { ctidTraderAccountId: ctid }, 12000);
+            const md = u.moneyDigits != null ? u.moneyDigits : 2;
+            (u.positionUnrealizedPnL || []).forEach((x) => { upnl[String(x.positionId)] = money(x.netUnrealizedPnL, md); });
+          } catch (e) { /* older servers: P&L stays unknown */ }
+          const label = (acc.brokerTitleShort ? acc.brokerTitleShort + ' ' : '') + (acc.traderLogin || ctid);
+          pos.forEach((p) => {
+            const td = p.tradeData || {}, md = p.moneyDigits != null ? p.moneyDigits : 2;
+            const ls = Number(lotMap[String(td.symbolId)]);
+            const vol = Number(td.volume || 0);
+            out.push({
+              id: String(p.positionId), broker: 'cTrader', account: label, live: !!acc.isLive,
+              pair: symbolMap[String(td.symbolId)] || ('Symbol #' + td.symbolId),
+              dir: side(td.tradeSide), lots: r2(ls > 0 ? vol / ls : vol / 100),
+              entry: Number(p.price || 0), sl: Number(p.stopLoss || 0), tp: Number(p.takeProfit || 0),
+              pnl: upnl[String(p.positionId)] != null ? r2(upnl[String(p.positionId)]) : null,
+              swap: r2(money(p.swap || 0, md)),
+              openTime: td.openTimestamp ? new Date(Number(td.openTimestamp)).toISOString() : '',
+            });
+          });
+        } catch (e) { console.warn('[ctrader] positions failed for', ctid, '-', e.message); }
+      }
+    } catch (e) { console.warn('[ctrader] positions session', env, '-', e.message); }
+    finally { session.close(); }
+  }
+  return out;
+}
+
+module.exports = { fetchClosedTrades, discoverAccounts, mapDeal, fetchTrendbars, levelsFromOrders, fetchOpenPositions, PT };
