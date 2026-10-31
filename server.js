@@ -1311,24 +1311,73 @@ app.post('/api/auth/send-verification', authLimiter, requireAuth, async (req, re
   }
 });
 
-// Unauthenticated password-reset request. Always returns ok (no account
-// enumeration); only actually sends when the account exists.
-app.post('/api/auth/send-reset', authLimiter, async (req, res) => {
-  const addr = String((req.body && req.body.email) || '').trim();
-  if (!addr) return res.status(400).json({ error: 'email required' });
+// The Admin SDK's links point at <project>.firebaseapp.com/__/auth/action. A
+// button whose link goes to a different domain than the sender is a classic
+// phishing signal, so reset emails carry a link to our own login page instead
+// (same domain as the receipts, which land in the inbox). The page reads the
+// one-time oobCode and finishes the reset with the Firebase client SDK.
+function ownActionLink(firebaseLink, mode) {
   try {
-    const link = await admin.auth().generatePasswordResetLink(addr, actionSettings);
-    await email.sendEmail({
-      to: addr,
-      subject: 'Reset your ETW Journal password',
-      html: emailShell('Reset your password',
-        `<p>We received a request to reset your ETW Journal password. Click below to choose a new one. This link expires shortly.</p><p>If you didn't request this, you can safely ignore this email.</p>`,
-        'Reset password', link),
-    });
-  } catch (e) {
-    if (!/user-not-found|no user record|EMAIL_NOT_FOUND/i.test(e.message || '')) console.error('send-reset:', e.message);
+    const code = new URL(firebaseLink).searchParams.get('oobCode');
+    if (code) return APP_URL.replace(/\/+$/, '') + '/?mode=' + encodeURIComponent(mode) + '&oobCode=' + encodeURIComponent(code);
+  } catch (e) {}
+  return firebaseLink;
+}
+
+// Unauthenticated password-reset request. Answers ok whether or not the
+// account exists (no account enumeration). Only when the account exists but
+// Brevo could not send does it answer 502, so the page can fall back to
+// Firebase's own email instead of telling the user to wait for nothing.
+app.post('/api/auth/send-reset', authLimiter, async (req, res) => {
+  const addr = String((req.body && req.body.email) || '').trim().toLowerCase();
+  if (!addr || addr.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(addr)) return res.status(400).json({ error: 'A valid email is required.' });
+  let user = null;
+  try { user = await admin.auth().getUserByEmail(addr); }
+  catch (e) {
+    if (!/user-not-found|no user record|EMAIL_NOT_FOUND/i.test(e.message || '')) console.error('send-reset lookup:', e.message);
+    return res.json({ ok: true });
   }
-  res.json({ ok: true });
+  try {
+    const link = ownActionLink(await admin.auth().generatePasswordResetLink(addr, actionSettings), 'resetPassword');
+    const hasPassword = (user.providerData || []).some((p) => p.providerId === 'password');
+    const hi = user.displayName ? 'Hi ' + escapeHtml(user.displayName.split(' ')[0]) + ',' : 'Hi,';
+    const sent = await email.sendEmail({
+      to: user.email || addr, toName: user.displayName || '',
+      subject: hasPassword ? 'Reset your ETW Journal password' : 'Set a password for your ETW Journal account',
+      html: emailShell(hasPassword ? 'Reset your password' : 'Set your password',
+        `<p>${hi}</p><p>We received a request to ${hasPassword ? 'reset the password for' : 'add a password to'} your ETW Journal account (${escapeHtml(user.email || addr)}). Use the button below to choose a new one. The link works once and expires in 1 hour.</p>` +
+        `<p>If you didn't ask for this, ignore this email: your password stays the same.</p>`,
+        hasPassword ? 'Choose a new password' : 'Set my password', link),
+      // A plain-text part next to the HTML is part of what keeps mail out of spam.
+      text: `${hi}\n\nWe received a request to ${hasPassword ? 'reset the password for' : 'add a password to'} your ETW Journal account (${user.email || addr}).\n\nChoose a new password here (works once, expires in 1 hour):\n${link}\n\nIf you didn't ask for this, ignore this email: your password stays the same.\n\nETW Journal`,
+    });
+    if (!sent) return res.status(502).json({ error: 'Email send failed' });
+    res.json({ ok: true, sent: true });
+  } catch (e) {
+    console.error('send-reset:', e.message);
+    res.status(502).json({ error: 'Could not send the reset email' });
+  }
+});
+
+// Security notice after a password change (Settings, or a completed reset).
+// Sent by the server so it comes from the same verified sender as receipts.
+app.post('/api/auth/password-changed', authLimiter, requireAuth, async (req, res) => {
+  try {
+    const user = await admin.auth().getUser(req.uid);
+    if (!user.email) return res.json({ ok: true });
+    const ip = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    const when = new Date().toUTCString();
+    await email.sendEmail({
+      to: user.email, toName: user.displayName || '',
+      subject: 'Your ETW Journal password was changed',
+      html: emailShell('Your password was changed',
+        `<p>The password for your ETW Journal account (${escapeHtml(user.email)}) was changed on <b>${when}</b>${ip ? ' from IP ' + escapeHtml(ip) : ''}. Other devices have been signed out.</p>` +
+        `<p>If this was you, no action is needed.</p><p><b>If it wasn't you</b>, reset your password right away from the login page and contact support.</p>`,
+        'Open ETW Journal', APP_URL),
+      text: `The password for your ETW Journal account (${user.email}) was changed on ${when}${ip ? ' from IP ' + ip : ''}. Other devices have been signed out.\n\nIf this was you, no action is needed. If it wasn't you, reset your password right away from the login page (${APP_URL}) and contact support.\n\nETW Journal`,
+    });
+    res.json({ ok: true });
+  } catch (e) { console.error('password-changed:', e.message); res.json({ ok: true }); }
 });
 
 // ── Email 2FA (new/untrusted-device only) ──────────────────
