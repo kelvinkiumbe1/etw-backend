@@ -493,6 +493,56 @@ app.post('/api/mt5-direct/connect', authLimiter, requireAuth, withSpace, require
       }
     });
 });
+// ── MT5 server directory (autocomplete for the Server field) ────────────
+// Every server name a user has ACTUALLY linked successfully is recorded once
+// per user, so the suggestion list grows with real, working servers only —
+// nobody can add a made-up name: the server must match a connected account on
+// the caller's own user doc. Stored server-side only (no client rules exist
+// for these collections, so the catch-all deny keeps them Admin-SDK only).
+const MT5_DIR = () => db.collection('mt5ServerDirectory').doc('all');
+let _mt5DirCache = { at: 0, list: [] };
+function cleanServerName(v) {
+  const s = String(v || '').replace(/\s+/g, ' ').trim();
+  return s.length >= 3 && s.length <= 64 && /^[A-Za-z0-9][A-Za-z0-9 ._\-()&]*$/.test(s) ? s : '';
+}
+app.get('/api/mt5/servers', requireAuth, async (req, res) => {
+  try {
+    if (Date.now() - _mt5DirCache.at > 10 * 60 * 1000) {
+      const snap = await MT5_DIR().get();
+      const map = (snap.exists && snap.data().servers) || {};
+      const list = Object.keys(map).map((k) => ({ s: map[k].name || k, n: Number(map[k].n) || 0, mt5: Number(map[k].mt5) || 0, mt4: Number(map[k].mt4) || 0 }))
+        .filter((x) => cleanServerName(x.s)).sort((a, b) => b.n - a.n).slice(0, 5000);
+      _mt5DirCache = { at: Date.now(), list };
+    }
+    res.set('Cache-Control', 'private, max-age=600');
+    res.json({ ok: true, servers: _mt5DirCache.list });
+  } catch (e) {
+    console.error('mt5/servers:', e.message);
+    res.json({ ok: true, servers: [] });
+  }
+});
+app.post('/api/mt5/servers/seen', authLimiter, requireAuth, withSpace, async (req, res) => {
+  try {
+    const name = cleanServerName(req.body && req.body.server);
+    if (!name) return res.status(400).json({ ok: false, error: 'server required' });
+    const snap = await db.collection('users').doc(req.duid).get();
+    const d = snap.exists ? snap.data() : {};
+    const accs = Object.values(d.mt5DirectAccounts || {}).concat(d.mt5Direct ? [d.mt5Direct] : []);
+    const hit = accs.find((a) => a && a.status === 'connected' && String(a.server || '').trim().toLowerCase() === name.toLowerCase());
+    const plat = hit && String(hit.platform || 'mt5').toLowerCase() === 'mt4' ? 'mt4' : 'mt5';
+    if (!hit) return res.status(409).json({ ok: false, error: 'Only a server with a connected account can be added.' });
+    const key = name.toLowerCase();
+    const mark = db.collection('mt5ServerSeen').doc(crypto.createHash('sha256').update(req.uid + '|' + plat + '|' + key).digest('hex').slice(0, 40));
+    try { await mark.create({ at: Date.now() }); } catch (e) { return res.json({ ok: true, already: true }); }
+    // set+merge treats map keys literally, so names with dots/spaces are safe.
+    await MT5_DIR().set({ servers: { [key]: { name, n: admin.firestore.FieldValue.increment(1), [plat]: admin.firestore.FieldValue.increment(1), last: Date.now() } } }, { merge: true });
+    _mt5DirCache.at = 0;
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('mt5/servers/seen:', e.message);
+    res.status(500).json({ ok: false });
+  }
+});
 // Daily mode is the only supported direct-sync mode. This endpoint remains for
 // old clients that may still send a mode preference.
 app.post('/api/mt5-direct/mode', authLimiter, requireAuth, withSpace, requirePro, async (req, res) => {
