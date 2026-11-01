@@ -372,6 +372,7 @@ async function requireAppCheck(req, res, next) {
 const APPCHECK_EXEMPT = [
   /^\/api\/gumroad\/ping/,
   /^\/api\/ctrader\/callback/,
+  /^\/api\/notion\/callback/,
   /^\/api\/mt5\/trades/,
   /^\/api\/mt5-ea\/push/,
   /^\/api\/cron\//,
@@ -904,6 +905,9 @@ app.post('/api/ai/transcribe', aiLimiter, requireAuth, requireUltra, async (req,
 
 // ── ETW AI market pulse: live news, TradingView technicals, trader sentiment ──
 require('./src/marketPulse').mount(app, { requireAuth, requireSub, limiter: marketLimiter });
+
+// ── Notion Sync: import a trading journal kept in Notion (see src/notionSync.js) ──
+require('./src/notionSync').mount(app, { requireAuth, requireSub, limiter: rl(60 * 1000, 90, 'Too many Notion requests, please wait a moment.'), db, admin });
 
 // ── Economic calendar (Forex Factory weekly feed) ──────────
 // Forex Factory publishes the current week as JSON. Browsers can't read it
