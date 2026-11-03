@@ -75,7 +75,7 @@ access.isUltra = (a) => !!a && a.active !== false && String(a.plan || '').toLowe
 initFirebase();
 const db = admin.firestore();
 store.init(db);
-aiGuard.init(db);   // risk interventions, pushed the moment synced trades land
+aiGuard.init(db, { isPro: async (uid) => (await directPlanGate(uid)) === 'pro' });   // risk interventions, pushed the moment synced trades land (Pro / Ultra only)
 mt5.init();
 ctrader.init();
 // onDeplete is injected rather than required, so tokens.js does not have to
