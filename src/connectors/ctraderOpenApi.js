@@ -227,6 +227,29 @@ function fmtPrice(n, ref) {
   return String(Number(n.toFixed(Math.max(2, Math.min(6, d + 1)))));
 }
 
+// When the position behind a closing deal was opened. Sources, best first:
+//   1. the opening deal (a deal of the same position with no closePositionDetail);
+//   2. the order that opened it (a filled market order's open time / its fill update);
+//   3. the closing deal's own tradeData.openTimestamp, if the API sent one.
+// Anything at or after the close is rejected, so the open time is never the close time.
+function positionOpenMs(d, openTsByPos, ordersByPos, closeMs) {
+  const pid = d.positionId != null ? String(d.positionId) : '';
+  const ok = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 && n < closeMs ? n : 0; };
+  let t = ok(pid && openTsByPos && openTsByPos[pid]);
+  if (!t && pid && ordersByPos && Array.isArray(ordersByPos[pid])) {
+    const opens = ordersByPos[pid].filter((o) => o && !o.closingOrder && Number(o.orderType) !== OT_SLTP)
+      .map((o) => {
+        const td = o.tradeData || {};
+        // MARKET (1) fills when placed; a pending order fills at its last update.
+        return Number(o.orderType) === 1 ? (ok(td.openTimestamp) || ok(o.utcLastUpdateTimestamp)) : (ok(o.utcLastUpdateTimestamp) || ok(td.openTimestamp));
+      })
+      .filter(Boolean);
+    if (opens.length) t = Math.min(...opens);
+  }
+  if (!t) t = ok(d.tradeData && d.tradeData.openTimestamp);
+  return t || 0;
+}
+
 // Map one closed cTrader deal into the shared Firestore "trades" schema.
 function mapDeal(d, { uid, accountId, symbolMap, lotSizeMap, accountLabel, openTsByPos, ordersByPos }) {
   const close = d.closePositionDetail || {};
@@ -236,7 +259,10 @@ function mapDeal(d, { uid, accountId, symbolMap, lotSizeMap, accountLabel, openT
   const commission = money(close.commission || 0, moneyDigits);
   const tradeData = d.tradeData || {};
   const symbolName = (symbolMap && symbolMap[String(d.symbolId)]) || tradeData.symbolName || ('Symbol #' + d.symbolId);
+  // The deal we import is the CLOSING deal, so its executionTimestamp is the exit
+  // time (kept in tradeDate, which the app reads as the close time for cTrader).
   const openMs = Number(d.executionTimestamp || d.createTimestamp || Date.now());
+  const closeMs = openMs;
   // Volume→lots: cTrader reports volume in the symbol's own units; the real lot
   // count is filledVolume / symbol.lotSize (lotSize varies per instrument, e.g.
   // FX=10,000,000 but others differ). Falls back to the legacy /100 only if the
@@ -256,6 +282,7 @@ function mapDeal(d, { uid, accountId, symbolMap, lotSizeMap, accountLabel, openT
   // old behaviour — exit price as TP on a win / SL on a loss — so a temporary
   // API failure never wipes levels; with order data, blanks mean "none placed".
   const lv = ordersByPos ? levelsFromOrders(ordersByPos[String(d.positionId)], d, positionDir, entryStr) : null;
+  const entryMs = positionOpenMs(d, openTsByPos, ordersByPos, closeMs);
   const slOut = lv ? fmtPrice(lv.sl, entryStr) : (result === 'LOSS' ? exitPrice : '');
   const tpOut = lv ? fmtPrice(lv.tp, entryStr) : (result === 'WIN' ? exitPrice : '');
   return {
@@ -275,11 +302,14 @@ function mapDeal(d, { uid, accountId, symbolMap, lotSizeMap, accountLabel, openT
     tradeDate: openMs,
     // Position open time (from the deal's tradeData) — used by Trade Replay to place
     // the entry marker; the closing deal's executionTimestamp is the exit time.
-    openTime: (openTsByPos && d.positionId != null && openTsByPos[String(d.positionId)]) || (tradeData.openTimestamp ? Number(tradeData.openTimestamp) : ''),
-    closeTime: new Date(openMs).toISOString(),
+    // Real position open time: the opening deal, else the order that opened it.
+    // Blank (never the close time) when neither could be found.
+    openTime: entryMs ? new Date(entryMs).toISOString() : '',
+    closeTime: new Date(closeMs).toISOString(),
+    ...(entryMs ? { holdMinutes: Math.max(0, Math.round((closeMs - entryMs) / 60000)) } : {}),
     swap: r2(swap),
     commission: r2(commission),
-    session: getSessionFromTime(openMs),
+    session: getSessionFromTime(entryMs || closeMs),
     ticket: String(d.dealId != null ? d.dealId : (d.orderId || d.positionId || openMs)),
     source: 'ctrader_open_api',
     rr: '', notes: '', rules: '', psychology: '', model: '',
@@ -393,8 +423,11 @@ async function fetchAccountDeals(session, account, { uid, from, to }) {
   // True position open time = the earliest deal execution per positionId (the opening
   // deal). We now keep ALL deals (not just closing ones) so this can be derived even
   // when the closing deal's tradeData.openTimestamp is absent.
+  // Only OPENING deals count — a closing deal (closePositionDetail) is the exit, and
+  // counting it made openTime equal the close time whenever the opening deal fell
+  // outside the window.
   const openTsByPos = {};
-  raw.forEach((d) => { const pid = String(d.positionId || ''); if (!pid) return; const ts = Number(d.executionTimestamp || d.createTimestamp || 0); if (ts && (openTsByPos[pid] == null || ts < openTsByPos[pid])) openTsByPos[pid] = ts; });
+  raw.forEach((d) => { if (d.closePositionDetail) return; const pid = String(d.positionId || ''); if (!pid) return; const ts = Number(d.executionTimestamp || d.createTimestamp || 0); if (ts && (openTsByPos[pid] == null || ts < openTsByPos[pid])) openTsByPos[pid] = ts; });
   const closingDeals = raw.filter((d) => d.closePositionDetail);
   // Resolve each traded symbol's lotSize (needed to convert volume → real lots).
   const lotSizeMap = await ensureLotSizes(session, ctid, closingDeals.map((d) => d.symbolId));

@@ -121,6 +121,40 @@ async function ensureToken(uid) {
 // errors — so a rate-limited/partial backfill self-heals instead of leaving a
 // permanent gap. Only once a backfill fully succeeds do we switch to the light
 // 7-day incremental window, and we only advance the cursor when the sync is clean.
+// Trades imported before the fix carry the CLOSE time in openTime. For trades this
+// sync saw again, put the real open time on the stored copy — only where the stored
+// openTime is blank or equals the close time, so an open time the trader typed in
+// by hand is never overwritten. Nothing else on the trade is touched.
+const OPEN_TIME_FIX_V = 1;
+function toMs(v) {
+  if (v == null || v === '') return NaN;
+  if (typeof v === 'number') return v > 1e12 ? v : v * 1000;
+  if (/^\d+$/.test(String(v))) { const n = Number(v); return n > 1e12 ? n : n * 1000; }
+  const p = Date.parse(String(v).replace(/^(\d{4})\.(\d{2})\.(\d{2}) /, '$1-$2-$3T'));
+  return Number.isFinite(p) ? p : NaN;
+}
+async function repairOpenTimes(uid, seen) {
+  const byTicket = new Map();
+  seen.forEach((tr) => { if (tr.openTime) byTicket.set(String(tr.ticket), tr); });
+  if (!byTicket.size) return 0;
+  const snap = await store.db.collection('trades').where('uid', '==', uid).where('source', '==', 'ctrader_open_api').get();
+  let batch = store.db.batch(), n = 0, inBatch = 0;
+  for (const doc of snap.docs) {
+    const x = doc.data() || {};
+    const tr = byTicket.get(String(x.ticket || ''));
+    if (!tr) continue;
+    const cur = toMs(x.openTime), closeMs = toMs(x.closeTime) || toMs(x.tradeDate);
+    const wrong = !Number.isFinite(cur) || (Number.isFinite(closeMs) && Math.abs(cur - closeMs) < 1000);
+    if (!wrong) continue;
+    const patch = { openTime: tr.openTime, session: tr.session, updatedAt: Date.now() };
+    if (tr.holdMinutes != null) patch.holdMinutes = tr.holdMinutes;
+    batch.update(doc.ref, patch); n++; inBatch++;
+    if (inBatch >= 400) { await batch.commit(); batch = store.db.batch(); inBatch = 0; }
+  }
+  if (inBatch) await batch.commit();
+  return n;
+}
+
 async function syncUser(uid, { backfill, journalAccountId } = {}) {
   const t = await ensureToken(uid);
   const statusSnap = await store.db.collection('users').doc(uid).get();
@@ -129,7 +163,10 @@ async function syncUser(uid, { backfill, journalAccountId } = {}) {
   // connect time; fall back to what's stored on the status doc; default to '' (= default profile).
   const jid = (journalAccountId != null ? journalAccountId : (status.journalAccountId || '')) || '';
   const now = Date.now();
-  const doBackfill = backfill || status.backfillDone !== true;
+  // One-off: re-pull the 90-day history so trades imported before the open-time
+  // fix get their real open time (see repairOpenTimes).
+  const needTimeFix = status.openTimeFixV !== OPEN_TIME_FIX_V;
+  const doBackfill = backfill || status.backfillDone !== true || needTimeFix;
   const from = doBackfill
     ? now - 90 * 86400000
     : Math.max(Number(status.lastDealSyncAt || 0), now - 7 * 86400000);
@@ -145,6 +182,9 @@ async function syncUser(uid, { backfill, journalAccountId } = {}) {
   const existing = await store.existingTickets(uid, 'ctrader_open_api', jid);
   const fresh = trades.filter((tr) => !existing.has(String(tr.ticket)));
   const written = fresh.length ? await store.writeTrades(fresh) : 0;
+  let repaired = 0;
+  try { repaired = await repairOpenTimes(uid, trades.filter((tr) => existing.has(String(tr.ticket)))); }
+  catch (e) { console.warn('ctrader: open-time repair failed for', uid, '-', e.message); }
 
   const patch = {
     status: 'connected',
@@ -161,8 +201,10 @@ async function syncUser(uid, { backfill, journalAccountId } = {}) {
   if (ok) {
     patch.lastDealSyncAt = now - 60000;
     if (doBackfill) patch.backfillDone = true;
+    if (needTimeFix) patch.openTimeFixV = OPEN_TIME_FIX_V;
   }
   await setStatus(uid, patch);
+  if (repaired) console.log('ctrader: fixed open time on', repaired, 'existing trade(s) for', uid);
   if (written) console.log('ctrader: wrote', written, 'new trade(s) for', uid, 'profile', jid || '(default)');
   else if (!ok) console.log('ctrader: sync incomplete for', uid, '— will retry on next poll');
   return written;

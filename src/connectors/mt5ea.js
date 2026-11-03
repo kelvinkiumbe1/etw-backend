@@ -43,6 +43,20 @@ async function revoke(key) {
   await store.db.collection('eaKeys').doc(key).delete();
 }
 
+function p2(n) { return String(n).padStart(2, '0'); }
+function eaOpenTime(t, openMs) {
+  const s = String(t.openTime || '').trim();
+  if (/^\d{4}[.\-]\d{2}[.\-]\d{2}[ T]\d{2}:\d{2}/.test(s) && s !== String(t.closeTime || '').trim()) return s.slice(0, 25);
+  if (!Number(t.tradeDate)) return '';
+  const d = new Date(openMs);
+  return d.getUTCFullYear() + '.' + p2(d.getUTCMonth() + 1) + '.' + p2(d.getUTCDate()) + ' '
+    + p2(d.getUTCHours()) + ':' + p2(d.getUTCMinutes()) + ':' + p2(d.getUTCSeconds());
+}
+function holdMin(t) {
+  const h = Number(t.holdSeconds);
+  return t.holdSeconds != null && t.holdSeconds !== '' && Number.isFinite(h) && h >= 0 ? Math.round(h / 6) / 10 : null;
+}
+
 function normalize(t, uid, accountId) {
   const openMs = Number(t.tradeDate) || Date.now();
   const pnl = Math.round(((parseFloat(t.pnl) || 0) + Number.EPSILON) * 100) / 100;
@@ -55,6 +69,11 @@ function normalize(t, uid, accountId) {
     sl: String(t.sl || ''), tp: String(t.tp || ''), lot: String(t.lot || ''),
     pnl, result,
     tradeDate: openMs, closeTime: String(t.closeTime || ''),
+    // Open time in the same terminal-clock format as closeTime, so the two read
+    // consistently. Older EAs don't send it: tradeDate is the open time in the
+    // terminal clock (written as if UTC), so it is rebuilt from that.
+    openTime: eaOpenTime(t, openMs),
+    ...(holdMin(t) != null ? { holdMinutes: holdMin(t) } : {}),
     swap: parseFloat(t.swap) || 0, commission: parseFloat(t.commission) || 0,
     session: t.session || getSessionFromTime(openMs),
     ticket: String(t.ticket || ''),
