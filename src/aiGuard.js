@@ -31,20 +31,10 @@ const REVENGE_MIN = 15;    // minutes after a loss that counts as revenge
 const SIZE_MULT   = 2.5;   // lot size vs recent median that counts as a spike
 const OVERTRADE_X = 2;     // today's count vs a typical day
 
-function init(_db) { db = _db; }
-
-// Independent accounts: a login can own several journals. Trades of an extra
-// account carry the data uid  <loginUid>__<accountId>.  The phone (push token)
-// always belongs to the login; the loss limits and the dedupe memo belong to the
-// account the trades landed in.
-const SPACE_SEP = '__';
-const ownerUid = (id) => String(id || '').split(SPACE_SEP)[0];
-const spaceId = (id) => { const i = String(id || '').indexOf(SPACE_SEP); return i > 0 ? String(id).slice(i + SPACE_SEP.length) : ''; };
-async function accountName(uid) {
-  const sid = spaceId(uid); if (!sid) return '';
-  try { const s = await db.collection('users').doc(ownerUid(uid)).collection('accounts').doc(sid).get(); return (s.exists && String(s.data().name || '').trim()) || 'Account'; }
-  catch (e) { return 'Account'; }
-}
+// ETW AI is Pro / Ultra only: server.js passes a plan check, and a push only
+// goes to a trader on one of those plans. Without a check nothing is pushed.
+let isProUser = null;
+function init(_db, opts) { db = _db; isProUser = (opts && typeof opts.isPro === 'function') ? opts.isPro : null; }
 
 const num = (v) => { const n = parseFloat(String(v == null ? '' : v).replace(/[$,\s]/g, '')); return isFinite(n) ? n : 0; };
 const money = (v) => (v >= 0 ? '+$' : '-$') + Math.abs(Number(v) || 0).toFixed(2);
@@ -68,17 +58,15 @@ const ymd = (ms) => (ms ? new Date(ms).toISOString().slice(0, 10) : '');
 // ── push ──────────────────────────────────────────────────────────────────
 async function pushTo(uid, title, body) {
   if (!uid) return false;
-  const owner = ownerUid(uid), sid = spaceId(uid);
   try {
-    const snap = await db.collection('pushTokens').doc(owner).get();
+    const snap = await db.collection('pushTokens').doc(uid).get();
     const token = snap.exists && snap.data().token;
     if (!token) return false;
     await admin.messaging().send({
       token,
       notification: { title, body },
       webpush: {
-        // Opens the journal straight into the account the warning is about.
-        fcmOptions: { link: SITE + '/journal.html' + (sid ? '?account=' + encodeURIComponent(sid) : '?account=main') },
+        fcmOptions: { link: SITE + '/journal.html' },
         notification: { icon: SITE + '/etw-logo-192.png', requireInteraction: true, tag: 'etw-ai-guard' },
       },
     });
@@ -86,7 +74,7 @@ async function pushTo(uid, title, body) {
   } catch (e) {
     if (e && (e.code === 'messaging/registration-token-not-registered'
            || e.code === 'messaging/invalid-argument')) {
-      db.collection('pushTokens').doc(owner).delete().catch(() => {});
+      db.collection('pushTokens').doc(uid).delete().catch(() => {});
     } else console.warn('[aiGuard] push:', e.message);
     return false;
   }
@@ -107,11 +95,7 @@ async function loadTrades(uid) {
 
 async function loadLimits(uid) {
   try {
-    // The main journal saves them on presence/{uid}; an extra account saves its
-    // own on its account doc users/{uid__accountId}.
-    const snap = spaceId(uid)
-      ? await db.collection('users').doc(uid).get()
-      : await db.collection('presence').doc(uid).get();
+    const snap = await db.collection('presence').doc(uid).get();   // where the journal saves them
     const l = (snap.exists && snap.data().drawdownLimits) || {};
     return {
       daily: Math.abs(num(l.daily)),
@@ -220,6 +204,8 @@ async function remember(uid, kind, count) {
 // ── entry point ───────────────────────────────────────────────────────────
 async function evaluate(uid) {
   if (!db || !uid) return null;
+  if (!isProUser) return null;
+  try { if (!(await isProUser(uid))) return null; } catch (e) { return null; }
   const trades = await loadTrades(uid);
   if (!trades.length) return null;
   const limits = await loadLimits(uid);
@@ -227,8 +213,7 @@ async function evaluate(uid) {
   if (!v) return null;
   if (await alreadySent(uid, v.kind, trades.length)) return null;
   await remember(uid, v.kind, trades.length);
-  const acct = await accountName(uid);
-  const sent = await pushTo(uid, 'ETW AI · ' + (acct ? acct + ' · ' : '') + v.title, v.body);
+  const sent = await pushTo(uid, 'ETW AI · ' + v.title, v.body);
   return Object.assign({ sent }, v);
 }
 
