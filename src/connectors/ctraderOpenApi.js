@@ -311,6 +311,7 @@ function mapDeal(d, { uid, accountId, symbolMap, lotSizeMap, accountLabel, openT
     commission: r2(commission),
     session: getSessionFromTime(entryMs || closeMs),
     ticket: String(d.dealId != null ? d.dealId : (d.orderId || d.positionId || openMs)),
+    positionId: d.positionId != null ? String(d.positionId) : '',
     source: 'ctrader_open_api',
     rr: '', notes: '', rules: '', psychology: '', model: '',
     accountId: String(accountId || ''),
@@ -535,6 +536,7 @@ async function fetchTrendbars({ clientId, clientSecret, accessToken, ctid, env, 
 async function fetchOpenPositions({ clientId, clientSecret, accessToken }) {
   const accounts = await discoverAccounts({ clientId, clientSecret, accessToken });
   const out = [];
+  const failed = [];
   const byEnv = { live: [], demo: [] };
   accounts.forEach((a) => (a.isLive ? byEnv.live : byEnv.demo).push(a));
   for (const env of ['live', 'demo']) {
@@ -573,7 +575,7 @@ async function fetchOpenPositions({ clientId, clientSecret, accessToken }) {
             const ls = Number(lotMap[String(td.symbolId)]);
             const vol = Number(td.volume || 0);
             out.push({
-              id: String(p.positionId), broker: 'cTrader', account: label, live: !!acc.isLive,
+              id: String(p.positionId), ctid: String(ctid), broker: 'cTrader', account: label, live: !!acc.isLive,
               pair: symbolMap[String(td.symbolId)] || ('Symbol #' + td.symbolId),
               dir: side(td.tradeSide), lots: r2(ls > 0 ? vol / ls : vol / 100),
               entry: Number(p.price || 0), sl: Number(p.stopLoss || 0), tp: Number(p.takeProfit || 0),
@@ -582,11 +584,14 @@ async function fetchOpenPositions({ clientId, clientSecret, accessToken }) {
               openTime: td.openTimestamp ? new Date(Number(td.openTimestamp)).toISOString() : '',
             });
           });
-        } catch (e) { console.warn('[ctrader] positions failed for', ctid, '-', e.message); }
+        } catch (e) { failed.push(String(ctid)); console.warn('[ctrader] positions failed for', ctid, '-', e.message); }
       }
-    } catch (e) { console.warn('[ctrader] positions session', env, '-', e.message); }
+    } catch (e) { byEnv[env].forEach((a) => failed.push(String(a.ctidTraderAccountId))); console.warn('[ctrader] positions session', env, '-', e.message); }
     finally { session.close(); }
   }
+  // Accounts that could not be read this time. An empty list then means "unknown",
+  // not "nothing open" — the caller keeps their last known positions.
+  out.failedAccounts = failed;
   return out;
 }
 

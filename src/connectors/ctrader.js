@@ -269,13 +269,53 @@ async function getBars(uid, { symbol, tf, from, to, accountId }) {
 
 // Live open positions for the dashboard (read-only), cached briefly so a
 // dashboard left open does not hammer cTrader.
+// A position stays listed until cTrader itself no longer reports it: when an
+// account (or cTrader as a whole) cannot be read for a moment, the last known
+// positions of that account are kept (marked stale) instead of disappearing.
+// The last good list is also kept in Firestore so a server restart keeps it.
 const _posCache = new Map();
+const _lastGood = new Map();   // uid -> { at, list }
+const POS_KEEP_MS = 14 * 86400000;
+function posRef(uid) { return store.db.collection('brokerPositions').doc(uid); }
+async function lastGood(uid) {
+  if (_lastGood.has(uid)) return _lastGood.get(uid);
+  let v = { at: 0, list: [] };
+  try { const s = await posRef(uid).get(); const c = s.exists && s.data().ctrader; if (c && Array.isArray(c.positions)) v = { at: +c.at || 0, list: c.positions }; } catch (e) {}
+  _lastGood.set(uid, v); if (_lastGood.size > 2000) _lastGood.delete(_lastGood.keys().next().value);
+  return v;
+}
+async function saveGood(uid, list) {
+  const prev = _lastGood.get(uid);
+  const sig = (l) => l.map((p) => p.id + ':' + p.sl + ':' + p.tp + ':' + p.lots).sort().join('|');
+  // everything still open, incl. positions of an account that could not be read (they keep lastSeen)
+  const fresh = list.map((p) => (p.stale ? Object.assign({}, p, { stale: false }) : p));
+  _lastGood.set(uid, { at: Date.now(), list: fresh });
+  if (prev && sig(prev.list) === sig(fresh) && Date.now() - prev.at < 3600000) return;   // unchanged: no write
+  try { await posRef(uid).set({ ctrader: { at: Date.now(), positions: fresh.map((p) => Object.assign({}, p, { pnl: null })) } }, { merge: true }); } catch (e) {}
+}
 async function getPositions(uid) {
   if (!configured()) return [];
   const hit = _posCache.get(uid);
   if (hit && Date.now() - hit.at < 20000) return hit.list;
-  const t = await ensureToken(uid);
-  const list = await engine.fetchOpenPositions({ clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, accessToken: t.accessToken });
+  const prev = await lastGood(uid);
+  const keepOld = (p) => Object.assign({}, p, { stale: true, pnl: null, lastSeen: p.lastSeen || prev.at });
+  let list;
+  try {
+    const t = await ensureToken(uid);
+    const got = await engine.fetchOpenPositions({ clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, accessToken: t.accessToken });
+    const failed = new Set(got.failedAccounts || []);
+    list = got.slice();
+    if (failed.size && Date.now() - prev.at < POS_KEEP_MS) {
+      const have = new Set(list.map((p) => String(p.id)));
+      prev.list.forEach((p) => { if (!have.has(String(p.id)) && (!p.ctid || failed.has(String(p.ctid)))) list.push(keepOld(p)); });
+    }
+    await saveGood(uid, list);
+  } catch (e) {
+    // cTrader did not answer at all: show what was open last time, marked stale.
+    if (!prev.list.length || Date.now() - prev.at > POS_KEEP_MS) throw e;
+    list = prev.list.map(keepOld);
+    list.stale = true;
+  }
   _posCache.set(uid, { at: Date.now(), list });
   if (_posCache.size > 2000) _posCache.delete(_posCache.keys().next().value);
   return list;

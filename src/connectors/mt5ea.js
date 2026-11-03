@@ -169,6 +169,9 @@ async function push(key, trades, meta) {
     });
   if (k.hosted) docs.forEach(t => { t.mt5AccountKey = k.accountKey; });
   if (docs.length) { await store.writeTrades(docs); store.indexTrades(uid, docs); }
+  // A position that just closed comes off the dashboard's open positions at once,
+  // even when the next positions snapshot is a while away (hosted runs, EA closed).
+  if (docs.length) await dropClosedPositions(uid, docs).catch((e) => console.warn('[mt5ea] drop closed positions:', e.message));
   if (k.hosted && docs.length) {
     // Required here, not at the top: hostedSync requires this module.
     await require('../hostedSync').noteWeekendTrades(uid, k.accountKey, docs)
@@ -198,6 +201,36 @@ async function push(key, trades, meta) {
 // GET /api/broker/positions. One slot per EA key, so several MT5 accounts on
 // different journal accounts never overwrite each other.
 function num(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
+// Which open position a closed trade belongs to: its positionId when the EA sends
+// one, else the same symbol, side and open time (both are the terminal's clock,
+// to the second). A partial close (less volume than the position) keeps it open.
+async function dropClosedPositions(uid, docs) {
+  const ids = new Set(), keys = [];
+  const norm = (v) => String(v || '').trim().replace(/-/g, '.').replace('T', ' ').slice(0, 19);
+  docs.forEach((t) => {
+    if (t.positionId) ids.add(String(t.positionId));
+    if (t.openTime) keys.push({ pair: String(t.pair || '').toUpperCase(), dir: t.direction, at: norm(t.openTime), lot: parseFloat(t.lot) || 0 });
+  });
+  if (!ids.size && !keys.length) return;
+  const closes = (p) => {
+    if (ids.has(String(p.id))) return true;
+    const at = norm(p.openTime), pair = String(p.pair || '').toUpperCase();
+    return !!at && keys.some((k) => k.at === at && k.pair === pair && k.dir === p.dir && !(k.lot && +p.lots && k.lot < +p.lots - 0.001));
+  };
+  const ref = store.db.collection('brokerPositions').doc(uid);
+  await store.db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const mt5 = (snap.exists && snap.data().mt5) || {};
+    const patch = {};
+    Object.keys(mt5).forEach((slot) => {
+      const list = (mt5[slot] && mt5[slot].positions) || [];
+      const keep = list.filter((p) => !closes(p));
+      if (keep.length !== list.length) patch['mt5.' + slot + '.positions'] = keep;
+    });
+    if (Object.keys(patch).length) tx.update(ref, patch);
+  });
+}
+
 async function positions(key, list, meta) {
   if (!key || !/^etw_[0-9a-f]{36}$/.test(String(key))) { const e = new Error('Invalid sync key'); e.status = 401; throw e; }
   const k = await keyData(key);
