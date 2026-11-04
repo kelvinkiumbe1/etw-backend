@@ -655,7 +655,9 @@ app.get('/api/broker/positions', marketLimiter, requireAuth, withSpace, async (r
       try {
         const list = await ctrader.getPositions(req.duid);
         list.forEach((p) => out.positions.push(Object.assign({ source: 'ctrader' }, p)));
-        out.sources.push({ source: 'ctrader', ok: true, count: list.length });
+        // stale = cTrader could not be read just now; these are the last positions it reported
+        const st = !!list.stale || list.some((p) => p.stale);
+        out.sources.push({ source: 'ctrader', ok: !list.stale, count: list.length, stale: st, at: st ? (list.reduce((m, p) => Math.max(m, +p.lastSeen || 0), 0) || null) : Date.now() });
       } catch (e) { out.sources.push({ source: 'ctrader', ok: false, error: 'cTrader did not answer — try again in a moment.' }); }
     }
     const bp = await db.collection('brokerPositions').doc(req.duid).get();
@@ -663,10 +665,15 @@ app.get('/api/broker/positions', marketLimiter, requireAuth, withSpace, async (r
     Object.keys(mt5).forEach((slot) => {
       const s = mt5[slot] || {};
       if (jid && s.accountId && s.accountId !== jid) return;
-      const fresh = Date.now() - (+s.at || 0) < 3 * 60 * 1000;
-      out.sources.push({ source: 'mt5', ok: fresh, login: s.login || '', at: s.at || 0, count: (s.positions || []).length, stale: !fresh });
-      if (!fresh) return;   // an EA that stopped reporting: don't show old positions as live
-      (s.positions || []).forEach((p) => out.positions.push(Object.assign({ source: 'mt5', broker: 'MT5', account: (s.server ? s.server + ' ' : '') + (s.login || '') }, p)));
+      const age = Date.now() - (+s.at || 0);
+      // Fresh = the EA (or hosted sync) reported in the last 3 minutes. Older snapshots
+      // are still shown — marked stale, with when they were last seen — because the
+      // position is open until MT5 says otherwise: it leaves the list when a newer
+      // snapshot no longer has it, or the moment its closed trade is imported.
+      const fresh = age < 3 * 60 * 1000;
+      if (age > 14 * 86400000) return;   // a sync that has been gone for two weeks
+      out.sources.push({ source: 'mt5', ok: fresh, login: s.login || '', at: s.at || 0, count: (s.positions || []).length, stale: !fresh, hosted: !!s.hosted });
+      (s.positions || []).forEach((p) => out.positions.push(Object.assign({ source: 'mt5', broker: 'MT5', account: (s.server ? s.server + ' ' : '') + (s.login || '') }, p, fresh ? {} : { stale: true, lastSeen: +s.at || 0 })));
     });
     res.set('Cache-Control', 'no-store');
     res.json(out);
@@ -1338,8 +1345,11 @@ app.post('/api/auth/send-reset', authLimiter, async (req, res) => {
   let user = null;
   try { user = await admin.auth().getUserByEmail(addr); }
   catch (e) {
-    if (!/user-not-found|no user record|EMAIL_NOT_FOUND/i.test(e.message || '')) console.error('send-reset lookup:', e.message);
-    return res.json({ ok: true });
+    if (/user-not-found|no user record|EMAIL_NOT_FOUND/i.test((e.code || '') + ' ' + (e.message || ''))) return res.json({ ok: true });
+    // Any other failure (credentials, quota, network) used to be answered "ok" too, so the
+    // page told the trader an email was coming when nothing was sent. Say it failed instead.
+    console.error('send-reset lookup:', e.message);
+    return res.status(502).json({ error: 'Could not look up the account' });
   }
   try {
     const link = ownActionLink(await admin.auth().generatePasswordResetLink(addr, actionSettings), 'resetPassword');
