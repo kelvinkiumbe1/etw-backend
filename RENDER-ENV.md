@@ -116,3 +116,18 @@ you've captured one, because the body contains buyer PII.
 `GET https://etwappmeta5-2.onrender.com/` returns a JSON status object listing which
 integrations it thinks are configured. Check that first — it'll tell you what's missing
 before any user does.
+
+## Bybit sync (via the Frankfurt relay)
+
+Bybit blocks API traffic from US IPs, and this service runs in Virginia, so Bybit
+calls go through the small relay in `bybit-relay/` (deployed separately in Frankfurt).
+
+1. Generate a secret: `openssl rand -hex 32`
+2. Render → New → Web Service → this repo. **Root Directory** `bybit-relay`,
+   **Region** Frankfurt, build `echo ok`, start `npm start`, health check `/health`.
+   Env: `RELAY_SECRET` = the secret.
+3. On this main backend set:
+   - `BYBIT_RELAY_URL` = the relay's URL (e.g. `https://etw-bybit-relay.onrender.com`)
+   - `BYBIT_RELAY_SECRET` = the same secret
+   - `MT5_CRED_KEY` must also be set (Bybit API keys are stored encrypted with it).
+4. Check: `https://<relay>/health` should show `"configured": true`.

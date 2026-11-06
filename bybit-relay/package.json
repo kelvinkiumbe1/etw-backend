@@ -1,0 +1,9 @@
+{
+  "name": "etw-bybit-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Forwards signed Bybit V5 GET requests from the US-hosted ETW backend via a non-US region.",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
+}

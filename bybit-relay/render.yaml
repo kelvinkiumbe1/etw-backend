@@ -1,0 +1,16 @@
+# Bybit relay — must run outside the US (Bybit blocks US IPs).
+# In Render: New → Web Service → this repo, Root Directory = bybit-relay,
+# Region = Frankfurt. Or use this file as a Blueprint.
+services:
+  - type: web
+    name: etw-bybit-relay
+    env: node
+    region: frankfurt
+    plan: starter
+    rootDir: bybit-relay
+    buildCommand: echo "no dependencies"
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: RELAY_SECRET     # long random string; set the SAME value as BYBIT_RELAY_SECRET on the main backend
+        sync: false
