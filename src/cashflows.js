@@ -73,4 +73,64 @@ async function writeCash(list) {
   return n;
 }
 
-module.exports = { writeCash, classifyMt5, classifyCtrader, docId };
+// ── MT5 starting balance when the broker history has no deposit ──
+// Prop-firm accounts (and some brokers) fund the account without a deposit deal,
+// or the terminal's history doesn't reach back to it. When an MT5 account has no
+// deposit at all, its starting balance is worked out from what we do know:
+//   starting balance = current balance − closed-trade P&L (profit + swap + commission)
+//                      − every other balance operation we have (withdrawals, fees…)
+// and saved as one deposit row (source 'mt5-initial', marked as estimated). It is
+// refreshed as trades arrive, and removed by itself as soon as a real deposit shows
+// up (from the broker, or one the trader adds by hand). Hide / note set in the app
+// are kept, like any other synced row.
+const _initRun = new Map();
+async function ensureMt5Initial(uid, slot, opts) {
+  try {
+    if (!uid || !slot || !(num(slot.balance) > 0)) return null;
+    const login = clean(slot.login, 20);
+    if (!login) return null;
+    const every = (opts && opts.everyMs) || 0;
+    const runKey = uid + '|' + login;
+    if (every && Date.now() - (_initRun.get(runKey) || 0) < every) return null;
+    _initRun.set(runKey, Date.now());
+    if (_initRun.size > 20000) _initRun.clear();
+    const acct = slot.accountId || '';
+    const same = (a) => (a || '') === acct;
+    const extId = 'mt5_' + login + '_initial';
+    const ref = store.db.collection('cashflows').doc(docId(uid, 'mt5-initial', extId));
+    const [cs, ts] = await Promise.all([
+      store.db.collection('cashflows').where('uid', '==', uid).get(),
+      store.db.collection('trades').where('uid', '==', uid).get(),
+    ]);
+    let hasDeposit = false, cashSum = 0, first = Infinity, existing = null;
+    cs.docs.forEach((d) => {
+      const c = d.data() || {};
+      if (!same(c.accountId)) return;
+      if (c.source === 'mt5-initial') { if (d.id === ref.id) existing = c; return; }
+      if ((c.kindOverride || c.kind) === 'deposit') hasDeposit = true;
+      cashSum += num(c.amount);
+      if (num(c.ts) > 0) first = Math.min(first, num(c.ts));
+    });
+    if (hasDeposit) { if (existing) await ref.delete(); return null; }
+    let pnl = 0, n = 0;
+    ts.docs.forEach((d) => {
+      const t = d.data() || {};
+      if (!same(t.accountId) || !/^mt5/i.test(String(t.source || ''))) return;
+      if (String(t.result || '').toUpperCase() === 'OPEN') return;
+      pnl += num(parseFloat(t.pnl)) + num(parseFloat(t.swap)) + num(parseFloat(t.commission)); n++;
+      const ms = num(t.tradeDate) || num(t.createdAt);
+      if (ms > 0) first = Math.min(first, ms);
+    });
+    const initial = r2(num(slot.balance) - pnl - cashSum);
+    if (!(initial > 0)) { if (existing) await ref.delete(); return null; }
+    const at = Math.round(first < Infinity ? first - 60000 : (num(slot.at) || Date.now()));
+    if (existing && Math.abs(num(existing.amount) - initial) < 1 && Math.abs(num(existing.ts) - at) < 86400000) return num(existing.amount);
+    await writeCash([{ uid, accountId: acct, source: 'mt5-initial', extId, kind: 'deposit', sub: 'Starting balance', amount: initial,
+      currency: slot.currency || '', ts: at, balance: null, brokerAccount: (clean(slot.server, 60) + ' ' + login).trim(),
+      note: 'Estimated starting balance — no deposit was found in the broker history (common on prop firm accounts). Based on ' + n + ' synced trade' + (n === 1 ? '' : 's') + '.' }]);
+    await ref.set({ estimated: true }, { merge: true });
+    return initial;
+  } catch (e) { console.warn('[cashflows] mt5 starting balance:', e.message); return null; }
+}
+
+module.exports = { writeCash, classifyMt5, classifyCtrader, docId, ensureMt5Initial };

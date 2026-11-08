@@ -332,7 +332,7 @@ function mount(app, opts) {
     return cached('cf:' + acc.du, 45e3, async () => {
       const s = await db.collection('cashflows').where('uid', '==', acc.du).get();
       return s.docs.map((d) => Object.assign({ id: d.id }, d.data() || {})).filter((c) => !c.hidden)
-        .map((c) => ({ id: c.id, account: acc.name, date: iso(num(c.ts)), ts: num(c.ts), kind: c.kindOverride || c.kind || 'other', sub: S(c.sub), amount: r2(num(c.amount)), currency: S(c.currency), note: clip(S(c.userNote || c.note), 200), source: c.source === 'manual' ? 'manual' : /ctrader/i.test(S(c.source)) ? 'cTrader' : 'MT5', balanceAfter: c.balance != null ? r2(num(c.balance)) : undefined }))
+        .map((c) => ({ id: c.id, account: acc.name, date: iso(num(c.ts)), ts: num(c.ts), kind: c.kindOverride || c.kind || 'other', sub: S(c.sub), amount: r2(num(c.amount)), currency: S(c.currency), note: clip(S(c.userNote || c.note), 200), source: c.source === 'manual' ? 'manual' : c.source === 'mt5-initial' ? 'MT5 (estimated starting balance — no deposit in the broker history)' : /ctrader/i.test(S(c.source)) ? 'cTrader' : 'MT5', balanceAfter: c.balance != null ? r2(num(c.balance)) : undefined }))
         .sort((a, b) => b.ts - a.ts);
     });
   }
