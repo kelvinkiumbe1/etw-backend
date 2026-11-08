@@ -6,17 +6,10 @@ service cloud.firestore {
     //  HELPER FUNCTIONS
     // ══════════════════════════════════════════════════
 
+    // Signed in. (Email 2FA has been retired: no session is held back for a
+    // code any more, whatever 2FA setting or claim an account still carries.)
     function isAuthed() {
-      return request.auth != null && mfaOk();
-    }
-
-    // Email 2FA, enforced here as well as in the backend (see mfaSatisfied in
-    // server.js). With 2FA on, a session only counts as signed in once its
-    // auth_time is in mfaSessions — i.e. it has entered a code or come from a
-    // trusted device. Every rule goes through isAuthed(), so this covers them all.
-    function mfaOk() {
-      return request.auth.token.get('mfaRequired', false) != true
-          || request.auth.token.auth_time in request.auth.token.get('mfaSessions', []);
+      return request.auth != null;
     }
 
     // An email address only proves who someone is once it is verified: anyone
@@ -40,19 +33,33 @@ service cloud.firestore {
               || request.time.toMillis() < request.auth.token.expiresAt);
     }
 
-    // Pro tier (Mentor mode, AI, Trade Replay). Essential subscribers fail this.
+    // Pro tier (Mentor mode, AI, Trade Replay). Ultra includes everything in
+    // Pro. Essential subscribers fail this.
     function hasPro() {
       return hasSub()
           && 'plan' in request.auth.token
-          && request.auth.token.plan == 'pro';
-    }
-
-    function isOwner() {
-      return resource.data.uid == request.auth.uid;
+          && request.auth.token.plan in ['pro', 'ultra'];
     }
 
     function isClaimingOwn() {
       return request.resource.data.uid == request.auth.uid;
+    }
+
+    // ── Independent accounts ("spaces") ───────────────────────────
+    // One login can own several fully independent journals. The main journal
+    // keeps the login's uid; every other account stores its data under the
+    // data uid  <loginUid>__<accountDocId>  (accountDocId = a doc id in
+    // users/{loginUid}/accounts). A signed-in user owns their own uid and every
+    // data uid that starts with it — nobody else's.
+    function ownsData(id) {
+      return isAuthed() && id is string
+          && (id == request.auth.uid || id.matches(request.auth.uid + '__[A-Za-z0-9]{6,40}'));
+    }
+    function isDataOwner() {
+      return ownsData(resource.data.uid);
+    }
+    function isClaimingOwnData() {
+      return ownsData(request.resource.data.uid);
     }
 
     function hasRequiredFields() {
@@ -159,17 +166,17 @@ service cloud.firestore {
       // NOT: a student sees only the mentor's playbooks (below) — the linked
       // example trades come from the mentor's own published playbook snapshot.
       allow read:   if hasSub() && (
-        isOwner() ||
+        isDataOwner() ||
         isMentorOf(resource.data.uid)
       );
-      allow create: if hasSub() && isClaimingOwn() && uidIsValid() && hasRequiredFields();
-      allow update: if hasSub() && isOwner() && isClaimingOwn() && uidIsValid();
+      allow create: if hasSub() && isClaimingOwnData() && uidIsValid() && hasRequiredFields();
+      allow update: if hasSub() && isDataOwner() && isClaimingOwnData() && uidIsValid();
       // Deleting own data stays allowed after a lapse — nobody should be locked
       // out of removing their own records.
-      allow delete: if isAuthed() && isOwner();
+      allow delete: if isAuthed() && isDataOwner();
       // Account deletion: a lapsed user must still be able to FIND their
       // trades in order to delete them.
-      allow read: if deletionRequested() && isOwner();
+      allow read: if deletionRequested() && isDataOwner();
     }
 
     // ══════════════════════════════════════════════════
@@ -179,25 +186,59 @@ service cloud.firestore {
       // A connected student can read their mentor's playbooks (Mentor Mode ›
       // Student › Playbooks); the mentor can read their students' playbooks.
       allow read:   if hasSub() && (
-        isOwner() ||
+        isDataOwner() ||
         isMentorOf(resource.data.uid) ||
         isStudentOf(resource.data.uid)
       );
-      allow create: if hasSub() && isClaimingOwn() && uidIsValid();
-      allow update: if hasSub() && isOwner() && isClaimingOwn() && uidIsValid();
-      allow delete: if isAuthed() && isOwner();
-      allow read:   if deletionRequested() && isOwner();
+      allow create: if hasSub() && isClaimingOwnData() && uidIsValid();
+      allow update: if hasSub() && isDataOwner() && isClaimingOwnData() && uidIsValid();
+      allow delete: if isAuthed() && isDataOwner();
+      allow read:   if deletionRequested() && isDataOwner();
     }
 
     // ══════════════════════════════════════════════════
     //  TRADING RULES COLLECTION
     // ══════════════════════════════════════════════════
     match /trading_rules/{ruleId} {
-      allow read:   if hasSub() && isOwner();
-      allow create: if hasSub() && isClaimingOwn() && uidIsValid();
-      allow update: if hasSub() && isOwner() && isClaimingOwn() && uidIsValid();
-      allow delete: if isAuthed() && isOwner();
-      allow read:   if deletionRequested() && isOwner();
+      allow read:   if hasSub() && isDataOwner();
+      allow create: if hasSub() && isClaimingOwnData() && uidIsValid();
+      allow update: if hasSub() && isDataOwner() && isClaimingOwnData() && uidIsValid();
+      allow delete: if isAuthed() && isDataOwner();
+      allow read:   if deletionRequested() && isDataOwner();
+    }
+
+    // ══════════════════════════════════════════════════
+    //  CASH FLOWS — deposits, withdrawals & other balance operations
+    // ══════════════════════════════════════════════════
+    //  Broker-synced rows (MT5 / cTrader) are written by the backend Admin SDK.
+    //  The owner reads them and may only hide, annotate or re-label them — never
+    //  change the amount or date the broker reported. Rows the trader adds by
+    //  hand (source 'manual') are fully theirs to edit and delete.
+    function cashManualOk(d) {
+      return d.source == 'manual'
+          && d.kind in ['deposit', 'withdrawal', 'other']
+          && d.amount is number && d.amount != 0 && d.amount > -1000000000 && d.amount < 1000000000
+          && d.ts is int && d.ts > 0
+          && d.get('note', '') is string && d.get('note', '').size() <= 300
+          && d.get('accountId', '') is string && d.get('accountId', '').size() <= 128;
+    }
+    match /cashflows/{id} {
+      allow read:   if hasSub() && isDataOwner();
+      allow create: if hasSub() && isClaimingOwnData() && cashManualOk(request.resource.data);
+      allow update: if hasSub() && isDataOwner() && isClaimingOwnData() && (
+                      (resource.data.source == 'manual' && cashManualOk(request.resource.data))
+                   || request.resource.data.diff(resource.data).affectedKeys().hasOnly(['hidden', 'userNote', 'kindOverride', 'updatedAt']));
+      allow delete: if isAuthed() && isDataOwner() && (resource.data.source == 'manual' || deletionRequested());
+      allow read:   if deletionRequested() && isDataOwner();
+    }
+
+    // ══════════════════════════════════════════════════
+    //  AI CONNECTOR KEYS (MCP) — backend only
+    // ══════════════════════════════════════════════════
+    //  mcpKeys/{sha256 of key}: created, listed and revoked through the backend
+    //  (/api/mcp/keys). Browsers never read or write them directly.
+    match /mcpKeys/{id} {
+      allow read, write: if false;
     }
 
     // ══════════════════════════════════════════════════
@@ -210,11 +251,19 @@ service cloud.firestore {
       // page or an old open tab therefore gets nothing once the membership
       // ends — the data is never sent. Renewing restores access instantly.
       // (Admins keep read for support/moderation.)
-      allow read:   if hasSub() || isAdmin();
-      allow create: if hasSub() && isClaimingOwn() && uidIsValid();
-      allow update: if hasSub() && isOwner() && isClaimingOwn() && uidIsValid();
-      allow delete: if isAuthed() && isOwner();
-      allow read:   if deletionRequested() && isOwner();
+      // PRIVATE SWITCH: isPublic == false means the owner stopped sharing it.
+      // Then nobody but the owner (and admins) receives the document at all.
+      // Docs without the field are public as before.
+      allow read:   if (hasSub() && resource.data.get('isPublic', true) != false) || isAdmin();
+      allow read:   if isDataOwner();
+      allow create: if hasSub() && isClaimingOwnData() && uidIsValid();
+      allow update: if hasSub() && isDataOwner() && isClaimingOwnData() && uidIsValid();
+      // The owner can always switch sharing on/off, even with a lapsed plan.
+      allow update: if isDataOwner()
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isPublic', 'privateAt', 'updatedAt'])
+                    && request.resource.data.isPublic is bool;
+      allow delete: if isAuthed() && isDataOwner();
+      allow read:   if deletionRequested() && isDataOwner();
     }
 
     // ══════════════════════════════════════════════════
@@ -370,20 +419,20 @@ service cloud.firestore {
       // could reset its own monthly limit.
       // referral / referredBy hold the referral code, bonus days earned/banked
       // and who referred this user — rewards are access, so Admin SDK only.
-      // mfaEnabled mirrors the 2FA claim; only POST /api/mfa/settings may change
-      // it, so a session holding just the password can't switch 2FA off.
+      // aiUsage / replayQuota are the daily ETW AI and monthly Trade Replay
+      // allowances — written by the backend only, or a client could reset them.
       return ['syncTokens', 'mt5Direct', 'mt5DirectAccounts', 'aiGuard', 'btQuota',
-              'referral', 'referredBy', 'mfaEnabled'];
+              'referral', 'referredBy', 'aiUsage', 'replayQuota'];
     }
     match /users/{uid} {
-      allow read:   if isAuthed() && (request.auth.uid == uid || isAdmin());
-      allow create: if isAuthed() && request.auth.uid == uid
+      allow read:   if isAuthed() && (ownsData(uid) || isAdmin());
+      allow create: if isAuthed() && ownsData(uid)
                     && !request.resource.data.keys().hasAny(serverOwnedUserFields());
-      allow update: if isAuthed() && request.auth.uid == uid
+      allow update: if isAuthed() && ownsData(uid)
                     && !request.resource.data.diff(resource.data).affectedKeys()
                           .hasAny(serverOwnedUserFields());
       // Only after the exit form is signed (Settings › Delete account).
-      allow delete: if deletionRequested() && request.auth.uid == uid;
+      allow delete: if deletionRequested() && ownsData(uid);
     }
 
     // ══════════════════════════════════════════════════
@@ -401,15 +450,15 @@ service cloud.firestore {
     //  Firestore grants if ANY matching rule allows, so a restrictive rule added
     //  alongside this one would be useless — the exclusion has to live here.
     match /users/{uid}/{collection}/{docId} {
-      allow read, write: if hasSub() && request.auth.uid == uid
+      allow read, write: if hasSub() && ownsData(uid)
                          && !(collection in ['private', 'syncLedger']);
-      allow read: if isAuthed() && request.auth.uid == uid && collection == 'syncLedger';
+      allow read: if isAuthed() && ownsData(uid) && collection == 'syncLedger';
       allow read: if hasSub() &&
         isMentorOf(uid) &&
         collection in ['trades', 'playbooks'];
       // Account deletion: the owner may list and delete EVERY sub-collection
       // (incl. private tokens and the sync ledger), with or without a plan.
-      allow list, delete: if deletionRequested() && request.auth.uid == uid;
+      allow list, delete: if deletionRequested() && ownsData(uid);
     }
 
     // ══════════════════════════════════════════════════
@@ -590,9 +639,18 @@ service cloud.firestore {
     match /publicInteractions/{shareId} {
       allow read, write: if false;
 
+      // Likes and comments of a journal its owner made private are hidden too —
+      // from everyone except the owner.
+      function shareOpen() {
+        let path = /databases/$(database)/documents/publicShares/$(shareId);
+        return !exists(path)
+            || get(path).data.get('isPublic', true) != false
+            || ownsData(get(path).data.get('uid', ''));
+      }
+
       // Likes & comments follow the journal: members only.
       match /likes/{likeId} {
-        allow read: if hasSub();
+        allow read: if hasSub() && shareOpen();
         allow create: if hasSub()
                       && request.resource.data.count is int
                       && request.resource.data.count == 1
@@ -606,7 +664,7 @@ service cloud.firestore {
       }
 
       match /{commentCol}/{commentId} {
-        allow read: if hasSub() && commentCol.matches('comments_[A-Za-z0-9]+');
+        allow read: if hasSub() && commentCol.matches('comments_[A-Za-z0-9]+') && shareOpen();
 
         allow create: if hasSub()
                       && commentCol.matches('comments_[A-Za-z0-9]+')
@@ -626,15 +684,13 @@ service cloud.firestore {
                            ||
                            (request.resource.data.isOwner == true
                              && isAuthed()
-                             && get(/databases/$(database)/documents/publicShares/$(shareId)).data.uid
-                                  == request.auth.uid)
+                             && ownsData(get(/databases/$(database)/documents/publicShares/$(shareId)).data.uid))
                          );
 
         allow update: if hasSub()
                       && commentCol.matches('comments_[A-Za-z0-9]+')
                       && isAuthed()
-                      && get(/databases/$(database)/documents/publicShares/$(shareId)).data.uid
-                           == request.auth.uid
+                      && ownsData(get(/databases/$(database)/documents/publicShares/$(shareId)).data.uid)
                       && resource.data.isOwner != true
                       && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likedByOwner'])
                       && request.resource.data.likedByOwner is bool;
@@ -645,8 +701,7 @@ service cloud.firestore {
         allow delete: if hasSub()
                       && commentCol.matches('comments_[A-Za-z0-9]+')
                       && (
-                           get(/databases/$(database)/documents/publicShares/$(shareId)).data.uid
-                             == request.auth.uid
+                           ownsData(get(/databases/$(database)/documents/publicShares/$(shareId)).data.uid)
                            || resource.data.get('uid', '') == request.auth.uid
                          );
       }
@@ -710,6 +765,36 @@ service cloud.firestore {
       allow create, update: if isAuthed()
         && request.resource.data.studentUid == request.auth.uid
         && wid == request.resource.data.mentorUid + '_' + request.auth.uid;
+    }
+
+    // ETW UNIVERSITY LIBRARY — lessons (video links) and trading materials (PDFs).
+    // Every active subscriber can read; only listed mentors publish, and each mentor
+    // edits or deletes only their own items (admins can remove anything). Readers
+    // may only bump the view / download counters, one at a time.
+    function uniItemOk(d) {
+      return d.type in ['pdf', 'video']
+          && d.title is string && d.title.size() >= 1 && d.title.size() <= 140
+          && d.get('description', '') is string && d.get('description', '').size() <= 1500
+          && d.get('category', '') is string && d.get('category', '').size() <= 40
+          && d.url is string && d.url.size() <= 2000 && d.url.matches('^https://[^ "<>]+$')
+          && (d.get('thumbUrl', '') == '' || (d.get('thumbUrl', '') is string && d.get('thumbUrl', '').matches('^https://[^ "<>]+$')));
+    }
+    match /uniMaterials/{id} {
+      allow read: if hasSub() || isMentorEmail() || isAdmin();
+      allow create: if isMentorEmail()
+                    && request.resource.data.authorUid == request.auth.uid
+                    && uniItemOk(request.resource.data);
+      allow update: if (isMentorEmail()
+                        && resource.data.authorUid == request.auth.uid
+                        && request.resource.data.authorUid == request.auth.uid
+                        && uniItemOk(request.resource.data))
+                    || isAdmin()
+                    || (hasSub() && (
+                         (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['downloads'])
+                           && request.resource.data.downloads == resource.data.get('downloads', 0) + 1)
+                      || (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['views'])
+                           && request.resource.data.views == resource.data.get('views', 0) + 1)));
+      allow delete: if (isMentorEmail() && resource.data.authorUid == request.auth.uid) || isAdmin();
     }
 
     // ETW SPACES: live group rooms hosted by mentors, open to EVERY active

@@ -138,10 +138,80 @@ async function fetchDeals(rpc) {
   return (res && res.deals) || (Array.isArray(res) ? res : []);
 }
 
+// ── SL / TP exactly as the trader placed them ─────────────────────────────
+// MT5 keeps the position's SL/TP on its deals (the closing deal carries the
+// levels in force at the close — so a stop moved to breakeven is recorded where
+// it really was) and on its orders (the levels sent with the order). A trade
+// whose SL or TP is blank — or holds the exit price as a stand-in — gets the
+// real level from these. Levels the trader typed in are never touched, and if
+// the order history can't be read the trade is left exactly as before.
+const lvl = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : null; };
+async function fetchHistoryOrders(rpc) {
+  const start = new Date(Date.UTC(2015, 0, 1));
+  const end = new Date(Date.now() + 24 * 3600 * 1000);
+  const out = [];
+  for (let offset = 0, page = 0; page < 30; page++) {
+    const res = await rpc.getHistoryOrdersByTimeRange(start, end, offset, 1000); // SDK:
+    const list = (res && res.historyOrders) || (Array.isArray(res) ? res : []);
+    out.push(...list);
+    if (list.length < 1000) break;
+    offset += list.length;
+  }
+  return out;
+}
+async function applyPlacedLevels(rpc, deals, trades) {
+  if (!trades.length) return;
+  const byPos = {};          // positionId -> { deals:[], orders:[] }
+  const dealById = {};
+  const bucket = (pid) => (byPos[pid] = byPos[pid] || { deals: [], orders: [] });
+  (deals || []).forEach((d) => {
+    if (!d) return;
+    if (d.id != null) dealById[String(d.id)] = d;
+    if (d.positionId != null) bucket(String(d.positionId)).deals.push(d);
+  });
+  let orders = [], ordersOk = false;
+  try { orders = await fetchHistoryOrders(rpc); ordersOk = true; }
+  catch (e) { console.warn('mt5: history orders unavailable, SL/TP from deals only:', e.message); }
+  orders.forEach((o) => { if (o && o.positionId != null) bucket(String(o.positionId)).orders.push(o); });
+
+  const tm = (x) => new Date(x.doneTime || x.time || x.brokerTime || 0).getTime() || 0;
+  trades.forEach((t) => {
+    const pid = String(t.positionId || (dealById[String(t.ticket)] || {}).positionId || t.ticket || '');
+    const p = byPos[pid]; if (!p) return;
+    const ins = p.deals.filter((d) => /ENTRY_IN$/.test(String(d.entryType || ''))).sort((a, b) => tm(a) - tm(b));
+    const outs = p.deals.filter((d) => /ENTRY_OUT|ENTRY_INOUT|ENTRY_OUT_BY/.test(String(d.entryType || ''))).sort((a, b) => tm(b) - tm(a));
+    const ords = p.orders.slice().sort((a, b) => tm(b) - tm(a));          // newest first
+    const pick = (k) => {
+      for (const d of outs) { const v = lvl(d[k]); if (v) return v; }     // in force at the close
+      for (const o of ords) { const v = lvl(o[k]); if (v) return v; }     // last level sent on an order
+      for (const d of ins) { const v = lvl(d[k]); if (v) return v; }
+      return null;
+    };
+    let sl = pick('stopLoss'), tp = pick('takeProfit');
+    // Closed by its own SL / TP: the fill price is that level.
+    const reason = String((outs[0] || {}).reason || '');
+    if (!sl && /REASON_SL$/.test(reason)) sl = lvl(outs[0].price);
+    if (!tp && /REASON_TP$/.test(reason)) tp = lvl(outs[0].price);
+    const long = String(t.direction || '').toUpperCase() === 'LONG';
+    const entry = Number(t.entry);
+    if (tp && entry && (long ? tp <= entry : tp >= entry)) tp = null;      // a TP sits on the profit side
+    const exit = String(t.closePrice || '');
+    const guess = (v) => !String(v || '').trim() || (exit && Number(v) === Number(exit));
+    if (sl && guess(t.sl)) t.sl = String(sl);
+    if (tp && guess(t.tp)) t.tp = String(tp);
+    // An exit price that was only standing in for a level the trader never set.
+    // Only when the order history was read, so a missing feed never blanks a level.
+    if (ordersOk && !sl && exit && Number(t.sl) === Number(exit) && !/REASON_SL$/.test(reason)) t.sl = '';
+    if (ordersOk && !tp && exit && Number(t.tp) === Number(exit) && !/REASON_TP$/.test(reason)) t.tp = '';
+  });
+}
+
 async function syncOnce(sync) {
   const deals = await fetchDeals(sync.rpc);
   const trades = buildTradesFromDeals(deals, { uid: sync.uid, accountId: sync.accountId })
     .map(t => ({ ...t, source: sync.source, mt5AccountKey: sync.accountKey }));
+  try { await applyPlacedLevels(sync.rpc, deals, trades.filter(t => !sync.written.has(String(t.ticket)))); }
+  catch (e) { console.warn('mt5: SL/TP enrichment skipped:', e.message); }
   const fresh = trades.filter(t => !sync.written.has(String(t.ticket)));
   if (fresh.length) { await store.writeTrades(fresh); fresh.forEach(t => sync.written.add(String(t.ticket))); }
   // Deposits / withdrawals / credits (balance-type deals) → cashflows, once each per process.
@@ -372,6 +442,6 @@ function friendlyError(e) {
 module.exports = {
   init, startSync, stopSync, resumeAll, setStatus, friendlyError,
   pullOnce, pause, resumeOne, findDormant, removeAccount,
-  reserveAccount, releaseNewPeriodSlot,
+  reserveAccount, releaseNewPeriodSlot, applyPlacedLevels,
   isActive: (uid, accountKey) => active.has(activeKey(uid, accountKey)),
 };
