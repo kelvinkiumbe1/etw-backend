@@ -337,6 +337,26 @@ function mount(app, opts) {
     });
   }
 
+  // ── live account balances reported by the broker side (MT5 EA / hosted / MetaApi, cTrader) ──
+  async function balancesOf(acc) {
+    return cached('bal:' + acc.du, 30e3, async () => {
+      const out = [];
+      try {
+        const [u, bp] = await Promise.all([db.collection('users').doc(acc.du).get(), db.collection('brokerPositions').doc(acc.du).get()]);
+        const ct = (u.exists && (u.data() || {}).ctrader) || {};
+        if (ct.status === 'connected') Object.keys(ct.cashBalances || {}).forEach((id) => { const b = ct.cashBalances[id] || {}; if (b.balance != null) out.push({ account: acc.name, broker: 'cTrader', name: b.label || ('cTrader ' + id), live: !!b.live, balance: r2(b.balance), updated: iso(b.at) }); });
+        const d = bp.exists ? (bp.data() || {}) : {};
+        const seen = new Set();
+        [['mt5', d.mt5 || {}], ['mt5api', d.mt5api || {}]].forEach(([k, m]) => Object.keys(m).forEach((slot) => {
+          const x = m[slot] || {}; if (!(+x.balance) && !(+x.equity)) return; if (Date.now() - (+x.at || 0) > 30 * 86400000) return;
+          if (x.login && seen.has(x.login)) return; if (x.login) seen.add(x.login);
+          out.push({ account: acc.name, broker: 'MT5' + (k === 'mt5api' ? ' (direct)' : x.hosted ? ' (hosted sync)' : ' (ETW EA)'), name: ((x.server ? x.server + ' ' : '') + (x.login || '')).trim(), balance: r2(x.balance), equity: x.equity != null ? r2(x.equity) : undefined, floatingPnl: x.equity != null ? r2(x.equity - x.balance) : undefined, currency: x.currency || undefined, updated: iso(x.at) });
+        }));
+      } catch (e) {}
+      return out;
+    });
+  }
+
   // ── notes ──
   async function foldersOf(du) {
     return cached('nf:' + du, 60e3, async () => {
@@ -411,6 +431,7 @@ function mount(app, opts) {
           allTime: stats(trades), last30Days: stats(trades.filter((t) => t.ts >= since)),
           money: cash.length ? { deposited: r2(dep), withdrawn: r2(wd), netDeposits: r2(dep - wd), otherBalanceChanges: r2(other), tradingPnl: r2(allPnl), returnOnDeposits: dep ? r2((allPnl + other) / dep * 100) + '%' : null } : 'No deposits or withdrawals recorded.',
           recentTrades: trades.slice(-8).reverse().map(brief),
+          brokerBalances: await (async () => { let b = []; for (const acc of accs) b = b.concat(await balancesOf(acc)); return b.length ? b : undefined; })(),
           notes: 'P&L is in the account currency. Dates are ISO-8601 UTC.',
         };
       },
@@ -492,7 +513,7 @@ function mount(app, opts) {
     },
     {
       name: 'get_cash_flows', title: 'Deposits & withdrawals',
-      description: 'Deposits, withdrawals and other balance changes (bonuses, fees, credit) imported from MT5 / cTrader or added by hand, with totals and return on deposits. Withdrawals are not losses and deposits are not profit.',
+      description: 'Live account balances reported by the broker (MT5, cTrader, prop firm accounts), plus deposits, withdrawals and other balance changes (bonuses, fees, credit) imported from MT5 / cTrader or added by hand, with totals and return on deposits. Withdrawals are not losses and deposits are not profit.',
       inputSchema: { type: 'object', properties: Object.assign({ account: ACCOUNT }, DATE_FILTERS, { limit: { type: 'integer', minimum: 1, maximum: 500, description: 'Max operations to list (default 100).' } }), additionalProperties: false }, annotations: RO,
       run: async (ctx, a) => {
         const accs = await pickAccounts(ctx, a.account);
@@ -503,7 +524,9 @@ function mount(app, opts) {
         const sum = (arr, k) => r2(arr.filter((c) => c.kind === k).reduce((s, c) => s + (k === 'other' ? c.amount : Math.abs(c.amount)), 0));
         let pnl = 0; for (const acc of accs) pnl += (await tradesOf(acc)).reduce((s, t) => s + t.pnl, 0);
         const dep = sum(all, 'deposit'), wd = sum(all, 'withdrawal'), oth = sum(all, 'other');
+        let brokerBalances = []; for (const acc of accs) brokerBalances = brokerBalances.concat(await balancesOf(acc));
         return {
+          brokerBalances: brokerBalances.length ? brokerBalances : 'No live balance reported yet (needs a connected MT5 / cTrader account).',
           allTime: { deposited: dep, withdrawn: wd, netDeposits: r2(dep - wd), otherBalanceChanges: oth, tradingPnl: r2(pnl), totalGain: r2(pnl + oth), returnOnDeposits: dep ? r2((pnl + oth) / dep * 100) + '%' : null, withdrawnShareOfDeposits: dep ? r2(wd / dep * 100) + '%' : null, ownCapitalStillAtRisk: r2(Math.max(0, dep - wd)) },
           inRange: (from != null || to != null) ? { deposited: sum(inR, 'deposit'), withdrawn: sum(inR, 'withdrawal'), other: sum(inR, 'other') } : undefined,
           operations: inR.slice(0, Math.min(500, a.limit || 100)).map((c) => { const o = Object.assign({}, c); delete o.ts; return o; }),

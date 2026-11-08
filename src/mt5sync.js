@@ -226,6 +226,19 @@ async function syncOnce(sync) {
     }).filter(Boolean);
     if (cash.length) { await cashflows.writeCash(cash); cash.forEach((c) => sync.cashWritten.add(c.extId.split('_').pop())); }
   } catch (e) { console.warn('mt5: cash flow write failed:', e.message); }
+  // Account balance / equity straight from the broker → Deposits & Withdrawals dashboard
+  // (brokerPositions/{uid}.mt5api — separate from the EA's open-positions slots).
+  try {
+    const info = await sync.rpc.getAccountInformation();
+    if (info && Number.isFinite(Number(info.balance))) {
+      const slot = 'a' + String(sync.accountKey || sync.login || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 32);
+      const rec = { at: Date.now(), accountId: sync.accountId || '', login: String(sync.login || info.login || ''), server: String(sync.server || info.server || '').slice(0, 80),
+        currency: String(info.currency || '').slice(0, 6), balance: Number(info.balance) || 0, equity: Number.isFinite(Number(info.equity)) ? Number(info.equity) : null,
+        platform: sync.platform || 'mt5', name: String(info.name || '').slice(0, 60) };
+      await store.db.collection('brokerPositions').doc(sync.uid).set({ mt5api: { [slot]: rec } }, { merge: true });
+      cashflows.ensureMt5Initial(sync.uid, rec, { everyMs: 60 * 60 * 1000 }).catch(() => {});
+    }
+  } catch (e) { console.warn('mt5: account balance read failed:', e.message); }
   await setStatus(sync.uid, {
     status: 'connected', platform: sync.platform, login: String(sync.login || ''), server: sync.server || '',
     metaApiAccountId: sync.account.id, historyImported: sync.written.size, lastSyncAt: Date.now(), error: null,

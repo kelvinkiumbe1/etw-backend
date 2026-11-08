@@ -11,13 +11,7 @@ const store = require('./store');
 function clean(s, n) { return String(s == null ? '' : s).replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, n || 200); }
 function num(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
 function r2(n) { return Math.round((num(n) + Number.EPSILON) * 100) / 100; }
-// MT5/MT4 deals get one id whichever path imported them (MetaApi 'mt5-direct' /
-// 'mt4-direct', the user's EA or the hosted worker 'mt5-ea'): extId is
-// mt5_<login>_<deal ticket> on every path, so a user who moves from MetaApi to
-// hosted sync doesn't see each deposit twice. 'mt5-direct' is kept as the key so
-// rows MetaApi already wrote keep their ids.
-const SAME_DEAL = { 'mt5-ea': 'mt5-direct', 'mt4-direct': 'mt5-direct', 'mt5-direct': 'mt5-direct' };
-function docId(uid, source, extId) { return (uid + '_' + (SAME_DEAL[source] || source) + '_' + String(extId)).replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 300); }
+function docId(uid, source, extId) { return (uid + '_' + source + '_' + String(extId)).replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 300); }
 
 // MT5 deal types (EnumToString names from the EA, or MetaApi's DEAL_TYPE_* strings).
 function classifyMt5(type, amount) {
