@@ -22,6 +22,7 @@ const mt5 = require('./src/mt5sync');
 const tradelocker = require('./src/connectors/tradelocker');
 const dxtrade = require('./src/connectors/dxtrade');
 const ctrader = require('./src/connectors/ctrader');
+const cashflows = require('./src/cashflows');
 const gumroad = require('./src/gumroad');
 const mt5ea = require('./src/connectors/mt5ea');
 const hosted = require('./src/hostedSync');
@@ -705,6 +706,8 @@ app.get('/api/cashflow/balances', marketLimiter, requireAuth, withSpace, require
       if (Date.now() - (+x.at || 0) > 30 * 86400000) return;
       out.accounts.push({ source: 'mt5', accountId: x.accountId || '', label: ((x.server ? x.server + ' ' : '') + (x.login || '')).trim() || 'MT5', balance: x.balance, equity: x.equity, currency: x.currency || '', at: x.at || 0, hosted: !!x.hosted });
     });
+    // MT5 accounts with no deposit in their history (prop firms): make sure the estimated starting balance exists.
+    await Promise.all(Object.keys(mt5).map((slot) => { const x = mt5[slot] || {}; return x.balance > 0 && Date.now() - (+x.at || 0) <= 30 * 86400000 ? cashflows.ensureMt5Initial(req.duid, x, { everyMs: 10 * 60 * 1000 }) : null; }));
     res.set('Cache-Control', 'no-store');
     res.json(out);
   } catch (e) { console.error('cashflow/balances:', e.message); res.status(500).json({ ok: false, error: 'Could not load balances.' }); }
