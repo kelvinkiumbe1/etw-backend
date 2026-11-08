@@ -5,8 +5,6 @@
 //                     POST /api/tradelocker/disconnect
 //   DXtrade ......... POST /api/dxtrade/connect        { webUrl, username, password, domain, journalAccountId }
 //                     POST /api/dxtrade/disconnect
-//   Bybit ........... POST /api/bybit/connect          { apiKey, apiSecret, env, journalAccountId }  (read-only key)
-//                     POST /api/bybit/disconnect
 //   cTrader ......... GET  /api/ctrader/auth           (returns { url } to open — OAuth)
 //                     GET  /api/ctrader/callback       (Spotware redirect target)
 //                     POST /api/ctrader/disconnect
@@ -24,7 +22,6 @@ const mt5 = require('./src/mt5sync');
 const tradelocker = require('./src/connectors/tradelocker');
 const dxtrade = require('./src/connectors/dxtrade');
 const ctrader = require('./src/connectors/ctrader');
-const bybit = require('./src/connectors/bybit');
 const cashflows = require('./src/cashflows');
 const gumroad = require('./src/gumroad');
 const mt5ea = require('./src/connectors/mt5ea');
@@ -294,7 +291,7 @@ app.get('/', (_req, res) => res.json({
   ok: true,
   service: 'etw-sync-backend',
   version: 'ea-2',
-  platforms: { mt5: true, mt4: true, mt5ea: true, tradelocker: true, dxtrade: true, ctrader: ctrader.configured(), bybit: hosted.configured() },
+  platforms: { mt5: true, mt4: true, mt5ea: true, tradelocker: true, dxtrade: true, ctrader: ctrader.configured() },
   email: email.configured(),
   eodhd: require('./src/eodhd').configured(),
   gumroad: gumroad.configured(),
@@ -700,14 +697,22 @@ app.get('/api/cashflow/balances', marketLimiter, requireAuth, withSpace, require
     const ct = (u.exists && u.data().ctrader) || {};
     if (ct.status === 'connected') Object.keys(ct.cashBalances || {}).forEach((id) => {
       const b = ct.cashBalances[id] || {};
-      out.accounts.push({ source: 'ctrader', accountId: ct.journalAccountId || '', label: b.label || ('cTrader ' + id), balance: b.balance, equity: null, currency: '', at: b.at || 0, live: !!b.live });
+      out.accounts.push({ source: 'ctrader', via: 'ctrader', login: String(id), accountId: ct.journalAccountId || '', label: b.label || ('cTrader ' + id), balance: b.balance, equity: null, currency: '', at: b.at || 0, live: !!b.live });
     });
     const mt5 = (bp.exists && bp.data().mt5) || {};
     Object.keys(mt5).forEach((slot) => {
       const x = mt5[slot] || {};
       if (!x.balance && !x.equity) return;
       if (Date.now() - (+x.at || 0) > 30 * 86400000) return;
-      out.accounts.push({ source: 'mt5', accountId: x.accountId || '', label: ((x.server ? x.server + ' ' : '') + (x.login || '')).trim() || 'MT5', balance: x.balance, equity: x.equity, currency: x.currency || '', at: x.at || 0, hosted: !!x.hosted });
+      out.accounts.push({ source: 'mt5', via: x.hosted ? 'hosted' : 'ea', login: x.login || '', accountId: x.accountId || '', label: ((x.server ? x.server + ' ' : '') + (x.login || '')).trim() || 'MT5', balance: x.balance, equity: x.equity, currency: x.currency || '', at: x.at || 0, hosted: !!x.hosted });
+    });
+    // MT5 accounts linked through MetaApi report balance/equity on every sync.
+    const api = (bp.exists && bp.data().mt5api) || {};
+    Object.keys(api).forEach((slot) => {
+      const x = api[slot] || {};
+      if (Date.now() - (+x.at || 0) > 30 * 86400000) return;
+      if (out.accounts.some((a) => a.source === 'mt5' && a.login && a.login === x.login)) return;   // same account also on the EA
+      out.accounts.push({ source: 'mt5', via: 'direct', accountId: x.accountId || '', login: x.login || '', label: ((x.server ? x.server + ' ' : '') + (x.login || '')).trim() || 'MT5', balance: x.balance, equity: x.equity, currency: x.currency || '', at: x.at || 0 });
     });
     // MT5 accounts with no deposit in their history (prop firms): make sure the estimated starting balance exists.
     await Promise.all(Object.keys(mt5).map((slot) => { const x = mt5[slot] || {}; return x.balance > 0 && Date.now() - (+x.at || 0) <= 30 * 86400000 ? cashflows.ensureMt5Initial(req.duid, x, { everyMs: 10 * 60 * 1000 }) : null; }));
@@ -752,28 +757,6 @@ app.post('/api/dxtrade/connect', authLimiter, requireAuth, withSpace, requireSub
 app.post('/api/dxtrade/disconnect', requireAuth, withSpace, async (req, res) => {
   try { await dxtrade.stopSync(req.duid); } catch (e) {}
   await store.setStatus(req.duid, 'dxtrade', { status: 'disconnected' }).catch(() => {});
-  res.json({ ok: true });
-});
-
-// ── Bybit ──────────────────────────────────────────────────
-// Read-only API key, verified before we answer so a bad / trading-enabled key
-// fails in the form; the history import then runs in the background.
-app.post('/api/bybit/connect', authLimiter, requireAuth, withSpace, requireSub, async (req, res) => {
-  const { apiKey, apiSecret, env, journalAccountId } = req.body || {};
-  if (!apiKey || !apiSecret) return res.status(400).json({ error: 'apiKey and apiSecret are required' });
-  if (String(apiKey).length > 200 || String(apiSecret).length > 200) return res.status(400).json({ error: 'That does not look like a Bybit API key.' });
-  if (!hosted.configured()) return res.status(503).json({ error: 'Bybit sync is not configured on the server yet.' });
-  try {
-    await bybit.connect(req.duid, { apiKey, apiSecret, env, journalAccountId });
-    res.json({ ok: true, status: 'connecting' });
-  } catch (e) {
-    console.warn('bybit connect:', e.message);
-    res.status(400).json({ error: bybit.friendlyError(e), code: e.code || undefined });
-  }
-});
-app.post('/api/bybit/disconnect', requireAuth, withSpace, async (req, res) => {
-  try { await bybit.disconnect(req.duid); } catch (e) {}
-  await store.setStatus(req.duid, 'bybit', { status: 'disconnected' }).catch(() => {});
   res.json({ ok: true });
 });
 
@@ -2896,7 +2879,6 @@ app.listen(port, () => {
   console.log('etw-sync-backend listening on :' + port);
 tokens.startMeter();
 mt5.resumeAll();
-bybit.resumeAll();
 // 2FA retired: remove leftover 2FA claims/flags from every account (see backfillMfaClaims).
 setTimeout(() => { backfillMfaClaims().catch(() => {}); }, 3000);
 // Essential users linked MT5 Direct before it moved to Pro: stop them right after
