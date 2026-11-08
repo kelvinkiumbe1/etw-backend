@@ -10,6 +10,7 @@
 const crypto = require('crypto');
 const store = require('../store');
 const { getSessionFromTime } = require('../tradeMapper');
+const cashflows = require('../cashflows');
 
 // Mint (or reuse) a key for this user+account.
 async function register(uid, accountId) {
@@ -142,7 +143,7 @@ async function checkLogin(key, k, meta) {
 }
 
 // Handle an EA push: { login, server, trades:[...] } + key (header or body). Returns count written.
-async function push(key, trades, meta) {
+async function push(key, trades, meta, cash) {
   if (!key) { const e = new Error('Missing sync key'); e.status = 401; throw e; }
   // The key is used as a document path, so only accept the shape register() mints.
   if (!/^etw_[0-9a-f]{36}$/.test(String(key))) { const e = new Error('Invalid sync key'); e.status = 401; throw e; }
@@ -168,6 +169,19 @@ async function push(key, trades, meta) {
       return true;
     });
   if (k.hosted) docs.forEach(t => { t.mt5AccountKey = k.accountKey; });
+  // Deposits / withdrawals / credits from EA v1.06+ (balance-type deals).
+  if (Array.isArray(cash) && cash.length) {
+    const cdocs = cash.slice(0, 500).map((c) => {
+      const amount = Number(c.amount);
+      const cl = cashflows.classifyMt5(c.type, amount);
+      if (!cl || !c.ticket || !Number.isFinite(amount)) return null;
+      const tsMs = Number(c.timeMs) || Date.parse(String(c.time || '').replace(/^(\d{4})\.(\d{2})\.(\d{2}) /, '$1-$2-$3T') + 'Z');
+      return { uid, accountId, source: 'mt5-ea', extId: 'mt5_' + String((meta && meta.login) || k.mt5Login || '') + '_' + String(c.ticket).slice(0, 32),
+        kind: cl.kind, sub: cl.sub, amount, currency: c.currency || '', ts: tsMs, note: c.comment || '',
+        brokerAccount: String((meta && meta.server) || '').slice(0, 60) + ' ' + String((meta && meta.login) || '') };
+    }).filter(Boolean);
+    await cashflows.writeCash(cdocs).catch((e) => console.warn('[mt5ea] cash write:', e.message));
+  }
   if (docs.length) { await store.writeTrades(docs); store.indexTrades(uid, docs); }
   // A position that just closed comes off the dashboard's open positions at once,
   // even when the next positions snapshot is a while away (hosted runs, EA closed).

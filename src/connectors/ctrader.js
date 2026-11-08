@@ -8,6 +8,7 @@
 const crypto = require('crypto');
 const store = require('../store');
 const engine = require('./ctraderOpenApi');
+const cashflows = require('../cashflows');
 
 const STATUS_KEY = 'ctrader';
 // Documented authorize screen (grantingaccess) and REST token endpoint.
@@ -204,10 +205,40 @@ async function syncUser(uid, { backfill, journalAccountId } = {}) {
     if (needTimeFix) patch.openTimeFixV = OPEN_TIME_FIX_V;
   }
   await setStatus(uid, patch);
+  // Deposits / withdrawals ride along, at most every 30 minutes (first time: a year back).
+  try { await syncCash(uid, { jid, status }); }
+  catch (e) { console.warn('ctrader: cash flow sync failed for', uid, '-', e.message); }
   if (repaired) console.log('ctrader: fixed open time on', repaired, 'existing trade(s) for', uid);
   if (written) console.log('ctrader: wrote', written, 'new trade(s) for', uid, 'profile', jid || '(default)');
   else if (!ok) console.log('ctrader: sync incomplete for', uid, '— will retry on next poll');
   return written;
+}
+
+// Deposits / withdrawals / other balance operations → `cashflows`.
+const CASH_EVERY = 30 * 60 * 1000;
+const CASH_BACKFILL_V = 1;
+async function syncCash(uid, { jid, status, force } = {}) {
+  if (!status) { const s = await store.db.collection('users').doc(uid).get(); status = (s.exists && s.data()[STATUS_KEY]) || {}; }
+  if (jid == null) jid = status.journalAccountId || '';
+  const now = Date.now();
+  const first = status.cashBackfillV !== CASH_BACKFILL_V;
+  if (!force && !first && now - Number(status.lastCashSyncAt || 0) < CASH_EVERY) return 0;
+  const from = first ? now - 365 * 86400000 : Math.max(Number(status.lastCashSyncAt || 0) - 2 * 86400000, now - 60 * 86400000);
+  const t = await ensureToken(uid);
+  const r = await engine.fetchCashFlows({ clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, accessToken: t.accessToken, from, to: now });
+  const docs = r.items.map((it) => {
+    const c = cashflows.classifyCtrader(it.op, it.delta);
+    return { uid, accountId: jid, source: 'ctrader_open_api', extId: 'ct' + it.ctid + '_' + it.id, kind: c.kind, sub: c.sub, amount: c.amount,
+      ts: it.ts, note: it.note, balance: it.balance, brokerAccount: it.label };
+  });
+  const n = await cashflows.writeCash(docs);
+  const balances = {};
+  (r.accounts || []).forEach((a) => { if (a.balance != null) balances[a.ctid] = { balance: a.balance, label: a.label, live: a.live, at: now }; });
+  const patch = { cashBalances: balances };
+  if (r.ok) { patch.lastCashSyncAt = now; patch.cashBackfillV = CASH_BACKFILL_V; }
+  await setStatus(uid, patch);
+  if (n) console.log('ctrader: synced', n, 'balance operation(s) for', uid);
+  return n;
 }
 
 // Step 2 — Spotware redirects here with ?code=&state=
@@ -321,4 +352,4 @@ async function getPositions(uid) {
   return list;
 }
 
-module.exports = { init, configured, createAuthUrl, handleCallback, disconnect, syncUser, friendlyError, getBars, getPositions };
+module.exports = { init, configured, createAuthUrl, handleCallback, disconnect, syncUser, syncCash, friendlyError, getBars, getPositions };

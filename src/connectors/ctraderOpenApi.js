@@ -18,6 +18,8 @@ const PT = {
   ORDER_LIST_BY_POSITION_ID_REQ: 2183, ORDER_LIST_BY_POSITION_ID_RES: 2184,
   TRENDBARS_REQ: 2137, TRENDBARS_RES: 2138,
   ERROR_RES: 2142, GET_ACCOUNTS_REQ: 2149, GET_ACCOUNTS_RES: 2150,
+  CASH_FLOW_REQ: 2143, CASH_FLOW_RES: 2144,
+  TRADER_REQ: 2121, TRADER_RES: 2122,
 };
 
 const endpoint = (env) =>
@@ -595,4 +597,58 @@ async function fetchOpenPositions({ clientId, clientSecret, accessToken }) {
   return out;
 }
 
-module.exports = { fetchClosedTrades, discoverAccounts, mapDeal, fetchTrendbars, levelsFromOrders, fetchOpenPositions, PT };
+// ── Deposits / withdrawals (balance history) ───────────────────────────────
+// ProtoOACashFlowHistoryListReq, like the deal list, takes at most one week per
+// request, so [from,to] is walked in weekly windows through the same app-wide
+// throttle. Returns raw operations; src/cashflows.js classifies them.
+async function fetchCashFlows({ clientId, clientSecret, accessToken, from, to }) {
+  const accounts = await discoverAccounts({ clientId, clientSecret, accessToken });
+  if (!accounts.length) return { ok: false, items: [], accounts: [] };
+  const byEnv = { live: [], demo: [] };
+  for (const a of accounts) (a.isLive ? byEnv.live : byEnv.demo).push(a);
+  const items = [], meta = [];
+  let ok = true;
+  const WINDOW = 7 * 24 * 60 * 60 * 1000 - 3600000;
+  for (const env of ['live', 'demo']) {
+    if (!byEnv[env].length) continue;
+    const session = new CtSession(env);
+    try {
+      await session.open();
+      await session.appAuth(clientId, clientSecret);
+      for (const acc of byEnv[env]) {
+        const ctid = Number(acc.ctidTraderAccountId);
+        const label = (acc.brokerTitleShort ? acc.brokerTitleShort + ' ' : '') + (acc.traderLogin || ctid);
+        try {
+          session.send(PT.ACCOUNT_AUTH_REQ, { ctidTraderAccountId: ctid, accessToken });
+          await session.wait(PT.ACCOUNT_AUTH_RES);
+          let balanceNow = null, digits = 2;
+          try {
+            const tr = await session.request(PT.TRADER_REQ, PT.TRADER_RES, { ctidTraderAccountId: ctid }, 12000);
+            const t = (tr && tr.trader) || {};
+            digits = t.moneyDigits != null ? Number(t.moneyDigits) : 2;
+            if (t.balance != null) balanceNow = money(t.balance, digits);
+          } catch (e) { /* balance is optional */ }
+          for (let ws = from; ws < to; ) {
+            const we = Math.min(ws + WINDOW, to);
+            const res = await throttledDealList(session, { ctidTraderAccountId: ctid, fromTimestamp: ws, toTimestamp: we }, PT.CASH_FLOW_REQ, PT.CASH_FLOW_RES);
+            (res.depositWithdraw || []).forEach((d) => {
+              const md = d.moneyDigits != null ? Number(d.moneyDigits) : digits;
+              items.push({
+                ctid: String(ctid), label, live: !!acc.isLive,
+                id: String(d.balanceHistoryId), op: Number(d.operationType),
+                delta: money(d.delta, md), balance: d.balance != null ? money(d.balance, md) : null,
+                ts: Number(d.changeBalanceTimestamp || 0), note: d.externalNote || '',
+              });
+            });
+            ws = we;
+          }
+          meta.push({ ctid: String(ctid), label, live: !!acc.isLive, balance: balanceNow });
+        } catch (e) { ok = false; console.warn('[ctrader] cash flow failed for', ctid, '-', e.message); }
+      }
+    } catch (e) { ok = false; console.warn('[ctrader] cash flow session', env, '-', e.message); }
+    finally { session.close(); }
+  }
+  return { ok, items, accounts: meta };
+}
+
+module.exports = { fetchClosedTrades, discoverAccounts, mapDeal, fetchTrendbars, levelsFromOrders, fetchOpenPositions, fetchCashFlows, PT };
