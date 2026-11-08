@@ -629,7 +629,8 @@ async function eaPush(req, res) {
   const key = req.headers['x-etw-key'] || (req.body && req.body.key) || '';
   const trades = (req.body && req.body.trades) || [];
   const meta = { login: (req.body && req.body.login) || '', server: (req.body && req.body.server) || '' };
-  try { const saved = await mt5ea.push(key, trades, meta); res.json({ ok: true, saved }); }
+  const cash = (req.body && Array.isArray(req.body.cash)) ? req.body.cash : [];
+  try { const saved = await mt5ea.push(key, trades, meta, cash); res.json({ ok: true, saved, cash: cash.length }); }
   catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 }
 app.post('/api/mt5/trades', eaLimiter, eaPush);   // matches the EA's default ServerURL path
@@ -683,6 +684,40 @@ app.get('/api/broker/positions', marketLimiter, requireAuth, withSpace, async (r
   }
 });
 app.post('/api/mt5-ea/push', eaLimiter, eaPush);
+
+// ── Deposits & withdrawals (Settings › Deposits & Withdrawals) ──
+// The operations themselves live in `cashflows` and are read by the app directly;
+// these two endpoints add what the browser can't reach: the balances the brokers
+// report right now, and an on-demand cTrader balance-history pull.
+app.get('/api/cashflow/balances', marketLimiter, requireAuth, withSpace, requireSub, async (req, res) => {
+  try {
+    const out = { ok: true, accounts: [] };
+    const [u, bp] = await Promise.all([db.collection('users').doc(req.duid).get(), db.collection('brokerPositions').doc(req.duid).get()]);
+    const ct = (u.exists && u.data().ctrader) || {};
+    if (ct.status === 'connected') Object.keys(ct.cashBalances || {}).forEach((id) => {
+      const b = ct.cashBalances[id] || {};
+      out.accounts.push({ source: 'ctrader', accountId: ct.journalAccountId || '', label: b.label || ('cTrader ' + id), balance: b.balance, equity: null, currency: '', at: b.at || 0, live: !!b.live });
+    });
+    const mt5 = (bp.exists && bp.data().mt5) || {};
+    Object.keys(mt5).forEach((slot) => {
+      const x = mt5[slot] || {};
+      if (!x.balance && !x.equity) return;
+      if (Date.now() - (+x.at || 0) > 30 * 86400000) return;
+      out.accounts.push({ source: 'mt5', accountId: x.accountId || '', label: ((x.server ? x.server + ' ' : '') + (x.login || '')).trim() || 'MT5', balance: x.balance, equity: x.equity, currency: x.currency || '', at: x.at || 0, hosted: !!x.hosted });
+    });
+    res.set('Cache-Control', 'no-store');
+    res.json(out);
+  } catch (e) { console.error('cashflow/balances:', e.message); res.status(500).json({ ok: false, error: 'Could not load balances.' }); }
+});
+app.post('/api/cashflow/sync', authLimiter, requireAuth, withSpace, requireSub, async (req, res) => {
+  const out = { ok: true, ctrader: null };
+  try {
+    const u = await db.collection('users').doc(req.duid).get();
+    const ct = (u.exists && u.data().ctrader) || {};
+    if (ct.status === 'connected' && ctrader.configured()) out.ctrader = await ctrader.syncCash(req.duid, { force: true });
+    res.json(out);
+  } catch (e) { console.error('cashflow/sync:', e.message); res.status(502).json({ ok: false, error: 'cTrader did not answer — try again in a minute.' }); }
+});
 
 // ── TradeLocker ────────────────────────────────────────────
 app.post('/api/tradelocker/connect', authLimiter, requireAuth, withSpace, requireSub, async (req, res) => {
@@ -912,6 +947,22 @@ app.post('/api/ai/transcribe', aiLimiter, requireAuth, requireUltra, async (req,
 
 // ── ETW AI market pulse: live news, TradingView technicals, trader sentiment ──
 require('./src/marketPulse').mount(app, { requireAuth, requireSub, limiter: marketLimiter });
+
+// ── AI connectors (MCP): let Claude, ChatGPT, Cursor… read the trader's journal (see src/mcp.js) ──
+// Endpoint: POST /mcp/<connector key>  (or POST /mcp with "Authorization: Bearer <key>").
+// Keys are created / revoked from Settings › AI Connectors (Pro / Ultra).
+async function mcpPlanOf(uid) {
+  try { const u = await admin.auth().getUser(uid); if (tokenPlan(u.customClaims || {}) === 'ultra') return 'ultra'; } catch (e) {}
+  let a; try { a = await access.accessFor(uid, null); } catch (e) { return undefined; }
+  if (!a || !a.active) return null;
+  if (access.isUltra(a)) return 'ultra';
+  return access.isPro(a) ? 'pro' : 'essential';
+}
+require('./src/mcp').mount(app, {
+  db, requireAuth,
+  planOf: async (uid) => { const p = await mcpPlanOf(uid); return p === 'essential' ? null : p; },
+  accountLimit: async (uid) => { const p = await mcpPlanOf(uid); return (PLAN_LIMITS[p] || PLAN_LIMITS.essential).accounts; },
+});
 
 // ── Notion Sync: import a trading journal kept in Notion (see src/notionSync.js) ──
 require('./src/notionSync').mount(app, { requireAuth, requireSub, limiter: rl(60 * 1000, 90, 'Too many Notion requests, please wait a moment.'), db, admin });
