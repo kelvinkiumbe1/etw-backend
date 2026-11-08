@@ -272,6 +272,11 @@ async function positions(key, list, meta) {
       positions: clean,
     } },
   }, { merge: true });
+  // No deposit in the broker history (prop firms)? Keep an estimated starting balance (hourly at most).
+  if (num(meta && meta.balance) > 0) {
+    cashflows.ensureMt5Initial(k.uid, { accountId: k.accountId || '', login: String((meta && meta.login) || k.mt5Login || ''), server: String((meta && meta.server) || k.mt5Server || ''),
+      currency: String((meta && meta.currency) || ''), balance: num(meta && meta.balance), at: Date.now() }, { everyMs: 60 * 60 * 1000 }).catch(() => {});
+  }
   return clean.length;
 }
 
