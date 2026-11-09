@@ -54,6 +54,20 @@ function classifyCtrader(op, delta) {
   return { kind: m[0], sub: m[1], amount };
 }
 
+// Prop firms (FundedNext and others) book deposits and payouts as "Charge" / "Correction"
+// balance deals and only say what they are in the comment ("Initial+Deposit", "Withdraw").
+// Read the comment so those become real deposits / withdrawals (sub keeps "Charge" etc.).
+const RECLASS_SUB = /^(charge|correction|credit|balance change)$/i;
+const DEP_NOTE = /deposit|initial|funding|funded|top.?up|starting balance/i;
+const WD_NOTE = /withdraw|payout|pay.?out|profit.?split|reward|disburs/i;
+function kindFromNote(kind, sub, note, amount) {
+  if (kind !== 'other' || !RECLASS_SUB.test(String(sub || '').trim())) return kind;
+  const n = String(note || ''), a = num(amount);
+  if (WD_NOTE.test(n) && a < 0) return 'withdrawal';
+  if (DEP_NOTE.test(n) && !WD_NOTE.test(n) && a > 0) return 'deposit';
+  return kind;
+}
+
 async function writeCash(list) {
   const docs = (list || []).filter((c) => c && c.uid && c.extId && Number.isFinite(c.ts) && c.ts > 0 && num(c.amount) !== 0);
   if (!docs.length) return 0;
@@ -62,7 +76,7 @@ async function writeCash(list) {
     const ref = store.db.collection('cashflows').doc(docId(c.uid, c.source, c.extId));
     batch.set(ref, {
       uid: c.uid, accountId: c.accountId || '', source: c.source, extId: String(c.extId).slice(0, 80),
-      kind: c.kind, sub: clean(c.sub, 60), amount: r2(c.amount), currency: clean(c.currency, 8),
+      kind: kindFromNote(c.kind, c.sub, c.note, c.amount), sub: clean(c.sub, 60), amount: r2(c.amount), currency: clean(c.currency, 8),
       ts: Math.round(c.ts), note: clean(c.note, 300), balance: c.balance != null ? r2(c.balance) : null,
       brokerAccount: clean(c.brokerAccount, 80), syncedAt: Date.now(),
     }, { merge: true });
@@ -107,7 +121,7 @@ async function ensureMt5Initial(uid, slot, opts) {
       const c = d.data() || {};
       if (!same(c.accountId)) return;
       if (c.source === 'mt5-initial') { if (d.id === ref.id) existing = c; return; }
-      if ((c.kindOverride || c.kind) === 'deposit') hasDeposit = true;
+      if ((c.kindOverride || kindFromNote(c.kind, c.sub, c.note, c.amount)) === 'deposit') hasDeposit = true;
       cashSum += num(c.amount);
       if (num(c.ts) > 0) first = Math.min(first, num(c.ts));
     });
@@ -133,4 +147,4 @@ async function ensureMt5Initial(uid, slot, opts) {
   } catch (e) { console.warn('[cashflows] mt5 starting balance:', e.message); return null; }
 }
 
-module.exports = { writeCash, classifyMt5, classifyCtrader, docId, ensureMt5Initial };
+module.exports = { writeCash, classifyMt5, classifyCtrader, docId, ensureMt5Initial, kindFromNote };
