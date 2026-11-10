@@ -372,7 +372,7 @@ function mount(app, opts) {
       return s.docs.map((d) => Object.assign({ id: d.id }, d.data() || {})).filter((n) => !n.trashed)
         .map((n) => {
           const text = S(n.userBodyHtml != null ? stripHtml(n.userBodyHtml) : (n.body || stripHtml(n.bodyHtml)));
-          return { ref: 'note:' + acc.id + ':' + n.id, id: n.id, account: acc.name, accountId: acc.id, title: S(n.title) || 'Untitled', folder: folders[n.folderId] || (n.dailyDate ? 'Daily notes' : n.prepDate ? 'Session prep' : ''), updated: num(n.updated) || num(n.created), created: num(n.created), tags: Array.isArray(n.tags) ? n.tags : [], dailyDate: n.dailyDate || n.prepDate || null, trade: n.tradeRef ? { pair: n.tradeRef.pair, date: n.tradeRef.date, result: n.tradeRef.result, pnl: n.tradeRef.pnl } : null, text };
+          return { ref: 'note:' + acc.id + ':' + n.id, id: n.id, account: acc.name, accountId: acc.id, title: S(n.title) || 'Untitled', folder: folders[n.folderId] || (n.dailyDate ? 'Daily notes' : n.prepDate ? 'Session prep' : ''), updated: num(n.updated) || num(n.created), created: num(n.created), tags: Array.isArray(n.tags) ? n.tags : [], dailyDate: n.dailyDate || n.prepDate || null, prepDate: S(n.prepDate) || null, htfImages: Array.isArray(n.htfImages) ? n.htfImages.filter((i) => i && i.src).map((i) => ({ url: S(i.src), name: clip(S(i.name), 80), explanation: clip(S(i.explanation), 500) })) : [], trade: n.tradeRef ? { pair: n.tradeRef.pair, date: n.tradeRef.date, result: n.tradeRef.result, pnl: n.tradeRef.pnl } : null, text };
         }).sort((a, b) => b.updated - a.updated);
     });
   }
@@ -390,6 +390,102 @@ function mount(app, opts) {
     if (Array.isArray(v)) return depth > 4 ? '[…]' : v.slice(0, 200).map((x) => scrub(x, depth + 1));
     if (typeof v === 'object') { if (depth > 4) return '[…]'; const o = {}; for (const k of Object.keys(v)) o[k] = scrub(v[k], depth + 1); return o; }
     return v;
+  }
+
+  // ════════════════════ write helpers (scope "write" only) ════════════════════
+  // Safety model: every write goes to a document that belongs to this connector's
+  // user (uid === ctx.uid or ctx.uid + '__…'); only whitelisted fields are
+  // written; everything is length-capped; there are NO delete tools; existing
+  // trades can only gain tags or images — their prices, P&L and broker data can
+  // never be changed from a connector.
+  const SESSIONS = ['Asian', 'London', 'London Open', 'London/NY Overlap', 'New York', 'New York AM', 'New York PM', 'NY Open'];
+  function needWrite(ctx) { if (ctx.scope !== 'write') throw toolErr('This connector is read-only. The trader can create a connector with writing allowed in ETW Journal › Settings › AI Connectors.'); }
+  function cleanTags(v, max) {
+    const out = [];
+    (Array.isArray(v) ? v : []).forEach((t) => { const c = clip(S(t).replace(/[<>]/g, '').trim(), 40); if (c && !out.some((x) => low(x) === low(c))) out.push(c); });
+    return out.slice(0, max || 20);
+  }
+  function numStr(v, name) { if (v == null || v === '') return ''; const n = +v; if (!isFinite(n)) throw toolErr(name + ' must be a number.'); return String(n); }
+  function sessionOf(v) {
+    const w = low(v).replace(/[^a-z0-9]/g, ''); if (!w) return '';
+    const hit = SESSIONS.find((x) => low(x).replace(/[^a-z0-9]/g, '') === w);
+    if (!hit) throw toolErr('Unknown session "' + v + '". Valid sessions: ' + SESSIONS.join(', ') + '. Leave it out if unsure.');
+    return hit;
+  }
+  function whenMs(v) {
+    if (v == null || v === '') return Date.now();
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(S(v).trim());
+    const ms = m ? Date.UTC(+m[1], +m[2] - 1, +m[3], 12) : Date.parse(v);
+    if (!isFinite(ms)) throw toolErr('Could not read the date "' + v + '". Use YYYY-MM-DD or an ISO date-time.');
+    if (ms > Date.now() + 86400000) throw toolErr('That date is in the future.');
+    if (ms < 946684800000) throw toolErr('That date is before 2000 — check it.');
+    return ms;
+  }
+  async function ownDoc(ctx, col, id, what) {
+    id = S(id).replace(/^(trade|playbook):/, '');
+    if (!/^[A-Za-z0-9_-]{1,100}$/.test(id)) throw toolErr('Invalid ' + what + ' id.');
+    const ref = db.collection(col).doc(id); const snap = await ref.get();
+    const d = snap.exists ? (snap.data() || {}) : null;
+    if (!d || !(d.uid === ctx.uid || S(d.uid).startsWith(ctx.uid + SEP))) throw toolErr('No ' + what + ' with id ' + id + ' in this journal.');
+    return { id, ref, data: d };
+  }
+  // Images: a data: image is uploaded to the app's own image host (the same
+  // unsigned Cloudinary preset the app itself uses), so Firestore documents stay
+  // small; a direct https link is kept as given. Anything else is refused.
+  const CLD = { name: S(process.env.CLOUDINARY_NAME || 'djhuavwfc'), preset: S(process.env.CLOUDINARY_PRESET || 'etwjournal_unsigned') };
+  async function imageUrl(ctx, src) {
+    src = S(src == null ? '' : (typeof src === 'object' ? (src.url || src.src) : src)).trim();
+    if (/^https:\/\/[^\s"'<>]{8,2000}$/.test(src)) return src;
+    if (/^data:image\/(png|jpe?g|webp|gif);base64,[A-Za-z0-9+/=\s]+$/.test(src)) {
+      if (src.length > 11000000) throw toolErr('Image too large — keep it under 8MB.');
+      if (limited('img:' + ctx.hash, 12, 60e3)) throw toolErr('Too many image uploads in one minute — wait a little.');
+      if (typeof fetch !== 'function') throw toolErr('Image upload is not available on this server right now.');
+      const body = new URLSearchParams(); body.set('file', src.replace(/\s+/g, '')); body.set('upload_preset', CLD.preset); body.set('folder', 'etwjournal');
+      const r = await fetch('https://api.cloudinary.com/v1_1/' + CLD.name + '/image/upload', { method: 'POST', body });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !/^https:\/\//.test(S(j.secure_url))) throw toolErr('Image upload failed' + (j.error && j.error.message ? ': ' + clip(j.error.message, 120) : '. Try a direct https image link instead.'));
+      return S(j.secure_url);
+    }
+    throw toolErr('Images must be a direct https URL or a data:image/…;base64 string (png, jpeg, webp or gif).');
+  }
+  async function imageUrls(ctx, arr, max) {
+    const list = (Array.isArray(arr) ? arr : (arr ? [arr] : [])).slice(0, max || 8), out = [];
+    for (const it of list) out.push({ url: await imageUrl(ctx, it), name: clip(S(it && it.name), 80), explanation: clip(S(it && it.explanation), 500) });
+    return out;
+  }
+  function fillImgSlots(doc, urls, max) {
+    const slots = []; let n = 0;
+    for (let i = 1; i <= max; i++) if (!S(doc['img' + i])) slots.push(i);
+    const patch = {};
+    for (const u of urls) { if (!slots.length) break; patch['img' + slots.shift()] = u.url; n++; }
+    return { patch, added: n, left: urls.length - n };
+  }
+  function tagCounts(list) {
+    const use = {};
+    list.forEach((t) => t.tags.forEach((x) => { use[x] = (use[x] || 0) + 1; }));
+    return Object.keys(use).sort((a, b) => use[b] - use[a]).slice(0, 40).map((k) => k + ' ×' + use[k]);
+  }
+  function breakdownRows(list, by, tz) {
+    const g = new Map();
+    for (const t of list) for (const k of groupKeys(t, by, tz)) { const arr = g.get(k) || []; arr.push(t); g.set(k, arr); }
+    const rows = [...g.entries()].map(([k, arr]) => { const s = stats(arr); return { [by]: k, trades: s.trades, winRate: s.winRate, netPnl: s.netPnl, profitFactor: s.profitFactor, avgWin: s.avgWin, avgLoss: s.avgLoss, expectancyPerTrade: s.expectancyPerTrade }; });
+    if (by === 'weekday') rows.sort((x, y) => WD.indexOf(x.weekday) - WD.indexOf(y.weekday));
+    else if (by === 'hour' || by === 'month') rows.sort((x, y) => S(x[by]).localeCompare(S(y[by])));
+    else rows.sort((x, y) => y.netPnl - x.netPnl);
+    return rows;
+  }
+  const SP_FOLDER = 'SESSION PREP';
+  async function prepFolderId(du) {
+    const folders = await foldersOf(du);
+    for (const id of Object.keys(folders)) if (folders[id] === SP_FOLDER) return id;
+    const ref = await db.collection('users').doc(du).collection('noteFolders').add({ name: SP_FOLDER, icon: '', created: Date.now() });
+    bust('nf:' + du);
+    return ref.id;
+  }
+  function prepTitle(ms) { return 'Session Prep — ' + new Date(ms).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'UTC' }); }
+  function htfBodyHtml(imgs) {
+    if (!imgs.length) return '';
+    return '<h3>HTF Analysis</h3>' + imgs.map((i) => '<p><img src="' + escHtml(i.url) + '" alt="' + escHtml(i.name) + '">' + (i.name || i.explanation ? '<br>' + escHtml([i.name, i.explanation].filter(Boolean).join(' — ')) : '') + '</p>').join('');
   }
 
   // ════════════════════════ tools ════════════════════════
@@ -618,6 +714,291 @@ function mount(app, opts) {
         return { saved: true, note_id: 'note:' + acc.id + ':' + ref.id, account: acc.name, title, message: 'Saved to the ' + acc.name + ' notebook in ETW Journal.' };
       },
     },
+    {
+      name: 'get_report', title: 'Reports',
+      description: 'The journal\'s Reports section, computed from the trades: overview, risk, wins vs losses, mistakes, markets (by symbol), sessions, strategies, day & time, and a daily P&L calendar. Accepts the same account and date filters as search_trades.',
+      inputSchema: { type: 'object', properties: Object.assign({ account: ACCOUNT }, DATE_FILTERS, {
+        timezone: { type: 'string', description: 'IANA time zone for the day & time tables (default UTC), e.g. Africa/Nairobi.' },
+      }), additionalProperties: false }, annotations: RO,
+      run: async (ctx, a) => {
+        const list = await tradesFor(ctx, { account: a.account, period: a.period, from: a.from, to: a.to });
+        if (!list.length) return { trades: 0, note: 'No trades in this range.' };
+        const o = stats(list), tz = a.timezone;
+        const days = new Map();
+        for (const t of list) { const k = (iso(t.ts) || '').slice(0, 10); days.set(k, (days.get(k) || { trades: 0, pnl: 0 })); const d = days.get(k); d.trades++; d.pnl = r2(d.pnl + t.pnl); }
+        const mi = new Map();
+        for (const t of list) { const m = clip(S(t.mistakes).trim(), 80); if (!m) continue; const x = mi.get(m) || { trades: 0, netPnl: 0 }; x.trades++; x.netPnl = r2(x.netPnl + t.pnl); mi.set(m, x); }
+        const wins = list.filter((t) => t.result === 'WIN'), losses = list.filter((t) => t.result === 'LOSS');
+        return {
+          overview: o,
+          risk: {
+            maxDrawdown: o.maxDrawdown, longestLossStreak: o.longestLossStreak, avgLoss: o.avgLoss,
+            largestLoss: o.worstTrade, largestWin: o.bestTrade,
+            tradesWithStopLoss: list.filter((t) => S(t.sl)).length + ' of ' + list.length,
+            worstDay: [...days.entries()].sort((x, y) => x[1].pnl - y[1].pnl).slice(0, 1).map(([d, x]) => ({ date: d, pnl: x.pnl, trades: x.trades }))[0] || null,
+          },
+          winsVsLosses: { wins: wins.length, losses: losses.length, breakeven: o.breakeven, avgWin: o.avgWin, avgLoss: o.avgLoss, profitFactor: o.profitFactor, avgRRWins: wins.filter((t) => t.rr != null).length ? r2(wins.filter((t) => t.rr != null).reduce((s, t) => s + t.rr, 0) / wins.filter((t) => t.rr != null).length) : null, avgRRLosses: losses.filter((t) => t.rr != null).length ? r2(losses.filter((t) => t.rr != null).reduce((s, t) => s + t.rr, 0) / losses.filter((t) => t.rr != null).length) : null },
+          mistakes: [...mi.entries()].map(([k, x]) => ({ mistake: k, trades: x.trades, netPnl: x.netPnl })).sort((x, y) => y.trades - x.trades).slice(0, 15),
+          bySymbol: breakdownRows(list, 'symbol', tz).slice(0, 20),
+          bySession: breakdownRows(list, 'session', tz),
+          byStrategy: breakdownRows(list, 'strategy', tz).slice(0, 20),
+          byWeekday: breakdownRows(list, 'weekday', tz),
+          byHour: breakdownRows(list, 'hour', tz),
+          timezone: tz || 'UTC',
+          calendar: [...days.entries()].sort((x, y) => y[0].localeCompare(x[0])).slice(0, 45).map(([d, x]) => ({ date: d, trades: x.trades, pnl: x.pnl })),
+        };
+      },
+    },
+    {
+      name: 'get_session_prep', title: 'Read session prep',
+      description: 'The trader\'s Session Prep entries (pre-session plan, bias, key levels, HTF chart notes). Give a date (YYYY-MM-DD) for that day, or omit it for the most recent entries.',
+      inputSchema: { type: 'object', properties: { account: ACCOUNT, date: { type: 'string', description: 'YYYY-MM-DD. Omit for the latest entries.' }, limit: { type: 'integer', minimum: 1, maximum: 30, description: 'Max entries (default 5).' } }, additionalProperties: false }, annotations: RO,
+      run: async (ctx, a) => {
+        let all = [];
+        for (const acc of await pickAccounts(ctx, a.account)) all = all.concat((await notesOf(acc)).filter((n) => n.prepDate));
+        all.sort((x, y) => S(y.prepDate).localeCompare(S(x.prepDate)) || y.updated - x.updated);
+        const d = S(a.date).trim();
+        if (d && !/^\d{4}-\d{2}-\d{2}$/.test(d)) throw toolErr('date must be YYYY-MM-DD.');
+        const hit = d ? all.filter((n) => n.prepDate === d) : all;
+        return { total: hit.length, entries: hit.slice(0, Math.min(30, a.limit || 5)).map((n) => ({ note_id: n.ref, account: n.account, date: n.prepDate, title: n.title, updated: iso(n.updated), text: clip(n.text, 20000), images: n.htfImages.map((i) => ({ name: i.name || undefined, explanation: i.explanation || undefined, url: i.url })) })) };
+      },
+    },
+    {
+      name: 'save_session_prep', title: 'Write session prep',
+      description: 'Write the trader\'s Session Prep for a day (plan, bias, key levels). Appends to an existing entry for that day by default, or creates one. Markdown supported; images (chart screenshots) can be attached with explanations. Needs a connector that allows writing.',
+      inputSchema: { type: 'object', properties: {
+        content: { type: 'string', description: 'The prep text (Markdown: # headings, - bullets, **bold**, | tables |).' },
+        date: { type: 'string', description: 'YYYY-MM-DD (default today).' },
+        account: { type: 'string', description: 'Account to save into (default: main journal).' },
+        mode: { type: 'string', enum: ['append', 'replace'], description: 'append (default) adds to that day\'s entry; replace rewrites it.' },
+        images: { type: 'array', maxItems: 6, description: 'Chart images: each { url (https or data:image base64), name, explanation }.', items: { type: 'object', properties: { url: { type: 'string' }, name: { type: 'string' }, explanation: { type: 'string' } }, required: ['url'] } },
+      }, required: ['content'], additionalProperties: false },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }, write: true,
+      run: async (ctx, a) => {
+        needWrite(ctx);
+        const acc = (await pickAccounts(ctx, a.account || 'main'))[0];
+        const d = S(a.date).trim() || new Date().toISOString().slice(0, 10);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) throw toolErr('date must be YYYY-MM-DD.');
+        const md = clip(S(a.content).trim(), 40000); if (!md) throw toolErr('content is required.');
+        const imgs = await imageUrls(ctx, a.images, 6);
+        const addHtml = mdToHtml(md) + htfBodyHtml(imgs);
+        const existing = (await notesOf(acc)).filter((n) => n.prepDate === d).sort((x, y) => y.updated - x.updated)[0];
+        const now = Date.now(), du = acc.du;
+        if (existing && low(a.mode || 'append') !== 'replace') {
+          const ref = db.collection('users').doc(du).collection('notes').doc(existing.id);
+          const cur = (await ref.get()).data() || {};
+          const joinedHtml = S(cur.userBodyHtml || cur.bodyHtml) + '<hr>' + addHtml;
+          const htf = (Array.isArray(cur.htfImages) ? cur.htfImages : []).concat(imgs.map((i) => ({ src: i.url, name: i.name, explanation: i.explanation }))).slice(0, 12);
+          await ref.set({ userBodyHtml: joinedHtml, bodyHtml: joinedHtml, body: stripHtml(joinedHtml), htfImages: htf, updated: now }, { merge: true });
+          bust('nt:' + du);
+          return { saved: true, mode: 'appended', note_id: existing.ref, account: acc.name, date: d, message: 'Added to the ' + d + ' Session Prep in ' + acc.name + '.' };
+        }
+        const payload = { title: prepTitle(whenMs(d)), body: stripHtml(addHtml), bodyHtml: addHtml, userBodyHtml: addHtml, htfImages: imgs.map((i) => ({ src: i.url, name: i.name, explanation: i.explanation })), folderId: await prepFolderId(du), prepDate: d, updated: now };
+        if (existing) {
+          await db.collection('users').doc(du).collection('notes').doc(existing.id).set(payload, { merge: true });
+          bust('nt:' + du);
+          return { saved: true, mode: 'replaced', note_id: existing.ref, account: acc.name, date: d, message: 'Rewrote the ' + d + ' Session Prep in ' + acc.name + '.' };
+        }
+        const ref = await db.collection('users').doc(du).collection('notes').add(Object.assign({ uid: du, images: [], created: now, source: 'mcp', aiClient: clip(ctx.client || '', 40) }, payload));
+        bust('nt:' + du);
+        return { saved: true, mode: 'created', note_id: 'note:' + acc.id + ':' + ref.id, account: acc.name, date: d, message: 'Session Prep for ' + d + ' saved in ' + acc.name + '. It shows in Session Prep and in the Notebook\'s SESSION PREP folder.' };
+      },
+    },
+    {
+      name: 'log_trade', title: 'Log a trade',
+      description: 'Add a CLOSED trade to the journal (same as the Add Trade form), with prices, result, session, emotions, notes, tags and chart screenshots. Confirm the details with the trader before saving. It cannot edit or delete existing trades. Needs a connector that allows writing.',
+      inputSchema: { type: 'object', properties: {
+        account: { type: 'string', description: 'Account to log into (default: main journal).' },
+        pair: { type: 'string', description: 'Instrument, e.g. XAUUSD, EURUSD, NAS100.' },
+        direction: { type: 'string', enum: ['LONG', 'SHORT'], description: 'LONG (buy) or SHORT (sell).' },
+        pnl: { type: 'number', description: 'Net P&L in the account currency (negative for a loss).' },
+        result: { type: 'string', enum: ['WIN', 'LOSS', 'BREAKEVEN'], description: 'Derived from pnl when omitted.' },
+        date: { type: 'string', description: 'When the trade was taken (YYYY-MM-DD or ISO date-time; default now).' },
+        entry: { type: 'number' }, exit: { type: 'number' }, sl: { type: 'number', description: 'Stop loss price.' }, tp: { type: 'number', description: 'Take profit price.' },
+        lot: { type: 'number', description: 'Position size (lots).' }, rr: { type: 'number', description: 'Realised R multiple, e.g. 2 for 1:2.' },
+        session: { type: 'string', enum: ['Asian', 'London', 'London Open', 'London/NY Overlap', 'New York', 'New York AM', 'New York PM', 'NY Open'] },
+        strategy: { type: 'string', description: 'Strategy / model / setup name.' }, timeframe: { type: 'string' },
+        notes: { type: 'string', description: 'Trade notes (plain text).' },
+        emotion_before: { type: 'string' }, emotion_after: { type: 'string' },
+        mistakes: { type: 'string' }, lesson: { type: 'string' },
+        tags: { type: 'array', items: { type: 'string' }, maxItems: 20, description: 'Tags, exactly as the trader names them.' },
+        images: { type: 'array', maxItems: 8, items: { type: 'string' }, description: 'Chart screenshots: https URLs or data:image base64.' },
+      }, required: ['pair', 'pnl'], additionalProperties: false },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }, write: true,
+      run: async (ctx, a) => {
+        needWrite(ctx);
+        const acc = (await pickAccounts(ctx, a.account || 'main'))[0];
+        const pair = clip(S(a.pair).toUpperCase().replace(/[^A-Z0-9.\-]/g, ''), 20);
+        if (!pair) throw toolErr('pair is required (e.g. XAUUSD).');
+        const pnl = +a.pnl; if (!isFinite(pnl) || Math.abs(pnl) > 1e9) throw toolErr('pnl must be a number.');
+        const dirW = low(a.direction); const direction = /long|buy/.test(dirW) ? 'LONG' : /short|sell/.test(dirW) ? 'SHORT' : '';
+        if (S(a.direction) && !direction) throw toolErr('direction must be LONG or SHORT.');
+        const resW = S(a.result).toUpperCase().replace(/^BE$/, 'BREAKEVEN');
+        if (resW && !['WIN', 'LOSS', 'BREAKEVEN'].includes(resW)) throw toolErr('result must be WIN, LOSS or BREAKEVEN.');
+        const result = resW || (pnl > 0 ? 'WIN' : pnl < 0 ? 'LOSS' : 'BREAKEVEN');
+        const tradeDate = whenMs(a.date);
+        // never double-log: same pair, same P&L, within 2 minutes of an existing trade
+        const dup = (await tradesOf(acc)).find((t) => t.symbol === pair && t.pnl === r2(pnl) && Math.abs(t.ts - tradeDate) < 120000);
+        if (dup) return { saved: false, duplicate: true, trade_id: dup.id, message: 'An identical trade is already journaled (id ' + dup.id + ') — nothing was added.' };
+        const imgs = await imageUrls(ctx, a.images, 8);
+        const now = Date.now();
+        const data = {
+          uid: acc.du, accountId: acc.id === 'main' ? '' : acc.id, pair, direction,
+          entry: numStr(a.entry, 'entry'), exit: numStr(a.exit, 'exit'), sl: numStr(a.sl, 'sl'), tp: numStr(a.tp, 'tp'),
+          lot: numStr(a.lot, 'lot'), rr: numStr(a.rr, 'rr'), pnl: r2(pnl), result, tradeDate,
+          session: sessionOf(a.session), model: clip(S(a.strategy).trim(), 80), strategy: clip(S(a.strategy).trim(), 80), timeframe: clip(S(a.timeframe).trim(), 20),
+          notes: clip(S(a.notes), 8000), emotionBefore: clip(S(a.emotion_before).trim(), 60), emotionAfter: clip(S(a.emotion_after).trim(), 60),
+          mistakes: clip(S(a.mistakes), 2000), lesson: clip(S(a.lesson), 2000),
+          tags: cleanTags(a.tags, 20), rules: '', source: 'mcp', aiClient: clip(ctx.client || '', 40), createdAt: now, updatedAt: now,
+        };
+        imgs.forEach((im, i) => { if (i < 8) data['img' + (i + 1)] = im.url; });
+        const ref = await db.collection('trades').add(data);
+        bust('tr:' + acc.du);
+        return { saved: true, trade_id: ref.id, account: acc.name, trade: { pair, direction: direction || undefined, result, pnl: r2(pnl), date: iso(tradeDate), tags: data.tags.length ? data.tags : undefined, images: imgs.length || undefined }, message: 'Trade logged in ' + acc.name + ' — it now shows in the Journal.' };
+      },
+    },
+    {
+      name: 'update_trade_tags', title: 'Tag a trade',
+      description: 'Add or remove tags on an existing trade — they render as the tag chips on the trade\'s card in the Journal. Reuse the trader\'s existing tag names EXACTLY (same spelling and case; see existingTags in the result or get_performance_stats group_by tag) so they group with their tags; invent a new tag only when the trader asks for one. Only the tags change — nothing else on the trade. Needs a connector that allows writing.',
+      inputSchema: { type: 'object', properties: {
+        trade_id: { type: 'string', description: 'Trade id from search_trades.' },
+        add: { type: 'array', items: { type: 'string' }, maxItems: 10, description: 'Tags to add.' },
+        remove: { type: 'array', items: { type: 'string' }, maxItems: 10, description: 'Tags to remove (exact, case-insensitive match).' },
+      }, required: ['trade_id'], additionalProperties: false },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }, write: true,
+      run: async (ctx, a) => {
+        needWrite(ctx);
+        const { id, ref, data } = await ownDoc(ctx, 'trades', a.trade_id, 'trade');
+        let tags = Array.isArray(data.tags) ? data.tags.map(S).filter(Boolean) : S(data.tags).split(',').map((x) => x.trim()).filter(Boolean);
+        const rm = cleanTags(a.remove, 10).map(low);
+        if (rm.length) tags = tags.filter((t) => !rm.includes(low(t)));
+        for (const t of cleanTags(a.add, 10)) if (!tags.some((x) => low(x) === low(t))) tags.push(t);
+        if (tags.length > 25) throw toolErr('A trade can hold up to 25 tags.');
+        await ref.set({ tags, updatedAt: Date.now() }, { merge: true });
+        bust('tr:' + data.uid);
+        const existing = tagCounts(await tradesOf({ id: 'x', name: '', du: data.uid }));
+        return { trade_id: id, tags, existingTags: existing, message: 'Tags updated — they show on the trade\'s card in the Journal.' };
+      },
+    },
+    {
+      name: 'create_playbook', title: 'Create a playbook',
+      description: 'Create a playbook (a documented setup) in the trader\'s Playbooks: name, description, market, timeframe, numbered rules, entry/exit/risk rules, notes, tags and example chart images. Confirm the content with the trader before saving. Needs a connector that allows writing.',
+      inputSchema: { type: 'object', properties: {
+        title: { type: 'string', description: 'Playbook name.' },
+        description: { type: 'string' }, market: { type: 'string', description: 'e.g. XAUUSD, indices, forex.' }, timeframe: { type: 'string', description: 'e.g. M5, H1.' },
+        rules: { type: 'array', items: { type: 'string' }, maxItems: 30, description: 'The setup\'s rules, one per item, in order.' },
+        entry_rules: { type: 'string' }, exit_rules: { type: 'string' }, risk_rule: { type: 'string' }, notes: { type: 'string' },
+        tags: { type: 'array', items: { type: 'string' }, maxItems: 12 },
+        images: { type: 'array', maxItems: 8, items: { type: 'string' }, description: 'Example chart images: https URLs or data:image base64.' },
+        account: { type: 'string', description: 'Account to save into (default: main journal).' },
+      }, required: ['title'], additionalProperties: false },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }, write: true,
+      run: async (ctx, a) => {
+        needWrite(ctx);
+        const acc = (await pickAccounts(ctx, a.account || 'main'))[0];
+        const title = clip(S(a.title).replace(/[<>]/g, '').trim(), 140); if (!title) throw toolErr('title is required.');
+        const imgs = await imageUrls(ctx, a.images, 8);
+        const now = Date.now();
+        const data = {
+          uid: acc.du, title, desc: clip(S(a.description), 4000), market: clip(S(a.market).trim(), 60), timeframe: clip(S(a.timeframe).trim(), 60),
+          tags: cleanTags(a.tags, 12), rules: (Array.isArray(a.rules) ? a.rules : []).map((r) => clip(S(r).trim(), 300)).filter(Boolean).slice(0, 30),
+          entryRules: clip(S(a.entry_rules), 4000), exitRules: clip(S(a.exit_rules), 4000), riskRule: clip(S(a.risk_rule), 4000), notes: clip(S(a.notes), 4000),
+          source: 'mcp', aiClient: clip(ctx.client || '', 40), createdAt: now, updatedAt: now,
+        };
+        imgs.forEach((im, i) => { if (i < 8) data['img' + (i + 1)] = im.url; });
+        const ref = await db.collection('playbooks').add(data);
+        bust('playbooks:' + acc.du);
+        return { saved: true, playbook_id: ref.id, account: acc.name, title, message: 'Playbook "' + title + '" created — it shows under Playbooks › My playbooks.' };
+      },
+    },
+    {
+      name: 'update_playbook', title: 'Update a playbook',
+      description: 'Update one of the trader\'s own playbooks: only the fields you pass change (rules replaces the whole rules list). It cannot touch mentor playbooks and cannot delete anything. Needs a connector that allows writing.',
+      inputSchema: { type: 'object', properties: {
+        playbook_id: { type: 'string', description: 'Playbook id from get_playbooks.' },
+        title: { type: 'string' }, description: { type: 'string' }, market: { type: 'string' }, timeframe: { type: 'string' },
+        rules: { type: 'array', items: { type: 'string' }, maxItems: 30, description: 'Replaces the full rules list — include every rule to keep.' },
+        entry_rules: { type: 'string' }, exit_rules: { type: 'string' }, risk_rule: { type: 'string' }, notes: { type: 'string' },
+        tags: { type: 'array', items: { type: 'string' }, maxItems: 12 },
+      }, required: ['playbook_id'], additionalProperties: false },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }, write: true,
+      run: async (ctx, a) => {
+        needWrite(ctx);
+        const { id, ref, data } = await ownDoc(ctx, 'playbooks', a.playbook_id, 'playbook');
+        const patch = {};
+        if (a.title != null) { patch.title = clip(S(a.title).replace(/[<>]/g, '').trim(), 140); if (!patch.title) throw toolErr('title cannot be empty.'); }
+        if (a.description != null) patch.desc = clip(S(a.description), 4000);
+        if (a.market != null) patch.market = clip(S(a.market).trim(), 60);
+        if (a.timeframe != null) patch.timeframe = clip(S(a.timeframe).trim(), 60);
+        if (a.rules != null) patch.rules = (Array.isArray(a.rules) ? a.rules : []).map((r) => clip(S(r).trim(), 300)).filter(Boolean).slice(0, 30);
+        if (a.entry_rules != null) patch.entryRules = clip(S(a.entry_rules), 4000);
+        if (a.exit_rules != null) patch.exitRules = clip(S(a.exit_rules), 4000);
+        if (a.risk_rule != null) patch.riskRule = clip(S(a.risk_rule), 4000);
+        if (a.notes != null) patch.notes = clip(S(a.notes), 4000);
+        if (a.tags != null) patch.tags = cleanTags(a.tags, 12);
+        if (!Object.keys(patch).length) throw toolErr('Pass at least one field to change.');
+        patch.updatedAt = Date.now();
+        await ref.set(patch, { merge: true });
+        bust('playbooks:' + data.uid);
+        return { saved: true, playbook_id: id, changed: Object.keys(patch).filter((k) => k !== 'updatedAt'), message: 'Playbook "' + S(patch.title || data.title) + '" updated.' };
+      },
+    },
+    {
+      name: 'attach_image', title: 'Attach an image',
+      description: 'Attach a chart image (https URL or data:image base64) to an existing trade (its screenshot slots), playbook, notebook note, or a day\'s Session Prep (as an HTF chart with an explanation). Needs a connector that allows writing.',
+      inputSchema: { type: 'object', properties: {
+        target: { type: 'string', description: 'Where it goes: "trade:<id>", "playbook:<id>", a note_id from list_notes ("note:<account>:<id>"), or "prep:<YYYY-MM-DD>".' },
+        image: { type: 'string', description: 'https URL or data:image/…;base64.' },
+        name: { type: 'string', description: 'Short label (session prep only).' },
+        explanation: { type: 'string', description: 'What the chart shows (session prep only).' },
+        account: { type: 'string', description: 'Account, for a prep target (default: main journal).' },
+      }, required: ['target', 'image'], additionalProperties: false },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }, write: true,
+      run: async (ctx, a) => {
+        needWrite(ctx);
+        const url = await imageUrl(ctx, a.image);
+        const t = S(a.target).trim();
+        let m;
+        if ((m = /^trade:(.+)$/.exec(t))) {
+          const { id, ref, data } = await ownDoc(ctx, 'trades', m[1], 'trade');
+          const { patch, added } = fillImgSlots(data, [{ url }], 8);
+          if (!added) throw toolErr('All 8 screenshot slots on that trade are full.');
+          patch.updatedAt = Date.now(); await ref.set(patch, { merge: true }); bust('tr:' + data.uid);
+          return { saved: true, trade_id: id, slot: Object.keys(patch).find((k) => k.startsWith('img')), message: 'Image added to the trade\'s screenshots.' };
+        }
+        if ((m = /^playbook:(.+)$/.exec(t))) {
+          const { id, ref, data } = await ownDoc(ctx, 'playbooks', m[1], 'playbook');
+          const { patch, added } = fillImgSlots(data, [{ url }], 8);
+          if (!added) throw toolErr('All 8 image slots on that playbook are full.');
+          patch.updatedAt = Date.now(); await ref.set(patch, { merge: true }); bust('playbooks:' + data.uid);
+          return { saved: true, playbook_id: id, slot: Object.keys(patch).find((k) => k.startsWith('img')), message: 'Image added to the playbook.' };
+        }
+        if ((m = /^prep:(\d{4}-\d{2}-\d{2})$/.exec(t))) {
+          const acc = (await pickAccounts(ctx, a.account || 'main'))[0];
+          const prep = (await notesOf(acc)).filter((n) => n.prepDate === m[1]).sort((x, y) => y.updated - x.updated)[0];
+          if (!prep) throw toolErr('No Session Prep for ' + m[1] + ' — create it first with save_session_prep.');
+          const ref = db.collection('users').doc(acc.du).collection('notes').doc(prep.id);
+          const cur = (await ref.get()).data() || {};
+          const htf = (Array.isArray(cur.htfImages) ? cur.htfImages : []).concat([{ src: url, name: clip(S(a.name), 80), explanation: clip(S(a.explanation), 500) }]).slice(0, 12);
+          await ref.set({ htfImages: htf, updated: Date.now() }, { merge: true }); bust('nt:' + acc.du);
+          return { saved: true, note_id: prep.ref, date: m[1], images: htf.length, message: 'Chart added to the ' + m[1] + ' Session Prep HTF analysis.' };
+        }
+        if ((m = /^note:([^:]+):(.+)$/.exec(t))) {
+          const acc = (await pickAccounts(ctx, m[1]))[0];
+          const note = (await notesOf(acc)).find((n) => n.id === m[2]);
+          if (!note) throw toolErr('No note with id ' + t + '.');
+          const ref = db.collection('users').doc(acc.du).collection('notes').doc(note.id);
+          const cur = (await ref.get()).data() || {};
+          const add = '<p><img src="' + escHtml(url) + '" alt=""></p>';
+          const html = S(cur.userBodyHtml || cur.bodyHtml || (cur.body ? '<p>' + escHtml(cur.body) + '</p>' : '')) + add;
+          const patch = { bodyHtml: html, body: stripHtml(html), updated: Date.now() };
+          if (cur.userBodyHtml != null) patch.userBodyHtml = html;
+          await ref.set(patch, { merge: true }); bust('nt:' + acc.du);
+          return { saved: true, note_id: note.ref, message: 'Image added to the note "' + note.title + '".' };
+        }
+        throw toolErr('target must be "trade:<id>", "playbook:<id>", "note:<account>:<id>" or "prep:YYYY-MM-DD".');
+      },
+    },
   ];
   const TOOL = Object.fromEntries(TOOLS.map((t) => [t.name, t]));
 
@@ -656,7 +1037,7 @@ function mount(app, opts) {
     'P&L figures are in the account currency; dates are UTC ISO-8601. A trader can have several independent journal accounts (personal, prop challenge, funded) — "all" combines them, so say which account a finding comes from.',
     'Judge profitability on trading P&L versus deposits (get_cash_flows): withdrawals are not losses and deposits are not profit.',
     'Be a direct, data-driven trading coach: quote the numbers, point out patterns (overtrading, revenge trades after losses, rule breaks, weak sessions), and suggest concrete changes. This is not financial advice.',
-    'create_note saves into the trader\'s notebook only if their connector allows it; ask before saving.',
+    'Writing (only on a connector the trader created with writing allowed, and always from the trader\'s instructions): create_note and save_session_prep save notes and session prep, log_trade adds a closed trade, update_trade_tags tags a trade (reuse their existing tag names exactly), create_playbook and update_playbook manage their playbooks, attach_image adds chart images. Confirm with the trader before each write. Nothing can be deleted through this connector.',
   ].join('\n');
 
   // ════════════════════════ the MCP endpoint ════════════════════════
