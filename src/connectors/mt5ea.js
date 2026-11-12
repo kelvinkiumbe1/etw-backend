@@ -69,6 +69,7 @@ function normalize(t, uid, accountId) {
     entry: String(t.entry || ''), closePrice: String(t.closePrice || ''),
     sl: String(t.sl || ''), tp: String(t.tp || ''), lot: String(t.lot || ''),
     pnl, result,
+    vPnl: pnl,   // broker's own figure, frozen at sync time: the Verified Track Record voids the trade if pnl is edited away from it
     tradeDate: openMs, closeTime: String(t.closeTime || ''),
     // Open time in the same terminal-clock format as closeTime, so the two read
     // consistently. Older EAs don't send it: tradeDate is the open time in the
