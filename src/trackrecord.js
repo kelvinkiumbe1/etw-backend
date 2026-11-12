@@ -168,7 +168,7 @@ function mount(app, opts) {
       return {
         id: t.id, ts, pnl: r2(pnl),
         result: (res === 'WIN' || res === 'LOSS') ? res : (res === 'BREAKEVEN' || res === 'BE') ? 'BREAKEVEN' : (pnl > 0 ? 'WIN' : pnl < 0 ? 'LOSS' : 'BREAKEVEN'),
-        symbol: S(t.pair || t.symbol).toUpperCase(),
+        symbol: S(t.pair || t.symbol).toUpperCase(), direction: S(t.direction).toUpperCase(),
         source: low(t.source), execSource: low(t.execSource),
         vVoid: !!(t.vVoid || (g && g.some((x) => x.vVoid))),
         vPnl: g ? null : (t.vPnl != null && isFinite(num(t.vPnl)) ? r2(num(t.vPnl)) : null),
@@ -243,6 +243,8 @@ function mount(app, opts) {
       connections: conns.map((c) => ({ kind: c.kind, via: c.via, brand: c.brand, label: c.label, server: c.server || undefined, loginMasked: c.loginMasked, live: c.live, lastSync: c.lastSync ? iso(c.lastSync) : null, balance: c.balance, currency: c.currency })),
       stats: verified ? stats(included) : { trades: 0 },
       curve: verified ? curveOf(included) : [],
+      trades: verified ? included.slice(-400).reverse().map((t) => ({ id: t.id, date: iso(t.ts), symbol: t.symbol, direction: t.direction || undefined, result: t.result, pnl: t.pnl, merged: t.merged || undefined })) : [],
+      tradesTruncated: verified && included.length > 400 ? included.length : undefined,
       excluded,
       _included: included,
     };
@@ -328,7 +330,7 @@ function mount(app, opts) {
           accounts: b.accounts.map((a) => ({
             id: a.id, name: a.name, status: a.status, verified: a.verified, asOf: a.asOf, reasons: a.reasons,
             connections: (a.connections || []).map((c) => ({ kind: c.kind, via: c.via, brand: c.brand, live: c.live, loginMasked: c.loginMasked, lastSync: c.lastSync })),
-            stats: a.stats, curve: a.curve, excluded: a.excluded,
+            stats: a.stats, curve: a.curve, excluded: a.excluded,   // no trade list on the public JSON — summary only
           })),
         };
       });
