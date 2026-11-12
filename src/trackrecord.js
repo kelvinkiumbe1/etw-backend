@@ -403,6 +403,31 @@ function mount(app, opts) {
           : '<div class="why">' + (a.reasons || []).map((r) => '<p>• ' + esc(r) + '</p>').join('') + '</div>')
         + '</div>';
     }).join('');
+    // Full verified trade list: every broker-synced trade of every verified
+    // account (the server keeps the most recent 400 per account), so the
+    // page — and its Save-as-PDF copy — carries the trades, not just totals.
+    const allTrades = [];
+    let vAccs = 0, trunc = 0;
+    (sn.accounts || []).forEach((a) => {
+      if (!a.verified) return;
+      vAccs++;
+      if (a.tradesTruncated) trunc += Math.max(0, a.tradesTruncated - (a.trades || []).length);
+      (a.trades || []).forEach((t) => allTrades.push(Object.assign({ account: a.name }, t)));
+    });
+    const multi = vAccs > 1;
+    allTrades.sort((x, y) => S(y.date).localeCompare(S(x.date)));
+    const fmtDT = (d) => { try { const x = new Date(d); return x.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' }) + ' ' + x.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }); } catch (e) { return S(d); } };
+    const tradesCard = allTrades.length
+      ? '<div class="card trades"><h3>Verified trades · ' + allTrades.length + ' broker-synced trade' + (allTrades.length === 1 ? '' : 's') + ' <em>times in UTC</em></h3>'
+        + '<table><thead><tr><th>Date</th><th>Symbol</th><th>Side</th>' + (multi ? '<th>Account</th>' : '') + '<th>Result</th><th class="num">Net P&amp;L</th></tr></thead><tbody>'
+        + allTrades.map((t) => '<tr><td>' + esc(fmtDT(t.date)) + '</td><td><b>' + esc(t.symbol || '—') + '</b>' + (t.merged ? ' <small>merged</small>' : '') + '</td><td>' + esc(t.direction || '—') + '</td>'
+            + (multi ? '<td>' + esc(t.account) + '</td>' : '')
+            + '<td class="' + (t.result === 'WIN' ? 'g' : t.result === 'LOSS' ? 'l' : '') + '">' + esc(t.result) + '</td>'
+            + '<td class="num ' + (t.pnl >= 0 ? 'g' : 'l') + '">' + fmt$(t.pnl) + '</td></tr>').join('')
+        + '</tbody></table>'
+        + (trunc ? '<p class="tn">' + trunc + ' older verified trade' + (trunc === 1 ? ' is' : 's are') + ' not listed (the page carries the most recent 400 per account) — the verified totals above include every verified trade.</p>' : '')
+        + '</div>'
+      : '';
     return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">'
       + '<title>' + esc(doc.name) + ' — Verified Track Record · ETW Journal</title><style>'
       + ':root{color-scheme:dark}*{box-sizing:border-box;margin:0}body{font-family:Inter,system-ui,-apple-system,sans-serif;background:#0b0c12;color:#f3f4f8;padding:28px 16px 48px}'
@@ -425,9 +450,15 @@ function mount(app, opts) {
       + '.tag{font:800 9px Inter;letter-spacing:.07em;border-radius:4px;padding:4px 7px;font-style:normal;background:rgba(255,255,255,.07);color:#c7c9d1}.tag.lv{background:#1f9d55;color:#fff}.tag.dm{background:#8a8f98;color:#fff}'
       + '.am{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:rgba(255,255,255,.09);border:1px solid rgba(255,255,255,.09);border-radius:11px;overflow:hidden;margin-top:11px}'
       + '.am .k b{font-size:13px}.why{margin-top:10px}.why p{font-size:12px;color:#9a9da8;line-height:1.6}'
+      + '.trades h3{font-size:14px;margin:0 0 10px}.trades h3 em{font:600 10.5px Inter;font-style:normal;color:#8b8e98;margin-left:6px}'
+      + '.trades table{width:100%;border-collapse:collapse;font-size:12px}.trades th{font:800 9px Inter;letter-spacing:.09em;text-transform:uppercase;color:#8b8e98;text-align:left;padding:7px 9px;border-bottom:1px solid rgba(255,255,255,.14)}'
+      + '.trades td{padding:6.5px 9px;border-bottom:1px solid rgba(255,255,255,.07);white-space:nowrap;font-variant-numeric:tabular-nums}.trades td small{color:#8b8e98;font-size:10px}'
+      + '.trades th.num,.trades td.num{text-align:right}.trades td.num{font-weight:700}.trades td.g{color:#22C55E}.trades td.l{color:#EF4444}'
+      + '.trades .tn{font-size:11px;color:#8b8e98;margin:9px 0 0;line-height:1.5}'
       + '.ft{font-size:11px;color:#70737e;line-height:1.7;margin-top:18px}'
-      + '@media(max-width:640px){.ks,.am{grid-template-columns:repeat(2,1fr)}.net b{font-size:22px}}'
-      + '@media print{:root{color-scheme:light}body{background:#fff;color:#0f172a;padding:0}.card,.acc,.k,.am .k{background:#fff}.card,.acc,.ch{border-color:#d8dbe2}.k span,.hd p,.top p,.an span,.ft,.why p{color:#475267}.btn,.sp{display:none}.bd.no{color:#475267}}'
+      + '@media(max-width:640px){.ks,.am{grid-template-columns:repeat(2,1fr)}.net b{font-size:22px}.trades{overflow-x:auto}}'
+      + '@media print{:root{color-scheme:light}body{background:#fff;color:#0f172a;padding:0}.card,.acc,.k,.am .k{background:#fff}.card,.acc,.ch{border-color:#d8dbe2}.k span,.hd p,.top p,.an span,.ft,.why p{color:#475267}.btn,.sp{display:none}.bd.no{color:#475267}'
+      + '.trades th{color:#475267;border-color:#cbd2dd}.trades td{border-color:#e3e6ec}.trades td small,.trades .tn,.trades h3 em{color:#475267}.trades td.g{color:#15803d}.trades td.l{color:#b91c1c}.trades tr{break-inside:avoid}.trades thead{display:table-header-group}.trades{break-inside:auto}}'
       + '</style></head><body><div class="w">'
       + '<div class="hd"><div class="lg">' + (doc.photo ? '<img src="' + esc(doc.photo) + '" alt="" referrerpolicy="no-referrer" style="width:42px;height:42px;border-radius:12px;display:block;object-fit:cover" onerror="this.remove()">' : '<img src="https://etwiz.space/etw-logo-192.png" alt="ETW" style="width:42px;height:42px;border-radius:12px;display:block" onerror="this.replaceWith(document.createTextNode(\'ETW\'))">') + '</div><div><h1>' + esc(doc.name) + ' — Verified Track Record</h1><p>ETW Journal · generated ' + esc(fmtD(new Date(doc.createdAt || Date.now()).toISOString())) + '</p></div>'
       + '<div class="sp"><button class="btn" onclick="window.print()">Download PDF</button></div></div>'
@@ -438,6 +469,7 @@ function mount(app, opts) {
         + kpi('Avg win', fmt$(st.avgWin), 'g') + kpi('Avg loss', fmt$(st.avgLoss), 'r') + kpi('Green days', st.greenDays + ' of ' + st.tradingDays) + kpi('Period', esc(fmtD(st.from)) + ' – ' + esc(fmtD(st.to)))
         + '</div><div class="ch">' + svgCurve(o.curve) + '</div>' : '') + '</div>'
       + accRows
+      + tradesCard
       + '<p class="ft">This record was generated by ETW Journal from trades autosynced directly from the broker or prop firm. Demo accounts, free trials, manually added trades and file imports are never included, and the verification is computed server-side — the trader cannot edit these figures. Every journal account of this trader is listed above, including unverified ones. Logins are masked for privacy. etwiz.space</p>'
       + '</div><script>if(/[?&]print=1/.test(location.search))setTimeout(function(){window.print()},400);</scr' + 'ipt></body></html>';
   }
