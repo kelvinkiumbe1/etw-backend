@@ -383,14 +383,18 @@ function mount(app, opts) {
     for (const k of keys) { if (k.length < 3) continue; if (txt.indexOf(k) === 0 || (k.length >= 5 && txt.indexOf(k) >= 0)) return 'https://www.google.com/s2/favicons?domain=' + BROKER_SITES[k] + '&sz=128'; }
     return '';
   }
+  const SH_OK = '<svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></svg>';
+  const SH_NO = '<svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/></svg>';
+  const SH_CLK = '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>';
   function badgeHtml(status, asOf) {
-    if (status === 'verified') return '<span class="bd ok">✓ VERIFIED</span>';
-    if (status === 'verified_up_to') return '<span class="bd up">VERIFIED UP TO ' + esc(fmtD(asOf)) + '</span>';
-    return '<span class="bd no">NOT VERIFIED</span>';
+    if (status === 'verified') return '<span class="bd ok">' + SH_OK + 'Verified</span>';
+    if (status === 'verified_up_to') return '<span class="bd up">' + SH_CLK + 'Verified up to ' + esc(fmtD(asOf)) + '</span>';
+    return '<span class="bd no">' + SH_NO + 'Not verified</span>';
   }
   function sharePage(doc) {
     const sn = doc.snapshot || {}, o = sn.overall || {}, st = o.stats || {};
     const kpi = (l, v, cls) => '<div class="k"><span>' + l + '</span><b class="' + (cls || '') + '">' + v + '</b></div>';
+    const kpiW = (l, v) => '<div class="k"><span>' + l + '</span><b class="wrap">' + v + '</b></div>';
     const accRows = (sn.accounts || []).map((a) => {
       const c = (a.connections || [])[0] || {}; const as = a.stats || {};
       return '<div class="acc">'
@@ -399,7 +403,7 @@ function mount(app, opts) {
         + (c.kind ? '<em class="tag ' + (c.live ? 'lv' : 'dm') + '">' + (c.live ? 'LIVE' : 'DEMO') + '</em><em class="tag">' + esc(c.kind === 'cTrader' ? 'cTrader' : 'MT5') + '</em>' : '')
         + badgeHtml(a.status, a.asOf) + '</div>'
         + (a.verified && as.trades
-          ? '<div class="am">' + kpi('Trades', as.trades) + kpi('Win rate', as.winRate == null ? '—' : as.winRate + '%') + kpi('Net P&L', fmt$(as.netPnl), as.netPnl >= 0 ? 'g' : 'r') + kpi('Profit factor', esc(S(as.profitFactor))) + kpi('Max DD', fmt$(as.maxDrawdown), 'r') + kpi('Period', esc(fmtD(as.from)) + ' – ' + esc(fmtD(as.to))) + '</div>'
+          ? '<div class="am">' + kpi('Trades', as.trades) + kpi('Win rate', as.winRate == null ? '—' : as.winRate + '%') + kpi('Net P&L', fmt$(as.netPnl), as.netPnl >= 0 ? 'g' : 'r') + kpi('Profit factor', esc(S(as.profitFactor))) + kpi('Max DD', fmt$(as.maxDrawdown), 'r') + kpiW('Period', esc(fmtD(as.from)) + ' – ' + esc(fmtD(as.to))) + '</div>'
           : '<div class="why">' + (a.reasons || []).map((r) => '<p>• ' + esc(r) + '</p>').join('') + '</div>')
         + '</div>';
     }).join('');
@@ -416,11 +420,11 @@ function mount(app, opts) {
     });
     const multi = vAccs > 1;
     allTrades.sort((x, y) => S(y.date).localeCompare(S(x.date)));
-    const fmtDT = (d) => { try { const x = new Date(d); return x.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' }) + ' ' + x.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }); } catch (e) { return S(d); } };
+    const fmtDT = (d) => { try { const x = new Date(d); return x.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: '2-digit', timeZone: 'UTC' }) + '<small>' + x.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }) + '</small>'; } catch (e) { return esc(S(d)); } };
     const tradesCard = allTrades.length
       ? '<div class="card trades"><h3>Verified trades · ' + allTrades.length + ' broker-synced trade' + (allTrades.length === 1 ? '' : 's') + ' <em>times in UTC</em></h3>'
         + '<table><thead><tr><th>Date</th><th>Symbol</th><th>Side</th>' + (multi ? '<th>Account</th>' : '') + '<th>Result</th><th class="num">Net P&amp;L</th></tr></thead><tbody>'
-        + allTrades.map((t) => '<tr><td>' + esc(fmtDT(t.date)) + '</td><td><b>' + esc(t.symbol || '—') + '</b>' + (t.merged ? ' <small>merged</small>' : '') + '</td><td>' + esc(t.direction || '—') + '</td>'
+        + allTrades.map((t) => '<tr><td class="dt">' + fmtDT(t.date) + '</td><td class="sy"><b>' + esc(t.symbol || '—') + '</b>' + (t.merged ? ' <small>merged</small>' : '') + '</td><td>' + esc((t.direction || '—').slice(0, 5)) + '</td>'
             + (multi ? '<td>' + esc(t.account) + '</td>' : '')
             + '<td class="' + (t.result === 'WIN' ? 'g' : t.result === 'LOSS' ? 'l' : '') + '">' + esc(t.result) + '</td>'
             + '<td class="num ' + (t.pnl >= 0 ? 'g' : 'l') + '">' + fmt$(t.pnl) + '</td></tr>').join('')
@@ -434,10 +438,13 @@ function mount(app, opts) {
       + '.w{max-width:960px;margin:0 auto}.hd{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px}'
       + '.lg{width:42px;height:42px;border-radius:12px;background:linear-gradient(135deg,#16a34a,#0ea5e9);display:grid;place-items:center;font-weight:900;font-size:15px;color:#fff}'
       + '.hd h1{font-size:19px;letter-spacing:-.01em}.hd p{font-size:12px;color:#8b8e98}.hd .sp{margin-left:auto;display:flex;gap:8px;align-items:center}'
-      + '.btn{border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.05);color:#f3f4f8;border-radius:9px;padding:8px 14px;font:700 12px Inter;cursor:pointer}'
+      + '.btn{display:inline-flex;align-items:center;gap:7px;border:none;background:linear-gradient(135deg,#16a34a,#0ea5e9);color:#fff;border-radius:10px;padding:9px 16px;font:800 12px Inter;cursor:pointer;box-shadow:0 10px 24px -10px rgba(16,163,74,.6)}'
+      + '.btn svg{width:13px;height:13px;stroke:#fff;fill:none;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}'
       + '.card{background:#15161c;border:1px solid rgba(255,255,255,.09);border-radius:16px;padding:20px;margin-bottom:14px}'
-      + '.bd{display:inline-block;padding:6px 12px;border-radius:999px;font:800 11px Inter;letter-spacing:.08em}'
-      + '.bd.ok{background:linear-gradient(135deg,#16a34a,#22c55e);color:#fff}.bd.up{background:linear-gradient(135deg,#f59e0b,#fbbf24);color:#1f1300}.bd.no{background:rgba(255,255,255,.07);color:#9a9da8;border:1px solid rgba(255,255,255,.14)}'
+      + '.card.hero{background:radial-gradient(90% 150% at 0% 0%,rgba(34,197,94,.15),transparent 55%),radial-gradient(80% 130% at 100% 0%,rgba(14,165,233,.12),transparent 55%),#15161c}'
+      + '.bd{display:inline-flex;align-items:center;gap:7px;padding:7px 13px;border-radius:999px;font:800 11px Inter;letter-spacing:.09em;text-transform:uppercase;white-space:nowrap;max-width:100%}'
+      + '.bd svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round;flex:none}'
+      + '.bd.ok{background:linear-gradient(135deg,#16a34a,#22c55e);color:#fff;box-shadow:0 6px 18px -8px rgba(34,197,94,.7)}.bd.up{background:linear-gradient(135deg,#f59e0b,#fbbf24);color:#1f1300}.bd.no{background:rgba(255,255,255,.07);color:#9a9da8;border:1px solid rgba(255,255,255,.14)}'
       + '.top{display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap;margin-bottom:14px}.top h2{font-size:17px;margin:8px 0 3px}.top p{font-size:12px;color:#8b8e98}'
       + '.net{margin-left:auto;text-align:right}.net span{font:800 10px Inter;letter-spacing:.12em;color:#8b8e98}.net b{display:block;font-size:28px;font-variant-numeric:tabular-nums}'
       + '.ks{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:rgba(255,255,255,.09);border:1px solid rgba(255,255,255,.09);border-radius:13px;overflow:hidden;margin-bottom:16px}'
@@ -452,21 +459,26 @@ function mount(app, opts) {
       + '.am .k b{font-size:13px}.why{margin-top:10px}.why p{font-size:12px;color:#9a9da8;line-height:1.6}'
       + '.trades h3{font-size:14px;margin:0 0 10px}.trades h3 em{font:600 10.5px Inter;font-style:normal;color:#8b8e98;margin-left:6px}'
       + '.trades table{width:100%;border-collapse:collapse;font-size:12px}.trades th{font:800 9px Inter;letter-spacing:.09em;text-transform:uppercase;color:#8b8e98;text-align:left;padding:7px 9px;border-bottom:1px solid rgba(255,255,255,.14)}'
-      + '.trades td{padding:6.5px 9px;border-bottom:1px solid rgba(255,255,255,.07);white-space:nowrap;font-variant-numeric:tabular-nums}.trades td small{color:#8b8e98;font-size:10px}'
+      + '.trades td{padding:6.5px 9px;border-bottom:1px solid rgba(255,255,255,.07);font-variant-numeric:tabular-nums;vertical-align:top}.trades td small{color:#8b8e98;font-size:10px}'
+      + '.trades td.dt{white-space:nowrap}.trades td.dt small{display:block;line-height:1.3}.trades td.sy{white-space:nowrap}.trades td.num{white-space:nowrap}'
       + '.trades th.num,.trades td.num{text-align:right}.trades td.num{font-weight:700}.trades td.g{color:#22C55E}.trades td.l{color:#EF4444}'
       + '.trades .tn{font-size:11px;color:#8b8e98;margin:9px 0 0;line-height:1.5}'
       + '.ft{font-size:11px;color:#70737e;line-height:1.7;margin-top:18px}'
-      + '@media(max-width:640px){.ks,.am{grid-template-columns:repeat(2,1fr)}.net b{font-size:22px}.trades{overflow-x:auto}}'
+      + '.k b.wrap{white-space:normal;font-size:12px;line-height:1.45}'
+      + '@media(max-width:640px){.ks,.am{grid-template-columns:repeat(2,1fr)}.net b{font-size:22px}'
+      + '.trades table{font-size:10.5px}.trades th{padding:6px 5px;font-size:8px;letter-spacing:.05em}.trades td{padding:6px 5px}.trades td.num{min-width:62px}'
+      + '.hd h1{font-size:16px}.hd .sp{margin-left:0;width:100%}.bd{font-size:9.5px;padding:6px 10px;letter-spacing:.06em}.bd svg{width:12px;height:12px}'
+      + '.at i{width:32px;height:32px}.an{min-width:110px}.an b{font-size:13px}.an span{white-space:normal;line-height:1.4}}'
       + '@media print{:root{color-scheme:light}body{background:#fff;color:#0f172a;padding:0}.card,.acc,.k,.am .k{background:#fff}.card,.acc,.ch{border-color:#d8dbe2}.k span,.hd p,.top p,.an span,.ft,.why p{color:#475267}.btn,.sp{display:none}.bd.no{color:#475267}'
       + '.trades th{color:#475267;border-color:#cbd2dd}.trades td{border-color:#e3e6ec}.trades td small,.trades .tn,.trades h3 em{color:#475267}.trades td.g{color:#15803d}.trades td.l{color:#b91c1c}.trades tr{break-inside:avoid}.trades thead{display:table-header-group}.trades{break-inside:auto}}'
       + '</style></head><body><div class="w">'
       + '<div class="hd"><div class="lg">' + (doc.photo ? '<img src="' + esc(doc.photo) + '" alt="" referrerpolicy="no-referrer" style="width:42px;height:42px;border-radius:12px;display:block;object-fit:cover" onerror="this.remove()">' : '<img src="https://etwiz.space/etw-logo-192.png" alt="ETW" style="width:42px;height:42px;border-radius:12px;display:block" onerror="this.replaceWith(document.createTextNode(\'ETW\'))">') + '</div><div><h1>' + esc(doc.name) + ' — Verified Track Record</h1><p>ETW Journal · generated ' + esc(fmtD(new Date(doc.createdAt || Date.now()).toISOString())) + '</p></div>'
-      + '<div class="sp"><button class="btn" onclick="window.print()">Download PDF</button></div></div>'
-      + '<div class="card"><div class="top"><div>' + badgeHtml(o.status) + '<h2>Verified Track Record</h2><p>' + o.verifiedAccounts + ' of ' + o.totalAccounts + ' account' + (o.totalAccounts === 1 ? '' : 's') + ' verified · broker-reported data only</p></div>'
+      + '<div class="sp"><button class="btn" onclick="window.print()"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M12 18v-6M9 15l3 3 3-3"/></svg>Download PDF</button></div></div>'
+      + '<div class="card hero"><div class="top"><div>' + badgeHtml(o.status) + '<h2>Verified Track Record</h2><p>' + o.verifiedAccounts + ' of ' + o.totalAccounts + ' account' + (o.totalAccounts === 1 ? '' : 's') + ' verified · broker-reported data only</p></div>'
       + (st.trades ? '<div class="net"><span>VERIFIED NET P&L</span><b style="color:' + (st.netPnl >= 0 ? '#22C55E' : '#EF4444') + '">' + fmt$(st.netPnl) + '</b></div>' : '') + '</div>'
       + (st.trades ? '<div class="ks">'
         + kpi('Win rate', st.winRate == null ? '—' : st.winRate + '%') + kpi('Profit factor', esc(S(st.profitFactor))) + kpi('Trades', st.trades) + kpi('Max drawdown', fmt$(st.maxDrawdown), 'r')
-        + kpi('Avg win', fmt$(st.avgWin), 'g') + kpi('Avg loss', fmt$(st.avgLoss), 'r') + kpi('Green days', st.greenDays + ' of ' + st.tradingDays) + kpi('Period', esc(fmtD(st.from)) + ' – ' + esc(fmtD(st.to)))
+        + kpi('Avg win', fmt$(st.avgWin), 'g') + kpi('Avg loss', fmt$(st.avgLoss), 'r') + kpi('Green days', st.greenDays + ' of ' + st.tradingDays) + kpiW('Period', esc(fmtD(st.from)) + ' – ' + esc(fmtD(st.to)))
         + '</div><div class="ch">' + svgCurve(o.curve) + '</div>' : '') + '</div>'
       + accRows
       + tradesCard
