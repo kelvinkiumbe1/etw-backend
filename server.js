@@ -975,6 +975,9 @@ require('./src/mcp').mount(app, {
   accountLimit: async (uid) => { const p = await mcpPlanOf(uid); return (PLAN_LIMITS[p] || PLAN_LIMITS.essential).accounts; },
 });
 
+// ── Verified Track Record: server-side proof of performance (src/trackrecord.js) ──
+require('./src/trackrecord').mount(app, { db, requireAuth, getUser: (uid) => admin.auth().getUser(uid) });
+
 // ── Notion Sync: import a trading journal kept in Notion (see src/notionSync.js) ──
 require('./src/notionSync').mount(app, { requireAuth, requireSub, limiter: rl(60 * 1000, 90, 'Too many Notion requests, please wait a moment.'), db, admin });
 
