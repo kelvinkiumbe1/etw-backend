@@ -10,11 +10,13 @@
 //  works with Claude (custom connectors), ChatGPT (developer-mode apps),
 //  Claude Code / Desktop, Cursor, VS Code and the MCP Inspector.
 //
-//  Auth: a personal connector key, created in Settings › AI Connectors. Only a
-//  SHA-256 hash of it is stored (mcpKeys/{hash}). The key can travel either in
-//  the URL  (https://<api>/mcp/<key>  — for apps that only take a URL) or as
-//  "Authorization: Bearer <key>" against https://<api>/mcp. Revoking the key in
-//  Settings cuts the AI off immediately. Pro / Ultra only, like ETW AI.
+//  Auth, two ways — both revocable in Settings › AI Connectors, Pro / Ultra only:
+//   • OAuth sign-in (Claude, ChatGPT and any app that supports MCP auth): the
+//     trader pastes https://<api>/mcp, the app opens ETW Journal, they click
+//     Allow. See "OAuth 2.1 sign-in" below.
+//   • A personal connector key for apps without OAuth. Only a SHA-256 hash is
+//     stored (mcpKeys/{hash}); it travels in the URL (https://<api>/mcp/<key>)
+//     or as "Authorization: Bearer <key>" against https://<api>/mcp.
 //
 //  Data model it reads (same as the app):
 //    trades            top-level, uid == data uid (one per independent account)
@@ -77,7 +79,7 @@ function mount(app, opts) {
   const keysCol = () => db.collection('mcpKeys');
   async function listKeys(uid) {
     const snap = await keysCol().where('uid', '==', uid).get();
-    return snap.docs.map((d) => { const x = d.data() || {}; return { id: d.id.slice(0, 16), name: x.name || 'Connector', scope: x.scope === 'write' ? 'write' : 'read', hint: x.hint || '', createdAt: x.createdAt || 0, lastUsedAt: x.lastUsedAt || 0, uses: x.uses || 0, client: x.client || '' }; })
+    return snap.docs.map((d) => { const x = d.data() || {}; return { id: d.id.slice(0, 16), name: x.name || 'Connector', scope: x.scope === 'write' ? 'write' : 'read', hint: x.hint || '', oauth: !!x.oauth, createdAt: x.createdAt || 0, lastUsedAt: x.lastUsedAt || 0, uses: x.uses || 0, client: x.client || '' }; })
       .sort((a, b) => b.createdAt - a.createdAt);
   }
   async function planGate(uid) {
@@ -116,7 +118,8 @@ function mount(app, opts) {
       const snap = await keysCol().where('uid', '==', req.uid).get();
       const d = snap.docs.find((x) => x.id.slice(0, 16) === id);
       if (!d) return res.status(404).json({ error: 'That connector no longer exists.' });
-      await keysCol().doc(d.id).delete();
+      if ((d.data() || {}).oauth) await dropGrant(d.id);    // also kills its access / refresh tokens
+      else await keysCol().doc(d.id).delete();
       _keyCache.delete(d.id);
       res.json({ ok: true });
     } catch (e) { console.error('[mcp] revoke key', e.message); res.status(500).json({ error: 'Could not revoke the connector.' }); }
@@ -130,7 +133,7 @@ function mount(app, opts) {
     const c = _keyCache.get(hash);
     if (c && c.exp > Date.now()) return c.rec;
     const snap = await keysCol().doc(hash).get();
-    const rec = snap.exists ? Object.assign({ hash }, snap.data()) : null;
+    const rec = snap.exists && !(snap.data() || {}).oauth ? Object.assign({ hash }, snap.data()) : null;
     _keyCache.set(hash, { rec, exp: Date.now() + (rec ? 60e3 : 15e3) });
     return rec;
   }
@@ -399,7 +402,7 @@ function mount(app, opts) {
   // trades can only gain tags or images — their prices, P&L and broker data can
   // never be changed from a connector.
   const SESSIONS = ['Asian', 'London', 'London Open', 'London/NY Overlap', 'New York', 'New York AM', 'New York PM', 'NY Open'];
-  function needWrite(ctx) { if (ctx.scope !== 'write') throw toolErr('This connector is read-only. The trader can create a connector with writing allowed in ETW Journal › Settings › AI Connectors.'); }
+  function needWrite(ctx) { if (ctx.scope !== 'write') throw toolErr('This connector is read-only. To allow writing, the trader can reconnect ETW Journal from their AI app and pick "Read + write" on the Allow screen (or create a connector with writing allowed in Settings › AI Connectors).'); }
   function cleanTags(v, max) {
     const out = [];
     (Array.isArray(v) ? v : []).forEach((t) => { const c = clip(S(t).replace(/[<>]/g, '').trim(), 40); if (c && !out.some((x) => low(x) === low(c))) out.push(c); });
@@ -1040,6 +1043,242 @@ function mount(app, opts) {
     'Writing (only on a connector the trader created with writing allowed, and always from the trader\'s instructions): create_note and save_session_prep save notes and session prep, log_trade adds a closed trade, update_trade_tags tags a trade (reuse their existing tag names exactly), create_playbook and update_playbook manage their playbooks, attach_image adds chart images. Confirm with the trader before each write. Nothing can be deleted through this connector.',
   ].join('\n');
 
+  // ════════════════════════ OAuth 2.1 sign-in (MCP authorization spec) ════════════════════════
+  // Claude, ChatGPT, Claude Code, Cursor… connect with just the URL  https://<api>/mcp :
+  //   1. their first call gets 401 + WWW-Authenticate pointing at our metadata;
+  //   2. they register themselves (dynamic client registration, RFC 7591);
+  //   3. they open /oauth/authorize in the browser → we send the trader to the
+  //      app (already signed in there), which shows an "Allow <app>?" screen;
+  //   4. on Allow the app gets a one-time code from us and bounces the browser
+  //      back to the AI app, which swaps it for tokens (PKCE S256 required).
+  // Each approval is a "grant" stored in mcpKeys like a manual key, so it shows
+  // in Settings › AI Connectors and Revoke cuts it off at once. Access tokens
+  // live 1 h, refresh tokens 180 days (rotated on every use). Docs also carry
+  // expireAt so a Firestore TTL policy can clean the oauth collections up.
+  const ACCESS_PREFIX = 'etwa_', REFRESH_PREFIX = 'etwr_', CODE_PREFIX = 'etwo_', CLIENT_PREFIX = 'etwc_', SECRET_PREFIX = 'etws_';
+  const OAUTH_SCOPES = ['journal:read', 'journal:write'];
+  const T = { request: 15 * 60e3, code: 5 * 60e3, access: 60 * 60e3, refresh: 180 * 86400e3 };
+  const clientsCol = () => db.collection('mcpOAuthClients');
+  const reqCol = () => db.collection('mcpOAuthRequests');
+  const codeCol = () => db.collection('mcpOAuthCodes');
+  const tokCol = () => db.collection('mcpTokens');
+  const appUrl = () => S(process.env.MCP_APP_URL || APP_URL);
+  // The address the AI app actually used (custom domain or the Render one), so
+  // the issuer in our metadata always matches what it fetched.
+  const baseFor = (req) => S(process.env.PUBLIC_API_URL || ((S(req.get('x-forwarded-proto')).split(',')[0].trim() || req.protocol || 'https') + '://' + req.get('host'))).replace(/\/+$/, '');
+  const scopeStr = (s) => (s === 'write' ? 'journal:read journal:write' : 'journal:read');
+  function okRedirect(u) {
+    let x; try { x = new URL(S(u)); } catch (e) { return false; }
+    if (x.hash || S(u).length > 500) return false;
+    if (x.protocol === 'https:') return true;
+    if (x.protocol === 'http:') return ['localhost', '127.0.0.1', '[::1]'].includes(x.hostname);   // desktop / CLI apps
+    return /^[a-z][a-z0-9+.-]{2,40}:$/.test(x.protocol) && !['javascript:', 'data:', 'file:', 'vbscript:', 'blob:'].includes(x.protocol); // cursor://, vscode://
+  }
+  function clientKind(name, uris) {
+    const s = low(name + ' ' + uris.join(' '));
+    return /claude|anthropic/.test(s) ? 'claude' : /chatgpt|openai/.test(s) ? 'chatgpt' : /cursor/.test(s) ? 'cursor' : 'other';
+  }
+  function oauthCors(res) { res.set('Access-Control-Allow-Origin', '*'); res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type, MCP-Protocol-Version'); res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS'); }
+  function oerr(res, status, error, desc) { oauthCors(res); res.set('Cache-Control', 'no-store'); return res.status(status).json({ error, error_description: desc }); }
+  function asMeta(b) {
+    return {
+      issuer: b, authorization_endpoint: b + '/oauth/authorize', token_endpoint: b + '/oauth/token', registration_endpoint: b + '/oauth/register', revocation_endpoint: b + '/oauth/revoke',
+      response_types_supported: ['code'], response_modes_supported: ['query'], grant_types_supported: ['authorization_code', 'refresh_token'],
+      code_challenge_methods_supported: ['S256'], token_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'],
+      revocation_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'],
+      scopes_supported: OAUTH_SCOPES, authorization_response_iss_parameter_supported: true, service_documentation: appUrl(),
+    };
+  }
+  const prMeta = (b) => ({ resource: b + '/mcp', authorization_servers: [b], scopes_supported: OAUTH_SCOPES, bearer_methods_supported: ['header'], resource_name: 'ETW Journal', resource_documentation: appUrl() });
+  const AS_PATHS = ['/.well-known/oauth-authorization-server', '/.well-known/oauth-authorization-server/mcp', '/.well-known/openid-configuration', '/.well-known/openid-configuration/mcp', '/mcp/.well-known/openid-configuration', '/mcp/.well-known/oauth-authorization-server'];
+  const PR_PATHS = ['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp', '/mcp/.well-known/oauth-protected-resource'];
+  app.get(AS_PATHS, (req, res) => { oauthCors(res); res.set('Cache-Control', 'public, max-age=600'); res.json(asMeta(baseFor(req))); });
+  app.get(PR_PATHS, (req, res) => { oauthCors(res); res.set('Cache-Control', 'public, max-age=600'); res.json(prMeta(baseFor(req))); });
+  app.options(AS_PATHS.concat(PR_PATHS, ['/oauth/register', '/oauth/token', '/oauth/revoke']), (req, res) => { oauthCors(res); res.status(204).end(); });
+
+  // ── dynamic client registration (RFC 7591) ──
+  app.post('/oauth/register', async (req, res) => {
+    try {
+      const b = req.body || {};
+      const uris = (Array.isArray(b.redirect_uris) ? b.redirect_uris : []).map(S);
+      if (!uris.length || uris.length > 10 || !uris.every(okRedirect)) return oerr(res, 400, 'invalid_redirect_uri', 'Give 1–10 redirect URIs (https, or http on localhost).');
+      if (limited('reg:' + S(req.ip), 30, 3600e3)) return oerr(res, 429, 'slow_down', 'Too many registrations from this address. Try again later.');
+      const method = ['client_secret_post', 'client_secret_basic'].includes(S(b.token_endpoint_auth_method)) ? S(b.token_endpoint_auth_method) : 'none';
+      const clientId = CLIENT_PREFIX + b62(crypto.randomBytes(24));
+      const secret = method === 'none' ? null : SECRET_PREFIX + b62(crypto.randomBytes(32));
+      const name = clip(S(b.client_name).replace(/[<>]/g, '').trim() || 'AI app', 80);
+      const now = Date.now();
+      await clientsCol().doc(clientId).set({ name, redirectUris: uris, authMethod: method, secretHash: secret ? sha(secret) : null, kind: clientKind(name, uris), clientUri: clip(S(b.client_uri), 200), createdAt: now });
+      oauthCors(res); res.set('Cache-Control', 'no-store');
+      res.status(201).json(Object.assign({ client_id: clientId, client_id_issued_at: Math.floor(now / 1000), client_name: name, redirect_uris: uris, grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'], token_endpoint_auth_method: method, scope: OAUTH_SCOPES.join(' ') },
+        secret ? { client_secret: secret, client_secret_expires_at: 0 } : {}));
+    } catch (e) { console.error('[mcp oauth] register', e.message); oerr(res, 500, 'server_error', 'Could not register the app.'); }
+  });
+
+  // ── authorize: check the request, then hand the browser to the app to approve ──
+  function oauthPage(res, title, msg) {
+    res.status(400).set('Cache-Control', 'no-store').type('html').send('<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ETW Journal</title>' +
+      '<body style="margin:0;min-height:100vh;display:grid;place-items:center;background:#0d0e12;color:#e8e9ef;font:15px/1.5 Inter,system-ui,sans-serif"><div style="max-width:440px;padding:28px;border-radius:16px;background:#17181e;border:1px solid rgba(255,255,255,.08)">' +
+      '<h2 style="margin:0 0 8px;font-size:19px">' + escHtml(title) + '</h2><p style="margin:0;color:#a3a6b5">' + escHtml(msg) + '</p></div></body>');
+  }
+  app.get('/oauth/authorize', async (req, res) => {
+    try {
+      const q = req.query || {}, cid = S(q.client_id);
+      const snap = /^etwc_[A-Za-z0-9]{10,60}$/.test(cid) ? await clientsCol().doc(cid).get() : null;
+      if (!snap || !snap.exists) return oauthPage(res, 'Unknown app', 'This AI app is not registered with ETW Journal. Remove the ETW Journal connector in the app and add it again.');
+      const c = snap.data() || {}, uris = c.redirectUris || [];
+      const redirect = S(q.redirect_uri) || (uris.length === 1 ? uris[0] : '');
+      if (!redirect || !uris.includes(redirect)) return oauthPage(res, 'Sign-in link not valid', 'The return address of this sign-in request does not match the app that registered it.');
+      const back = (error, desc) => { const u = new URL(redirect); u.searchParams.set('error', error); if (desc) u.searchParams.set('error_description', desc); if (q.state) u.searchParams.set('state', S(q.state)); u.searchParams.set('iss', baseFor(req)); return res.redirect(302, u.toString()); };
+      if (S(q.response_type) !== 'code') return back('unsupported_response_type', 'Only response_type=code is supported.');
+      if (S(q.code_challenge_method) !== 'S256' || !/^[A-Za-z0-9._~-]{43,128}$/.test(S(q.code_challenge))) return back('invalid_request', 'PKCE with code_challenge_method=S256 is required.');
+      if (limited('auth:' + cid, 30, 600e3)) return back('temporarily_unavailable', 'Too many sign-in attempts. Wait a few minutes.');
+      const want = S(q.scope).split(/\s+/).filter(Boolean);
+      const rid = b62(crypto.randomBytes(24)), exp = Date.now() + T.request;
+      await reqCol().doc(sha(rid)).set({ clientId: cid, redirectUri: redirect, state: clip(S(q.state), 1000), challenge: S(q.code_challenge), scope: want.includes('journal:write') ? 'write' : 'read', resource: clip(S(q.resource), 300), iss: baseFor(req), exp, expireAt: new Date(exp) });
+      res.set('Cache-Control', 'no-store');
+      return res.redirect(302, appUrl() + (appUrl().includes('?') ? '&' : '?') + 'mcp_auth=' + rid);
+    } catch (e) { console.error('[mcp oauth] authorize', e.message); oauthPage(res, 'Something went wrong', 'ETW Journal could not start the sign-in. Go back to your AI app and try connecting again.'); }
+  });
+
+  // ── the app's approval screen (signed-in trader) ──
+  async function loadRequest(rid) {
+    rid = S(rid); if (!/^[A-Za-z0-9]{20,60}$/.test(rid)) return null;
+    const s = await reqCol().doc(sha(rid)).get();
+    if (!s.exists) return null;
+    const r = s.data() || {}; if ((r.exp || 0) < Date.now()) return null;
+    const cs = await clientsCol().doc(S(r.clientId)).get();
+    if (!cs.exists) return null;
+    return { ref: s.ref, r, client: cs.data() || {} };
+  }
+  const sameApp = (g, clientId, c) => g.oauthClientId === clientId || (g.oauth && g.client === c.kind && low(g.name) === low(c.name));
+  app.get('/api/mcp/oauth/request', requireAuth, async (req, res) => {
+    try {
+      const L = await loadRequest(req.query && req.query.rid);
+      if (!L) return res.status(404).json({ error: 'This sign-in request has expired. Go back to your AI app and click Connect again.', code: 'expired' });
+      const plan = await planGate(req.uid);
+      let host = ''; try { host = new URL(L.r.redirectUri).host; } catch (e) {}
+      res.set('Cache-Control', 'no-store');
+      res.json({ ok: true, client: { name: L.client.name, kind: L.client.kind, host }, scope: L.r.scope, plan, allowed: plan === 'pro' || plan === 'ultra' });
+    } catch (e) { console.error('[mcp oauth] request', e.message); res.status(500).json({ error: 'Could not load the sign-in request.' }); }
+  });
+  app.post('/api/mcp/oauth/decision', requireAuth, async (req, res) => {
+    try {
+      const b = req.body || {};
+      const L = await loadRequest(b.rid);
+      if (!L) return res.status(404).json({ error: 'This sign-in request has expired. Go back to your AI app and click Connect again.', code: 'expired' });
+      const back = new URL(L.r.redirectUri);
+      if (L.r.state) back.searchParams.set('state', L.r.state);
+      back.searchParams.set('iss', L.r.iss || publicBase());
+      if (!b.approve) {
+        await L.ref.delete();
+        back.searchParams.set('error', 'access_denied'); back.searchParams.set('error_description', 'The trader declined.');
+        return res.json({ ok: true, redirect: back.toString() });
+      }
+      const plan = await planGate(req.uid);
+      if (plan === 'unknown') return res.status(503).json({ error: 'Could not check your plan. Please try again.' });
+      if (!plan) return res.status(402).json({ error: 'AI connectors are on the Pro and Ultra plans.', code: 'pro_required' });
+      const keys = (await keysCol().where('uid', '==', req.uid).get()).docs.map((d) => d.data() || {});
+      if (keys.filter((g) => !sameApp(g, L.r.clientId, L.client)).length >= MAX_KEYS) return res.status(400).json({ error: 'You already have ' + MAX_KEYS + ' AI connectors. Revoke one in Settings › AI Connectors, then try again.', code: 'limit' });
+      const code = CODE_PREFIX + b62(crypto.randomBytes(32)), exp = Date.now() + T.code;
+      await codeCol().doc(sha(code)).set({ uid: req.uid, clientId: L.r.clientId, redirectUri: L.r.redirectUri, challenge: L.r.challenge, scope: b.scope === 'write' ? 'write' : 'read', exp, expireAt: new Date(exp) });
+      await L.ref.delete();
+      back.searchParams.set('code', code);
+      res.json({ ok: true, redirect: back.toString() });
+    } catch (e) { console.error('[mcp oauth] decision', e.message); res.status(500).json({ error: 'Could not finish connecting. Please try again.' }); }
+  });
+
+  // ── token endpoint ──
+  async function clientAuth(req) {
+    const b = req.body || {};
+    let id = S(b.client_id), secret = S(b.client_secret);
+    const m = /^Basic\s+(.+)$/i.exec(S(req.get('authorization')));
+    if (m) { try { const [u, p] = Buffer.from(m[1], 'base64').toString('utf8').split(':'); id = decodeURIComponent(u || ''); secret = decodeURIComponent(p || ''); } catch (e) {} }
+    if (!/^etwc_[A-Za-z0-9]{10,60}$/.test(id)) return null;
+    const s = await clientsCol().doc(id).get(); if (!s.exists) return null;
+    const c = Object.assign({ id }, s.data() || {});
+    if (c.secretHash && !(secret && sha(secret) === c.secretHash)) return null;
+    return c;
+  }
+  async function issueTokens(grantId, uid, clientId, scope) {
+    const access = ACCESS_PREFIX + b62(crypto.randomBytes(32)), refresh = REFRESH_PREFIX + b62(crypto.randomBytes(32)), now = Date.now();
+    await Promise.all([
+      tokCol().doc(sha(access)).set({ type: 'access', grant: grantId, uid, clientId, exp: now + T.access, expireAt: new Date(now + T.access) }),
+      tokCol().doc(sha(refresh)).set({ type: 'refresh', grant: grantId, uid, clientId, exp: now + T.refresh, expireAt: new Date(now + T.refresh) }),
+    ]);
+    return { access_token: access, token_type: 'Bearer', expires_in: Math.floor(T.access / 1000), refresh_token: refresh, scope: scopeStr(scope) };
+  }
+  async function dropGrant(grantId) {
+    await keysCol().doc(grantId).delete().catch(() => {});
+    _keyCache.delete(grantId);
+    const t = await tokCol().where('grant', '==', grantId).get().catch(() => null);
+    if (t) await Promise.all(t.docs.map((d) => d.ref.delete().catch(() => {})));
+  }
+  app.post('/oauth/token', async (req, res) => {
+    try {
+      const b = req.body || {}, gt = S(b.grant_type);
+      const c = await clientAuth(req);
+      if (!c) return oerr(res, 401, 'invalid_client', 'Unknown app or wrong client secret. Remove the connector and add it again.');
+      if (limited('tok:' + c.id, 60, 60e3)) return oerr(res, 429, 'slow_down', 'Too many token requests.');
+      oauthCors(res); res.set('Cache-Control', 'no-store'); res.set('Pragma', 'no-cache');
+      if (gt === 'authorization_code') {
+        const code = S(b.code), ref = codeCol().doc(sha(code));
+        const rec = await db.runTransaction(async (tx) => { const s = await tx.get(ref); if (!s.exists) return null; tx.delete(ref); return s.data() || {}; });   // single use
+        if (!rec || (rec.exp || 0) < Date.now() || rec.clientId !== c.id) return oerr(res, 400, 'invalid_grant', 'The sign-in code is invalid or expired. Connect again.');
+        if (b.redirect_uri && S(b.redirect_uri) !== rec.redirectUri) return oerr(res, 400, 'invalid_grant', 'redirect_uri does not match.');
+        const verifier = S(b.code_verifier);
+        if (!/^[A-Za-z0-9._~-]{43,128}$/.test(verifier) || crypto.createHash('sha256').update(verifier).digest('base64url') !== rec.challenge) return oerr(res, 400, 'invalid_grant', 'PKCE check failed.');
+        // One grant per app: connecting Claude again replaces its old connection.
+        const mine = await keysCol().where('uid', '==', rec.uid).get();
+        for (const d of mine.docs) if ((d.data() || {}).oauth && sameApp(d.data(), c.id, c)) await dropGrant(d.id);
+        const grantId = sha('grant:' + b62(crypto.randomBytes(24)));
+        await keysCol().doc(grantId).set({ uid: rec.uid, name: c.name, scope: rec.scope, client: c.kind, oauth: true, oauthClientId: c.id, hint: 'Signed in with ETW Journal', createdAt: Date.now(), lastUsedAt: 0, uses: 0 });
+        return res.json(await issueTokens(grantId, rec.uid, c.id, rec.scope));
+      }
+      if (gt === 'refresh_token') {
+        const rt = S(b.refresh_token); if (!rt.startsWith(REFRESH_PREFIX)) return oerr(res, 400, 'invalid_grant', 'Invalid refresh token.');
+        const ref = tokCol().doc(sha(rt));
+        const rec = await db.runTransaction(async (tx) => { const s = await tx.get(ref); if (!s.exists) return null; tx.delete(ref); return s.data() || {}; });   // rotated
+        if (!rec || rec.type !== 'refresh' || (rec.exp || 0) < Date.now() || rec.clientId !== c.id) return oerr(res, 400, 'invalid_grant', 'This connection has expired or was revoked. Connect again.');
+        const g = await keysCol().doc(rec.grant).get();
+        if (!g.exists) return oerr(res, 400, 'invalid_grant', 'This connection was revoked in ETW Journal. Connect again.');
+        return res.json(await issueTokens(rec.grant, rec.uid, c.id, (g.data() || {}).scope));
+      }
+      return oerr(res, 400, 'unsupported_grant_type', 'Use authorization_code or refresh_token.');
+    } catch (e) { console.error('[mcp oauth] token', e.message); oerr(res, 500, 'server_error', 'Could not issue a token.'); }
+  });
+  // RFC 7009: always 200. Revoking a refresh token ends the whole connection.
+  app.post('/oauth/revoke', async (req, res) => {
+    try {
+      const c = await clientAuth(req), t = S((req.body || {}).token);
+      if (c && (t.startsWith(ACCESS_PREFIX) || t.startsWith(REFRESH_PREFIX))) {
+        const s = await tokCol().doc(sha(t)).get();
+        if (s.exists && (s.data() || {}).clientId === c.id) { if (s.data().type === 'refresh') await dropGrant(s.data().grant); else await s.ref.delete(); }
+      }
+    } catch (e) { console.warn('[mcp oauth] revoke', e.message); }
+    oauthCors(res); res.status(200).end();
+  });
+
+  // access token → the grant it belongs to (same record shape as a manual key)
+  const _tokCache = new Map();
+  async function resolveAccess(token) {
+    if (!token.startsWith(ACCESS_PREFIX) || token.length > 80) return null;
+    const h = sha(token);
+    let t = _tokCache.get(h);
+    if (!t || t.until < Date.now()) {
+      const s = await tokCol().doc(h).get();
+      t = { rec: s.exists ? s.data() : null, until: Date.now() + 60e3 };
+      _tokCache.set(h, t); if (_tokCache.size > 2000) _tokCache.delete(_tokCache.keys().next().value);
+    }
+    if (!t.rec || t.rec.type !== 'access' || (t.rec.exp || 0) < Date.now()) return null;
+    const c = _keyCache.get(t.rec.grant);
+    if (c && c.exp > Date.now()) return c.rec;
+    const g = await keysCol().doc(t.rec.grant).get();
+    const rec = g.exists ? Object.assign({ hash: g.id }, g.data()) : null;
+    _keyCache.set(t.rec.grant, { rec, exp: Date.now() + (rec ? 60e3 : 15e3) });
+    return rec;
+  }
+
   // ════════════════════════ the MCP endpoint ════════════════════════
   function keyFrom(req) {
     const p = S(req.params && req.params.key);
@@ -1107,13 +1346,18 @@ function mount(app, opts) {
   async function endpoint(req, res) {
     res.set('Cache-Control', 'no-store');
     const key = keyFrom(req);
-    const unauthorized = (why) => res.status(401).json(rpcErr(null, -32001, why));
-    if (!key) return unauthorized('Missing ETW Journal connector key. Create one in ETW Journal › Settings › AI Connectors and use the full connector URL.');
+    const isAccess = key.startsWith(ACCESS_PREFIX);
+    // 401 + WWW-Authenticate is what makes Claude / ChatGPT start the OAuth sign-in.
+    const unauthorized = (why, bad) => {
+      res.set('WWW-Authenticate', 'Bearer resource_metadata="' + baseFor(req) + '/.well-known/oauth-protected-resource"' + (bad ? ', error="invalid_token"' : '') + ', scope="journal:read"');
+      return res.status(401).json(rpcErr(null, -32001, why));
+    };
+    if (!key) return unauthorized('Sign in to ETW Journal to connect (your AI app opens the sign-in automatically), or use a connector URL from ETW Journal › Settings › AI Connectors.');
     if (limited('ip:' + sha(key).slice(0, 16), 240, 60e3)) return res.status(429).json(rpcErr(null, -32002, 'Too many requests. Slow down a little.'));
     let rec;
-    try { rec = await resolveKey(key); } catch (e) { console.error('[mcp] key lookup', e.message); return res.status(503).json(rpcErr(null, -32603, 'ETW Journal is temporarily unavailable.')); }
-    if (!rec) return unauthorized('This ETW Journal connector key is not valid or was revoked. Create a new one in Settings › AI Connectors.');
-    const ctx = { uid: rec.uid, scope: rec.scope === 'write' ? 'write' : 'read', hash: rec.hash, client: S(req.get('user-agent')).slice(0, 60) };
+    try { rec = isAccess ? await resolveAccess(key) : await resolveKey(key); } catch (e) { console.error('[mcp] key lookup', e.message); return res.status(503).json(rpcErr(null, -32603, 'ETW Journal is temporarily unavailable.')); }
+    if (!rec) return unauthorized(isAccess ? 'Your ETW Journal sign-in expired or was revoked. Reconnect from your AI app.' : 'This ETW Journal connector key is not valid or was revoked. Create a new one in Settings › AI Connectors.', true);
+    const ctx = { uid: rec.uid, scope: rec.scope === 'write' ? 'write' : 'read', hash: rec.hash, client: rec.oauth ? S(rec.name).slice(0, 60) : S(req.get('user-agent')).slice(0, 60) };
     const body = req.body;
     const batch = Array.isArray(body);
     const msgs = batch ? body : [body];
