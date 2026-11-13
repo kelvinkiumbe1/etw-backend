@@ -14,6 +14,12 @@
 //    · the trade itself carries an autosync source tag and still matches the
 //      broker's own values (stats are computed from the synced docs, so user
 //      edits to notes etc. don't change the numbers that matter)
+//    · cTrader: a trade counts only if this server recorded it in
+//      ctProof/{du}__{ticket} (same P&L, each ticket once) from an account the
+//      server classified (ctAccounts/{du}) as LIVE (cTrader isLive) or PROP (a
+//      recognised prop firm's paid challenge / funded account on cTrader's demo
+//      environment). Free trials, competitions and plain demo accounts never
+//      count, whatever the trade doc or the account label says.
 //
 //  What is always excluded
 //    · demo accounts and prop firm free trials
@@ -135,7 +141,26 @@ function mount(app, opts) {
         });
       }));
       const ct = (u.exists && (u.data() || {}).ctrader) || {};
-      if (ct.status === 'connected') {
+      const ca = ct.status === 'connected' ? await db.collection('ctAccounts').doc(du).get().catch(() => null) : null;
+      const caList = (ca && ca.exists && (ca.data() || {}).accounts) || null;
+      if (ct.status === 'connected' && caList && Object.keys(caList).length) {
+        // Every account on the cTrader token, live / demo as cTrader itself reports it.
+        const cb = ct.cashBalances || {};
+        Object.keys(caList).forEach((id) => {
+          const a = caList[id] || {}, b = cb[id] || {};
+          const label = S(a.label || b.label || ('cTrader ' + id));
+          out.push({
+            kind: 'cTrader', via: 'cTrader Open API',
+            server: '', login: S(id), loginMasked: mask(id), label,
+            brand: brandOf(a.firm || label) || 'cTrader', live: a.kind ? (a.kind === 'live' || a.kind === 'prop') : !!a.live, prop: a.kind === 'prop' || undefined,
+          demoReason: a.kind === 'trial' ? '"' + label + '" is a free trial / competition account.'
+            : (a.kind ? a.kind === 'demo' : !a.live) ? 'cTrader reports "' + label + '" as a demo account, and it is not a recognised prop firm account.' : '',
+            lastSync: Math.max(+a.at || 0, +b.at || 0), balance: b.balance != null ? r2(num(b.balance)) : undefined,
+          });
+        });
+      } else if (ct.status === 'connected') {
+        // Not re-synced since the proof update yet: show what we have, but its
+        // trades still need a live proof (see buildAccount) to count.
         const cb = ct.cashBalances || {};
         Object.keys(cb).forEach((id) => {
           const b = cb[id] || {};
@@ -173,9 +198,28 @@ function mount(app, opts) {
         vVoid: !!(t.vVoid || (g && g.some((x) => x.vVoid))),
         vPnl: g ? null : (t.vPnl != null && isFinite(num(t.vPnl)) ? r2(num(t.vPnl)) : null),
         rawResult: res, merged: !!g,
+        parts: (g || [t]).map((x) => ({ source: low(x.source), ticket: S(x.ticket), pnl: r2(num(x.pnl)) })),
         hay: low([t.brokerAccount, t.mt5AccountKey, t.extId, t.sourceTradeId, t.brokerName].map(S).join(' ')),
       };
     }).sort((a, b) => a.ts - b.ts);
+  }
+
+  // Server-only cTrader proofs of one journal account: ticket -> { live, pnl }.
+  // `live` here means "counts": the account's CURRENT kind from ctAccounts (so a
+  // later trial mark from deposit notes applies retroactively), else the kind
+  // stamped on the proof, else cTrader's isLive (proofs from before kinds existed).
+  async function ctProofsOf(du) {
+    const m = new Map();
+    try {
+      const [s, ca] = await Promise.all([db.collection('ctProof').where('du', '==', du).get(), db.collection('ctAccounts').doc(du).get()]);
+      const accs = (ca.exists && (ca.data() || {}).accounts) || {};
+      s.docs.forEach((d) => {
+        const x = d.data() || {}; if (!x.ticket) return;
+        const kind = (accs[S(x.ctid)] && accs[S(x.ctid)].kind) || x.kind || (x.live === true ? 'live' : 'demo');
+        m.set(S(x.ticket), { live: kind === 'live' || kind === 'prop', kind, pnl: r2(num(x.pnl)) });
+      });
+    } catch (e) { console.warn('[trackrecord] ctProof read failed for', du, '-', e.message); }
+    return m;
   }
 
   function classify(t) {
@@ -186,7 +230,9 @@ function mount(app, opts) {
   }
 
   async function buildAccount(acc) {
-    const [conns, trades] = await Promise.all([connectionsOf(acc.du), tradesOf(acc.du)]);
+    const [conns, trades, ctProofs] = await Promise.all([connectionsOf(acc.du), tradesOf(acc.du), ctProofsOf(acc.du)]);
+    const ctUsed = new Set();
+    let ctUnproven = 0;
     const liveConns = conns.filter((c) => c.live), demoConns = conns.filter((c) => !c.live);
     const excluded = { manual: 0, fileImport: 0, demo: 0, edited: 0, unattributed: 0 };
     const included = [];
@@ -203,6 +249,24 @@ function mount(app, opts) {
       if (t.vVoid) { excluded.edited++; continue; }
       if (t.vPnl != null && Math.abs(t.vPnl - t.pnl) > 0.01) { excluded.edited++; continue; }
       if (!t.merged && ((t.rawResult === 'WIN' && t.pnl < -0.009) || (t.rawResult === 'LOSS' && t.pnl > 0.009))) { excluded.edited++; continue; }
+      // cTrader: the server's own proof decides live vs demo — the trade doc and
+      // the account label are not trusted for this.
+      const ctParts = t.parts.filter((p) => p.source === 'ctrader_open_api');
+      if (ctParts.length) {
+        let why = '';
+        for (const p of ctParts) {
+          const pr = p.ticket ? ctProofs.get(p.ticket) : null;
+          if (!pr) { why = 'unproven'; break; }
+          if (!pr.live) { why = 'demo'; break; }
+          if (Math.abs(pr.pnl - p.pnl) > 0.01) { why = 'edited'; break; }
+          if (ctUsed.has(p.ticket)) { why = 'duplicate'; break; }
+        }
+        if (why === 'demo') { excluded.demo++; continue; }
+        if (why === 'edited') { excluded.edited++; continue; }
+        if (why) { excluded.unattributed++; if (why === 'unproven') ctUnproven++; continue; }
+        ctParts.forEach((p) => ctUsed.add(p.ticket));
+        if (ctParts.length === t.parts.length) { included.push(t); continue; }   // proof beats label matching
+      }
       // synced: make sure it did not come from a demo connection of this account
       if (DEMO_RE.test(t.hay)) { excluded.demo++; continue; }
       const hitsDemo = demoConns.some((c) => (c.login && t.hay.includes(low(c.login))) || (c.label && t.hay.includes(low(c.label))) || (c.server && t.hay.includes(low(c.server))));
@@ -237,10 +301,11 @@ function mount(app, opts) {
       status = stale ? 'verified_up_to' : 'verified';
       if (stale) { asOf = lastSync; reasons.push('The sync has not reported for more than 7 days.'); }
     }
+    if (ctUnproven) reasons.push(ctUnproven + ' cTrader trade' + (ctUnproven === 1 ? ' is' : 's are') + ' not counted yet: the server has not confirmed ' + (ctUnproven === 1 ? 'it' : 'them') + ' as coming from a live cTrader account (it checks on every sync).');
     const verified = status === 'verified' || status === 'verified_up_to';
     return {
       id: acc.id, name: acc.name, status, verified, asOf: asOf ? iso(asOf) : null, reasons,
-      connections: conns.map((c) => ({ kind: c.kind, via: c.via, brand: c.brand, label: c.label, server: c.server || undefined, loginMasked: c.loginMasked, live: c.live, lastSync: c.lastSync ? iso(c.lastSync) : null, balance: c.balance, currency: c.currency })),
+      connections: conns.map((c) => ({ kind: c.kind, via: c.via, brand: c.brand, label: c.label, server: c.server || undefined, loginMasked: c.loginMasked, live: c.live, prop: c.prop, lastSync: c.lastSync ? iso(c.lastSync) : null, balance: c.balance, currency: c.currency })),
       stats: verified ? stats(included) : { trades: 0 },
       curve: verified ? curveOf(included) : [],
       trades: verified ? included.slice(-400).reverse().map((t) => ({ id: t.id, date: iso(t.ts), symbol: t.symbol, direction: t.direction || undefined, result: t.result, pnl: t.pnl, merged: t.merged || undefined })) : [],
@@ -329,7 +394,7 @@ function mount(app, opts) {
           overall: b.overall,
           accounts: b.accounts.map((a) => ({
             id: a.id, name: a.name, status: a.status, verified: a.verified, asOf: a.asOf, reasons: a.reasons,
-            connections: (a.connections || []).map((c) => ({ kind: c.kind, via: c.via, brand: c.brand, live: c.live, loginMasked: c.loginMasked, lastSync: c.lastSync })),
+            connections: (a.connections || []).map((c) => ({ kind: c.kind, via: c.via, brand: c.brand, live: c.live, prop: c.prop, loginMasked: c.loginMasked, lastSync: c.lastSync })),
             stats: a.stats, curve: a.curve, excluded: a.excluded,   // no trade list on the public JSON — summary only
           })),
         };
@@ -400,7 +465,7 @@ function mount(app, opts) {
       return '<div class="acc">'
         + '<div class="at"><i>' + (brokerLogo(c.brand, c.label) ? '<img src="' + esc(brokerLogo(c.brand, c.label)) + '" alt="" referrerpolicy="no-referrer" onerror="this.remove()">' : '') + esc((c.brand || a.name || 'E').slice(0, 2).toUpperCase()) + '</i>'
         + '<div class="an"><b>' + esc(c.brand || a.name) + '</b><span>' + esc(a.name) + (c.server ? ' · ' + esc(c.server) : c.label ? ' · ' + esc(c.label) : '') + (c.loginMasked ? ' ' + esc(c.loginMasked) : '') + '</span></div>'
-        + (c.kind ? '<em class="tag ' + (c.live ? 'lv' : 'dm') + '">' + (c.live ? 'LIVE' : 'DEMO') + '</em><em class="tag">' + esc(c.kind === 'cTrader' ? 'cTrader' : 'MT5') + '</em>' : '')
+        + (c.kind ? '<em class="tag ' + (c.live ? 'lv' : 'dm') + '">' + (c.prop ? 'PROP FIRM' : c.live ? 'LIVE' : 'DEMO') + '</em><em class="tag">' + esc(c.kind === 'cTrader' ? 'cTrader' : 'MT5') + '</em>' : '')
         + badgeHtml(a.status, a.asOf) + '</div>'
         + (a.verified && as.trades
           ? '<div class="am">' + kpi('Trades', as.trades) + kpi('Win rate', as.winRate == null ? '—' : as.winRate + '%') + kpi('Net P&L', fmt$(as.netPnl), as.netPnl >= 0 ? 'g' : 'r') + kpi('Profit factor', esc(S(as.profitFactor))) + kpi('Max DD', fmt$(as.maxDrawdown), 'r') + kpiW('Period', esc(fmtD(as.from)) + ' – ' + esc(fmtD(as.to))) + '</div>'
