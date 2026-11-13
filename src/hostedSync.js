@@ -22,7 +22,10 @@ const { marketClosed } = require('./tokens');
 
 const COL = 'mt5Hosted';
 const MIN = 60 * 1000;
-const LEASE_MS = 8 * MIN;                 // worker's run timeout is 5 min
+// A run is up to 5 min, but a worker that doesn't find the server as typed
+// retries up to two other spellings ("Server2" -> "Server 2") after a broker
+// search, all inside one lease.
+const LEASE_MS = 25 * MIN;
 const ACTIVE_EVERY = 15 * MIN;            // trades in the last 24h, or positions open
 const IDLE_EVERY = 60 * MIN;
 const DORMANT_EVERY = 6 * 60 * MIN;       // nothing for 14 days
@@ -68,6 +71,7 @@ function decrypt(box, aad) {
 // Re-linking the same account (new password, say) keeps its EA key, so the
 // worker's on-disk sent-ticket list and the journal's dedup stay valid.
 async function link(uid, { accountKey, login, password, server, platform, journalAccountId }) {
+  server = await canonicalServer(server).catch(() => server);
   const id = docId(uid, accountKey);
   const prev = await ref(id).get();
   const old = prev.exists ? prev.data() : null;
@@ -143,7 +147,9 @@ async function healUnknownServer() {
     const now = Date.now();
     let n = 0;
     for (const doc of snap.docs) {
-      if ((doc.data().dueAt || 0) > now + 365 * 24 * 60 * MIN) { await doc.ref.update({ dueAt: now, loginFails: 0, unknownServerRuns: 1 }); n++; }
+      // Everything waiting on unknown_server goes now: the worker tries other
+      // spellings of the name since this release ("Server2" -> "Server 2").
+      if ((doc.data().dueAt || 0) > now) { await doc.ref.update({ dueAt: now, loginFails: 0, unknownServerRuns: Math.min(doc.data().unknownServerRuns || 1, 1) }); n++; }
     }
     if (n) console.log('[hosted] re-queued', n, 'account(s) previously stuck on unknown_server');
   } catch (e) { console.warn('[hosted] healUnknownServer:', e.message); }
@@ -276,13 +282,13 @@ function nextDue(d, now) {
 const BAD_PASSWORD_MSG = 'The broker says this login or investor password is wrong. Check them in MT5 and connect again.';
 const UNKNOWN_SERVER_MSG = (server, near) => 'We could not find a broker server called "' + server + '" in MT5’s directory yet. '
   + (near.length ? 'Did you mean ' + near.map((n) => '"' + n + '"').join(' or ') + '? ' : '')
-  + 'Copy the server name exactly as MT5 shows it (File → Login to Trade Account, e.g. "ICMarketsSC-MT5-2") and connect again — '
+  + 'We also tried it with and without a space before the number. Copy the server name exactly as MT5 shows it, spaces included (File → Login to Trade Account, e.g. "FundedNext-Server 2"), and connect again — '
   + 'or, if the name is already exact (new prop-firm servers can take a while to appear in the directory), no action is needed: we keep checking every few hours and will connect as soon as it answers.';
 const UNREACHABLE_MSG = (server) => 'We cannot reach the broker server "' + server + '" right now. We will keep trying — no action needed.';
 
 // "Did you mean": servers other accounts have synced from, close to what the
 // user typed. Spaces, dashes and case are ignored, so "Atlasfunded" finds
-// "AtlasFunded-Server" and "FundedNext-Server2" finds "FundedNext-Server".
+// "AtlasFunded-Server" and "FundedNext-Server2" finds "FundedNext-Server 2".
 const squash = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 function editDistance(a, b) {
   let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
@@ -297,12 +303,16 @@ async function suggestServers(server) {
   const typed = squash(server);
   if (!typed) return [];
   const snap = await store.db.collection(COL).where('everSynced', '==', true).get();
-  const names = [...new Set(snap.docs.map((d) => d.data().server).filter((n) => n && squash(n) !== typed))];
+  // Only the exact string is left out: a known name that differs only in
+  // spaces or case ("FundedNext-Server 2" for "FundedNext-Server2") is the
+  // best suggestion there is, so it ranks first.
+  const exact = String(server || '').trim();
+  const names = [...new Set(snap.docs.map((d) => d.data().server).filter((n) => n && n !== exact))];
   return names
     .map((n) => {
       const k = squash(n);
       const close = k.startsWith(typed) || typed.startsWith(k);
-      return { n, d: close ? 0 : editDistance(typed, k) };
+      return { n, d: k === typed ? -1 : close ? 0 : editDistance(typed, k) };
     })
     .filter((x) => x.d <= Math.max(2, Math.floor(typed.length / 6)))
     .sort((x, y) => x.d - y.d || x.n.length - y.n.length)
@@ -310,10 +320,36 @@ async function suggestServers(server) {
     .map((x) => x.n);
 }
 
+// At connect time: if a server some account has synced from (or the shared
+// server directory) differs from what the user typed only in spaces, dashes
+// or case, store that exact spelling — MT5 matches server names exactly.
+async function canonicalServer(server) {
+  const typed = squash(server);
+  if (!typed) return server;
+  const synced = await store.db.collection(COL).where('everSynced', '==', true).get();
+  const counts = new Map();
+  for (const doc of synced.docs) {
+    const n = doc.data().server;
+    if (n && squash(n) === typed) counts.set(n, (counts.get(n) || 0) + 1);
+  }
+  if (!counts.size) {
+    const dir = await store.db.collection('mt5ServerDirectory').doc('all').get();
+    const map = (dir.exists && dir.data().servers) || {};
+    for (const k of Object.keys(map)) {
+      const n = map[k] && map[k].name;
+      if (n && squash(n) === typed) counts.set(n, (counts.get(n) || 0) + (Number(map[k].n) || 1));
+    }
+  }
+  if (!counts.size) return server;
+  const best = [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  if (best !== server) console.log('[hosted] server name corrected:', JSON.stringify(server), '->', JSON.stringify(best));
+  return best;
+}
+
 // result: done | send_failed | not_connected | unknown_server | ea_failed | timeout
 // access: which password the terminal logged in with — 'investor' (read-only,
 // what we ask for) or 'trading' (the master password). '' when unknown.
-async function report(workerId, { jobId, leaseId, result, sent, failed, openPositions, durationMs, detail, access, live }) {
+async function report(workerId, { jobId, leaseId, result, sent, failed, openPositions, durationMs, detail, access, live, server }) {
   const r = ref(String(jobId || ''));
   const snap = await r.get();
   if (!snap.exists) return { ok: true, gone: true };          // unlinked mid-run
@@ -323,6 +359,17 @@ async function report(workerId, { jobId, leaseId, result, sent, failed, openPosi
   sent = Math.max(0, Number(sent) || 0);
   const patch = { leaseUntil: 0, leaseId: null, lastRunAt: now, lastResult: String(result || ''), lastDurationMs: Number(durationMs) || null };
   let status = null;
+
+  // The worker logged in with another spelling of the stored server name
+  // ("FundedNext-Server 2" for "FundedNext-Server2"): keep the one MT5
+  // accepted. Only spacing/dash/case may differ, so it can't point elsewhere.
+  const fixedServer = (result === 'done' || result === 'send_failed') && server
+    && String(server) !== d.server && String(server).length <= 128 && squash(server) === squash(d.server)
+    ? String(server) : null;
+  if (fixedServer) {
+    patch.server = fixedServer;
+    console.log('[hosted]', jobId.slice(0, 8) + '…', 'server corrected:', JSON.stringify(d.server), '->', JSON.stringify(fixedServer));
+  }
 
   if (result === 'done') {
     patch.loginFails = 0; patch.workerFails = 0; patch.unknownServerRuns = 0; patch.everSynced = true; patch.lastSyncAt = now;
@@ -381,6 +428,7 @@ async function report(workerId, { jobId, leaseId, result, sent, failed, openPosi
       : { syncing: false, live: false };
   }
   await r.update(patch);
+  if (fixedServer) status = Object.assign(status || {}, { server: fixedServer });
   if (status) await mt5.setStatus(d.uid, status, d.accountKey);
   console.log(`[hosted] ${workerId} ${jobId.slice(0, 8)}… ${result} +${sent}${failed ? ' failed ' + failed : ''} in ${Math.round((Number(durationMs) || 0) / 1000)}s`);
   return { ok: true, nextDueAt: patch.dueAt };
