@@ -133,6 +133,22 @@ async function recheck(uid) {
     .map((d) => d.ref.update({ dueAt: now })));
 }
 
+// One-time healer for accounts the old code bricked on 'unknown_server'
+// (dueAt pushed to forever, loginFails maxed). Puts them back in the worker's
+// queue at boot so they get the retrying behaviour in report() below without
+// the user having to re-enter anything.
+async function healUnknownServer() {
+  try {
+    const snap = await store.db.collection(COL).where('lastResult', '==', 'unknown_server').get();
+    const now = Date.now();
+    let n = 0;
+    for (const doc of snap.docs) {
+      if ((doc.data().dueAt || 0) > now + 365 * 24 * 60 * MIN) { await doc.ref.update({ dueAt: now, loginFails: 0, unknownServerRuns: 1 }); n++; }
+    }
+    if (n) console.log('[hosted] re-queued', n, 'account(s) previously stuck on unknown_server');
+  } catch (e) { console.warn('[hosted] healUnknownServer:', e.message); }
+}
+
 // ── Worker side ────────────────────────────────────────────────────────────
 // Plan check per user, cached for one claim call. Auto-sync is Pro only: Pro
 // syncs up to three linked accounts (oldest first); Essential and a lapsed plan
@@ -258,9 +274,10 @@ function nextDue(d, now) {
 }
 
 const BAD_PASSWORD_MSG = 'The broker says this login or investor password is wrong. Check them in MT5 and connect again.';
-const UNKNOWN_SERVER_MSG = (server, near) => 'We could not find a broker server called "' + server + '". '
+const UNKNOWN_SERVER_MSG = (server, near) => 'We could not find a broker server called "' + server + '" in MT5’s directory yet. '
   + (near.length ? 'Did you mean ' + near.map((n) => '"' + n + '"').join(' or ') + '? ' : '')
-  + 'Copy the server name exactly as MT5 shows it (File → Login to Trade Account, e.g. "ICMarketsSC-MT5-2") and connect again.';
+  + 'Copy the server name exactly as MT5 shows it (File → Login to Trade Account, e.g. "ICMarketsSC-MT5-2") and connect again — '
+  + 'or, if the name is already exact (new prop-firm servers can take a while to appear in the directory), no action is needed: we keep checking every few hours and will connect as soon as it answers.';
 const UNREACHABLE_MSG = (server) => 'We cannot reach the broker server "' + server + '" right now. We will keep trying — no action needed.';
 
 // "Did you mean": servers other accounts have synced from, close to what the
@@ -308,19 +325,33 @@ async function report(workerId, { jobId, leaseId, result, sent, failed, openPosi
   let status = null;
 
   if (result === 'done') {
-    patch.loginFails = 0; patch.workerFails = 0; patch.everSynced = true; patch.lastSyncAt = now;
+    patch.loginFails = 0; patch.workerFails = 0; patch.unknownServerRuns = 0; patch.everSynced = true; patch.lastSyncAt = now;
     patch.openPositions = Math.max(0, Number(openPositions) || 0);
     if (sent > 0) patch.lastActivityAt = now;
     patch.dueAt = nextDue(Object.assign({}, d, patch), now);
     status = { status: 'connected', syncing: false, error: null, lastSyncAt: now, nextSyncAt: patch.dueAt, pausedReason: null, errorCode: null, lastSent: sent, live: !!live };
     if (access === 'trading' || access === 'investor') status.masterPassword = access === 'trading';
   } else if (result === 'unknown_server') {
-    // The worker searched MT5's broker directory and found no such server.
-    // Retrying won't help until the user fixes the name.
-    patch.loginFails = MAX_LOGIN_FAILS;
-    patch.dueAt = Number.MAX_SAFE_INTEGER;
-    const near = await suggestServers(d.server).catch(() => []);
-    status = { status: 'error', syncing: false, error: UNKNOWN_SERVER_MSG(d.server, near), errorCode: 'unknown_server', suggestions: near, live: false };
+    // The worker searched MT5's broker directory and found no such server. That
+    // is NOT proof the name is wrong: the directory download itself can fail
+    // mid-run, and brand-new prop-firm servers (FundedNext-Server2 and the
+    // like) often lag behind in MetaQuotes' public list. So never brick the
+    // account on this result: retry quietly first, tell the user from the
+    // second consecutive miss, and keep probing a few times a day — the moment
+    // the directory answers (or the glitch passes), the account heals itself
+    // with no action from the user. "Sync now" stays available throughout.
+    patch.unknownServerRuns = (d.unknownServerRuns || 0) + 1;
+    patch.loginFails = 0;
+    if (d.everSynced || patch.unknownServerRuns < 2) {
+      // A server this account has synced from exists — a miss is a directory
+      // glitch. Same for a first miss on a fresh link: quick quiet retry.
+      patch.dueAt = now + RETRY_EVERY;
+      status = { syncing: false, live: false };
+    } else {
+      patch.dueAt = now + Math.min(patch.unknownServerRuns, 6) * 60 * MIN;
+      const near = await suggestServers(d.server).catch(() => []);
+      status = { status: 'error', syncing: false, error: UNKNOWN_SERVER_MSG(d.server, near), errorCode: 'unknown_server', suggestions: near, live: false };
+    }
   } else if (result === 'not_connected' && detail === 'invalid_account') {
     // The broker answered and said no. A first link is almost always the
     // details, so say so at once; an account that has synced before gets a
@@ -355,4 +386,4 @@ async function report(workerId, { jobId, leaseId, result, sent, failed, openPosi
   return { ok: true, nextDueAt: patch.dueAt };
 }
 
-module.exports = { configured, link, unlink, syncNow, isHosted, recheck, claim, report, nextDue, noteWeekendTrades, weekendCloseAt, encrypt, decrypt, COL };
+module.exports = { configured, link, unlink, syncNow, isHosted, recheck, healUnknownServer, claim, report, nextDue, noteWeekendTrades, weekendCloseAt, encrypt, decrypt, COL };
