@@ -253,7 +253,7 @@ function positionOpenMs(d, openTsByPos, ordersByPos, closeMs) {
 }
 
 // Map one closed cTrader deal into the shared Firestore "trades" schema.
-function mapDeal(d, { uid, accountId, symbolMap, lotSizeMap, accountLabel, openTsByPos, ordersByPos }) {
+function mapDeal(d, { uid, accountId, symbolMap, lotSizeMap, accountLabel, openTsByPos, ordersByPos, isLive }) {
   const close = d.closePositionDetail || {};
   const moneyDigits = close.moneyDigits != null ? close.moneyDigits : (d.moneyDigits != null ? d.moneyDigits : 2);
   const pnl = money((close.grossProfit || 0) + (close.swap || 0) + (close.commission || 0), moneyDigits);
@@ -317,6 +317,12 @@ function mapDeal(d, { uid, accountId, symbolMap, lotSizeMap, accountLabel, openT
     source: 'ctrader_open_api',
     rr: '', notes: '', rules: '', psychology: '', model: '',
     accountId: String(accountId || ''),
+    // cTrader's own isLive flag for the account this deal came from (the deal was
+    // also pulled over the live / demo host to match). The Verified Track Record
+    // only counts live ones — see ctProof in ../connectors/ctrader.js.
+    ctid: String(accountId || ''),
+    brokerLive: !!isLive,
+    brokerEnv: isLive ? 'live' : 'demo',
     brokerName: 'cTrader',
     brokerAccount: accountLabel || String(accountId || ''),
     createdAt: Date.now(),
@@ -400,6 +406,12 @@ async function fetchAccountDeals(session, account, { uid, from, to }) {
   }
 
   const accountLabel = (account.brokerTitleShort ? account.brokerTitleShort + ' ' : '') + (account.traderLogin || ctid);
+  // Who the account belongs to (the broker / prop firm's own whitelabel name) —
+  // the track record uses it to tell a prop firm account from a plain demo.
+  let trader = {};
+  try { trader = ((await session.request(PT.TRADER_REQ, PT.TRADER_RES, { ctidTraderAccountId: ctid }, 12000)) || {}).trader || {}; }
+  catch (e) { console.warn('[ctrader] trader details failed for', ctid, '-', e.message); }
+  logAccountFields(account, trader);
   const MAX_ROWS = 1000;
   // cTrader caps ProtoOADealListReq to a 1-week range per request — so walk the
   // full [from,to] span in sub-1-week windows, paging within each window.
@@ -435,9 +447,24 @@ async function fetchAccountDeals(session, account, { uid, from, to }) {
   // Resolve each traded symbol's lotSize (needed to convert volume → real lots).
   const lotSizeMap = await ensureLotSizes(session, ctid, closingDeals.map((d) => d.symbolId));
   const ordersByPos = closingDeals.length ? await fetchOrdersByPosition(session, ctid, closingDeals, { from, to }) : {};
-  const out = closingDeals.map((d) => mapDeal(d, { uid, accountId: ctid, symbolMap, lotSizeMap, accountLabel, openTsByPos, ordersByPos }));
+  const out = closingDeals.map((d) => mapDeal(d, { uid, accountId: ctid, symbolMap, lotSizeMap, accountLabel, openTsByPos, ordersByPos, isLive: !!account.isLive }));
   console.log('[ctrader] account', ctid, '(' + accountLabel + '):', seen, 'deals seen,', out.length, 'closed trades mapped');
-  return { trades: out, accountLabel, ctid, isLive: !!account.isLive };
+  return { trades: out, accountLabel, ctid, isLive: !!account.isLive,
+    brokerName: String(trader.brokerName || ''), brokerTitle: String(account.brokerTitleShort || ''),
+    registeredAt: Number(trader.registrationTimestamp || 0) || null };
+}
+
+// cTrader marks its free prop trial / competition accounts with a "FREE" flag in
+// its own apps, but the Open API does not document one. Log what the API does
+// send for every demo-environment account (once per account per process, no
+// balances or tokens) so a real trial account shows how to tell it apart.
+const _fieldsLogged = new Set();
+function logAccountFields(account, trader) {
+  const id = String(account.ctidTraderAccountId);
+  if (account.isLive || _fieldsLogged.has(id)) return;
+  _fieldsLogged.add(id);
+  const skip = /balance|bonus|token|password/i, pick = (o) => Object.fromEntries(Object.entries(o || {}).filter(([k]) => !skip.test(k)));
+  try { console.log('[ctrader] demo-env account fields', id, JSON.stringify({ account: pick(account), trader: pick(trader) })); } catch (e) {}
 }
 
 // Top-level: discover accounts, then pull deals per account grouped by env host.
@@ -465,7 +492,7 @@ async function fetchClosedTrades({ uid, clientId, clientSecret, accessToken, fro
         try {
           const r = await fetchAccountDeals(session, acc, { uid, from, to });
           allTrades.push(...r.trades);
-          accountMeta.push({ accountId: String(r.ctid), label: r.accountLabel, live: r.isLive });
+          accountMeta.push({ accountId: String(r.ctid), label: r.accountLabel, live: r.isLive, brokerName: r.brokerName, brokerTitle: r.brokerTitle, registeredAt: r.registeredAt });
         } catch (e) {
           ok = false;
           console.error('ctrader account sync failed', acc.ctidTraderAccountId, '-', e.message);

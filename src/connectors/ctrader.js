@@ -127,6 +127,81 @@ async function ensureToken(uid) {
 // openTime is blank or equals the close time, so an open time the trader typed in
 // by hand is never overwritten. Nothing else on the trade is touched.
 const OPEN_TIME_FIX_V = 1;
+
+// ── Verified Track Record proof (server-only collections) ──────────────────
+// A trade doc lives where the trader can edit it, so the track record does not
+// take its word for "live". Every closed deal this sync pulls is also recorded
+// in ctProof/{du}__{ticket} = { live, ctid, pnl } — live is cTrader's own
+// isLive flag for the account it came from — and the token's accounts in
+// ctAccounts/{du}. Both are written by this server only (no client rule allows
+// them), and src/trackrecord.js counts a cTrader trade only when its proof says
+// live and the P&L still matches. PROOF_V bumps re-pull a year of history once
+// so trades imported before this existed get their proof too.
+const PROOF_V = 1;
+
+// Which cTrader accounts count for the Verified Track Record:
+//   live  — a real-money account (cTrader isLive)                       → counts
+//   prop  — cTrader demo environment at a recognised prop firm (paid
+//           challenge, verification or funded account — prop firms run
+//           simulated accounts, so they are demo-hosted by design)       → counts
+//   trial — anything whose broker name, account label or deposit notes say
+//           free trial / competition / contest / giveaway                → never
+//   demo  — any other demo-environment account                          → never
+// cTrader's own "FREE" trial flag is not in the Open API, so trials are caught
+// by name and deposit notes; ctraderOpenApi logs each demo-env account's raw
+// fields so a real trial can show a sharper signal. Extra prop firms can be
+// added without a deploy: CTRADER_PROP_FIRMS="Firm One,Firm Two".
+const PROP_FIRMS = ['ftmo', 'fundednext', 'the5ers', '5ers', 'fundingpips', 'alphacapital', 'pipfarm', 'aquafunded',
+  'thetradingpit', 'tradingpit', 'instantfunding', 'visiontrade', 'funderpro', 'goatfunded', 'larkfunding', 'onefunded',
+  'tfunded', 'thefundedtrader', 'audacitycapital', 'audacityfx', 'mentfunding'];
+const squash = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+function propFirms() { return PROP_FIRMS.concat(String(process.env.CTRADER_PROP_FIRMS || '').split(',').map(squash).filter((x) => x.length >= 3)); }
+const NOT_REAL = /\b(free|trial|competitions?|contests?|tournaments?|giveaways?|demo\s*contest|practice)\b/i;
+function classifyAccount(a) {
+  const text = [a.brokerName, a.brokerTitle, a.label].filter(Boolean).join(' ');
+  const sq = squash(text);
+  const firm = propFirms().find((f) => sq.includes(f)) || '';
+  if (NOT_REAL.test(text) || a.trialHint) return { kind: 'trial', firm };
+  if (a.live) return { kind: 'live', firm };
+  if (firm) return { kind: 'prop', firm };
+  return { kind: 'demo', firm: '' };
+}
+const PROOF_BACKFILL_DAYS = 365;
+const _proofSeen = new Map();   // key -> "live|pnl" already written by this process
+const proofKey = (uid, ticket) => uid + '__' + String(ticket).replace(/[^A-Za-z0-9_-]/g, '_');
+async function saveProofs(uid, trades, accounts, ok) {
+  // Keep an account's trial mark from deposit notes (syncCash) across deal syncs.
+  let prevAcc = {};
+  try { const p = await store.db.collection('ctAccounts').doc(uid).get(); prevAcc = (p.exists && p.data().accounts) || {}; } catch (e) {}
+  const kindOf = {}, map = {};
+  (accounts || []).forEach((a) => {
+    const id = String(a.accountId), prev = prevAcc[id] || {};
+    const c = classifyAccount({ live: a.live, brokerName: a.brokerName, brokerTitle: a.brokerTitle, label: a.label, trialHint: prev.trialHint });
+    kindOf[id] = c.kind;
+    map[id] = { label: a.label || '', live: !!a.live, kind: c.kind, firm: c.firm, brokerName: a.brokerName || '', brokerTitle: a.brokerTitle || '',
+      trialHint: !!prev.trialHint, registeredAt: a.registeredAt || null, at: Date.now() };
+  });
+  let batch = store.db.batch(), inBatch = 0, n = 0;
+  for (const tr of trades) {
+    if (!tr.ticket) continue;
+    const key = proofKey(uid, tr.ticket), sig = (tr.brokerLive ? 1 : 0) + '|' + tr.pnl;
+    if (_proofSeen.get(key) === sig) continue;
+    batch.set(store.db.collection('ctProof').doc(key), {
+      du: uid, ticket: String(tr.ticket), ctid: String(tr.ctid || ''), live: !!tr.brokerLive, kind: kindOf[String(tr.ctid || '')] || (tr.brokerLive ? 'live' : 'demo'),
+      pnl: Number(tr.pnl) || 0, closeTime: tr.closeTime || null, account: tr.brokerAccount || '', at: Date.now(),
+    });
+    _proofSeen.set(key, sig); n++;
+    if (++inBatch >= 400) { await batch.commit(); batch = store.db.batch(); inBatch = 0; }
+  }
+  if (inBatch) await batch.commit();
+  if (_proofSeen.size > 200000) _proofSeen.clear();
+  if (accounts && accounts.length) {
+    // A complete pull replaces the list (accounts removed from the token drop off);
+    // a partial one only adds to it.
+    await store.db.collection('ctAccounts').doc(uid).set({ accounts: map, at: Date.now() }, { merge: !ok });
+  }
+  return n;
+}
 function toMs(v) {
   if (v == null || v === '') return NaN;
   if (typeof v === 'number') return v > 1e12 ? v : v * 1000;
@@ -167,10 +242,13 @@ async function syncUser(uid, { backfill, journalAccountId } = {}) {
   // One-off: re-pull the 90-day history so trades imported before the open-time
   // fix get their real open time (see repairOpenTimes).
   const needTimeFix = status.openTimeFixV !== OPEN_TIME_FIX_V;
-  const doBackfill = backfill || status.backfillDone !== true || needTimeFix;
-  const from = doBackfill
-    ? now - 90 * 86400000
-    : Math.max(Number(status.lastDealSyncAt || 0), now - 7 * 86400000);
+  const needProof = status.ctProofV !== PROOF_V;
+  const doBackfill = backfill || status.backfillDone !== true || needTimeFix || needProof;
+  const from = needProof
+    ? now - PROOF_BACKFILL_DAYS * 86400000
+    : doBackfill
+      ? now - 90 * 86400000
+      : Math.max(Number(status.lastDealSyncAt || 0), now - 7 * 86400000);
 
   const { accounts, trades, ok } = await engine.fetchClosedTrades({
     uid, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, accessToken: t.accessToken, from, to: now,
@@ -179,6 +257,12 @@ async function syncUser(uid, { backfill, journalAccountId } = {}) {
   // All cTrader trades are tagged with the chosen journal profile so the frontend's
   // per-account filter shows them (the cTrader account number stays in brokerAccount).
   trades.forEach((tr) => { tr.accountId = jid; });
+
+  // Proof first (every deal pulled, new or already journaled) — the track record's
+  // live / demo source of truth.
+  let proofs = 0;
+  try { proofs = await saveProofs(uid, trades, accounts, ok); }
+  catch (e) { console.warn('ctrader: proof write failed for', uid, '-', e.message); }
 
   const existing = await store.existingTickets(uid, 'ctrader_open_api', jid);
   const fresh = trades.filter((tr) => !existing.has(String(tr.ticket)));
@@ -203,12 +287,14 @@ async function syncUser(uid, { backfill, journalAccountId } = {}) {
     patch.lastDealSyncAt = now - 60000;
     if (doBackfill) patch.backfillDone = true;
     if (needTimeFix) patch.openTimeFixV = OPEN_TIME_FIX_V;
+    if (needProof) patch.ctProofV = PROOF_V;
   }
   await setStatus(uid, patch);
   // Deposits / withdrawals ride along, at most every 30 minutes (first time: a year back).
   try { await syncCash(uid, { jid, status }); }
   catch (e) { console.warn('ctrader: cash flow sync failed for', uid, '-', e.message); }
   if (repaired) console.log('ctrader: fixed open time on', repaired, 'existing trade(s) for', uid);
+  if (proofs) console.log('ctrader: recorded', proofs, 'track-record proof(s) for', uid);
   if (written) console.log('ctrader: wrote', written, 'new trade(s) for', uid, 'profile', jid || '(default)');
   else if (!ok) console.log('ctrader: sync incomplete for', uid, '— will retry on next poll');
   return written;
@@ -232,6 +318,17 @@ async function syncCash(uid, { jid, status, force } = {}) {
       ts: it.ts, note: it.note, balance: it.balance, brokerAccount: it.label };
   });
   const n = await cashflows.writeCash(docs);
+  // A free trial / competition account often says so in its funding note.
+  const hinted = [...new Set(r.items.filter((it) => NOT_REAL.test(String(it.note || ''))).map((it) => String(it.ctid)))];
+  if (hinted.length) {
+    try {
+      const ref = store.db.collection('ctAccounts').doc(uid), cur = await ref.get();
+      const accs = (cur.exists && cur.data().accounts) || {};
+      const patch = {};
+      hinted.forEach((id) => { const a = accs[id] || {}; if (!a.trialHint) patch[id] = Object.assign({}, a, { trialHint: true, kind: 'trial' }); });
+      if (Object.keys(patch).length) { await ref.set({ accounts: patch }, { merge: true }); console.log('ctrader: marked', Object.keys(patch).length, 'account(s) as trial / competition from deposit notes for', uid); }
+    } catch (e) { console.warn('ctrader: trial hint failed for', uid, '-', e.message); }
+  }
   const balances = {};
   (r.accounts || []).forEach((a) => { if (a.balance != null) balances[a.ctid] = { balance: a.balance, label: a.label, live: a.live, at: now }; });
   const patch = { cashBalances: balances };
@@ -352,4 +449,4 @@ async function getPositions(uid) {
   return list;
 }
 
-module.exports = { init, configured, createAuthUrl, handleCallback, disconnect, syncUser, syncCash, friendlyError, getBars, getPositions };
+module.exports = { init, configured, createAuthUrl, handleCallback, disconnect, syncUser, syncCash, friendlyError, getBars, getPositions, classifyAccount };
