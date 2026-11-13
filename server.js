@@ -81,6 +81,32 @@ mt5.init();
 ctrader.init();
 // onDeplete is injected rather than required, so tokens.js does not have to
 // require mt5sync.js (which would be a cycle via store).
+// MT5_ENGINE=hosted sends new links to our own worker (src/hostedSync.js) AND
+// retires the MetaApi engine: legacy MetaApi-linked accounts are never resumed,
+// pulled or re-deployed again, so MetaApi's own failures (expired subscription,
+// "balance is not enough", quota errors) can no longer surface to users. Those
+// accounts keep every imported trade and show one clear ask instead: reconnect
+// once, which routes them through the hosted worker.
+const HOSTED_ENGINE = String(process.env.MT5_ENGINE || '').trim().toLowerCase() === 'hosted';
+const RELINK_HOSTED_MSG = 'MT5 sync has moved to ETW’s own sync engine. Reconnect this account once — login, investor (read-only) password and server — and syncing resumes automatically. Your imported trades are safe.';
+// true = this account is a legacy MetaApi link and has been retired (caller must
+// NOT touch MetaApi for it). Hosted accounts and non-hosted mode return false.
+async function retireIfMetaApi(uid, accountKey) {
+  if (!HOSTED_ENGINE) return false;
+  try {
+    const d = await db.collection('users').doc(uid).get();
+    const data = d.exists ? d.data() : {};
+    const acc = (data.mt5DirectAccounts || {})[accountKey]
+      || ((((data.mt5Direct || {}).accountKey) || 'legacy') === accountKey ? data.mt5Direct : null);
+    if (!acc || hosted.isHosted(acc)) return false;
+    if (acc.errorCode !== 'relink_hosted') {
+      await mt5.stopSync(uid, { undeploy: true, accountKey }).catch(() => {});
+      await mt5.setStatus(uid, { status: 'error', error: RELINK_HOSTED_MSG, errorCode: 'relink_hosted', syncing: false }, accountKey).catch(() => {});
+      console.log('[mt5] retired MetaApi account', uid, accountKey, '-> relink_hosted');
+    }
+    return true;
+  } catch (e) { return false; }
+}
 tokens.init({
   onDeplete: async (uid) => {
     await mt5.stopSync(uid, { undeploy: true }).catch(() => {});
@@ -92,11 +118,13 @@ tokens.init({
   // scheduled pull checks the plan first, so Essential accounts that were linked
   // before the change never sync again until the user upgrades to Pro.
   onResume: async (uid, accountKey) => {
+    if (await retireIfMetaApi(uid, accountKey)) return;
     const g = await directPlanGate(uid);
     if (g === 'pro') return mt5.resumeOne(uid, accountKey);
     if (g === 'locked') await holdDirectForPro(uid, accountKey);
   },
   onPull:   async (uid, accountKey) => {
+    if (await retireIfMetaApi(uid, accountKey)) return;
     const g = await directPlanGate(uid);
     if (g === 'pro') return mt5.pullOnce(uid, accountKey);
     if (g === 'locked') await holdDirectForPro(uid, accountKey);
@@ -197,6 +225,7 @@ async function releaseDirectForPro(uid) {
     let keys = Object.keys(accs).filter((k) => accs[k] && accs[k].status === 'pro_required' && !hosted.isHosted(accs[k]));
     if (!keys.length && data.mt5Direct && data.mt5Direct.status === 'pro_required' && !hosted.isHosted(data.mt5Direct)) keys = [data.mt5Direct.accountKey || 'legacy'];
     for (const k of keys) {
+      if (await retireIfMetaApi(uid, k)) continue;
       await mt5.setStatus(uid, { status: 'connecting', error: null }, k).catch(() => {});
       mt5.resumeOne(uid, k)
         .then(() => mt5.setStatus(uid, { status: 'connected', error: null }, k).catch(() => {}))
@@ -418,10 +447,9 @@ async function requireUltra(req, res, next) {
 }
 
 // ── MT5 / MT4 ──────────────────────────────────────────────
-// MT5_ENGINE=hosted sends new links to our own worker (src/hostedSync.js) instead
-// of MetaApi. Hosted sync is on every plan (Essential 1 account, Pro 3); MetaApi
-// stays Pro-only. Accounts already on MetaApi keep running until re-linked.
-const HOSTED_ENGINE = String(process.env.MT5_ENGINE || '').trim().toLowerCase() === 'hosted';
+// HOSTED_ENGINE (defined above, next to retireIfMetaApi) sends new links to our
+// own worker (src/hostedSync.js) instead of MetaApi, and retires legacy MetaApi
+// accounts the moment anything would touch them.
 // Auto-sync is a Pro feature on both engines (admin decision 2026-10-26).
 const requireDirectPlan = requirePro;
 
@@ -562,7 +590,7 @@ app.post('/api/mt5-direct/mode', authLimiter, requireAuth, withSpace, requirePro
 
     // Only reshape the connection if one exists. Switching while disconnected
     // just records the preference for the next connect.
-    if (d.status === 'paused') mt5.resumeOne(req.duid, accountKey).catch((e) => console.error('mode resume:', e.message));
+    if (d.status === 'paused' && !(await retireIfMetaApi(req.duid, accountKey))) mt5.resumeOne(req.duid, accountKey).catch((e) => console.error('mode resume:', e.message));
     res.json({ ok: true, mode });
   } catch (e) {
     console.error('mt5 mode:', e.message);
@@ -2881,7 +2909,12 @@ const port = process.env.PORT || 8080;
 app.listen(port, () => {
   console.log('etw-sync-backend listening on :' + port);
 tokens.startMeter();
-mt5.resumeAll();
+// Hosted engine: never re-deploy MetaApi accounts at boot — deploying is what
+// makes MetaApi bill (and fail with its own balance/subscription errors).
+if (HOSTED_ENGINE) {
+  console.log('[mt5] hosted engine on — MetaApi boot resume skipped; legacy accounts retire on first touch');
+  setTimeout(() => { hosted.healUnknownServer().catch(() => {}); }, 8000);
+} else mt5.resumeAll();
 // 2FA retired: remove leftover 2FA claims/flags from every account (see backfillMfaClaims).
 setTimeout(() => { backfillMfaClaims().catch(() => {}); }, 3000);
 // Essential users linked MT5 Direct before it moved to Pro: stop them right after
