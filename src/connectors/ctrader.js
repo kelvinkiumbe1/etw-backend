@@ -135,8 +135,8 @@ const OPEN_TIME_FIX_V = 1;
 // isLive flag for the account it came from — and the token's accounts in
 // ctAccounts/{du}. Both are written by this server only (no client rule allows
 // them), and src/trackrecord.js counts a cTrader trade only when its proof says
-// live and the P&L still matches. PROOF_V bumps re-pull a year of history once
-// so trades imported before this existed get their proof too.
+// live and the P&L still matches. proofPass() (below) builds proofs for history
+// imported before this existed, a step at a time; bumping PROOF_V redoes it.
 const PROOF_V = 1;
 
 // Which cTrader accounts count for the Verified Track Record:
@@ -169,37 +169,80 @@ function classifyAccount(a) {
 const PROOF_BACKFILL_DAYS = 365;
 const _proofSeen = new Map();   // key -> "live|pnl" already written by this process
 const proofKey = (uid, ticket) => uid + '__' + String(ticket).replace(/[^A-Za-z0-9_-]/g, '_');
-async function saveProofs(uid, trades, accounts, ok) {
-  // Keep an account's trial mark from deposit notes (syncCash) across deal syncs.
+// Accounts on the token → ctAccounts/{du}.accounts, classified. Keeps a trial
+// mark from deposit notes. A complete list replaces the old one; a partial one
+// only adds. Other fields of the doc (the proof cursor) are left alone.
+async function writeAccounts(uid, accounts, complete) {
+  const ref = store.db.collection('ctAccounts').doc(uid);
   let prevAcc = {};
-  try { const p = await store.db.collection('ctAccounts').doc(uid).get(); prevAcc = (p.exists && p.data().accounts) || {}; } catch (e) {}
-  const kindOf = {}, map = {};
+  try { const p = await ref.get(); prevAcc = (p.exists && p.data().accounts) || {}; } catch (e) {}
+  const kindOf = {}, map = complete ? {} : Object.assign({}, prevAcc);
   (accounts || []).forEach((a) => {
     const id = String(a.accountId), prev = prevAcc[id] || {};
-    const c = classifyAccount({ live: a.live, brokerName: a.brokerName, brokerTitle: a.brokerTitle, label: a.label, trialHint: prev.trialHint });
+    const c = classifyAccount({ live: a.live, brokerName: a.brokerName || prev.brokerName, brokerTitle: a.brokerTitle || prev.brokerTitle, label: a.label, trialHint: prev.trialHint });
     kindOf[id] = c.kind;
-    map[id] = { label: a.label || '', live: !!a.live, kind: c.kind, firm: c.firm, brokerName: a.brokerName || '', brokerTitle: a.brokerTitle || '',
-      trialHint: !!prev.trialHint, registeredAt: a.registeredAt || null, at: Date.now() };
+    map[id] = { label: a.label || prev.label || '', live: !!a.live, kind: c.kind, firm: c.firm, brokerName: a.brokerName || prev.brokerName || '', brokerTitle: a.brokerTitle || prev.brokerTitle || '',
+      trialHint: !!prev.trialHint, registeredAt: a.registeredAt || prev.registeredAt || null, at: Date.now() };
   });
+  if (accounts && accounts.length) await ref.set({ accounts: map, at: Date.now() }, { mergeFields: ['accounts', 'at'] });
+  Object.keys(prevAcc).forEach((id) => { if (!kindOf[id] && prevAcc[id].kind) kindOf[id] = prevAcc[id].kind; });
+  return kindOf;
+}
+// items: { ticket, ctid, live, pnl, closeTime, account }
+async function writeProofs(uid, items, kindOf) {
   let batch = store.db.batch(), inBatch = 0, n = 0;
-  for (const tr of trades) {
-    if (!tr.ticket) continue;
-    const key = proofKey(uid, tr.ticket), sig = (tr.brokerLive ? 1 : 0) + '|' + tr.pnl;
+  for (const it of items) {
+    if (!it.ticket) continue;
+    const key = proofKey(uid, it.ticket), sig = (it.live ? 1 : 0) + '|' + it.pnl;
     if (_proofSeen.get(key) === sig) continue;
     batch.set(store.db.collection('ctProof').doc(key), {
-      du: uid, ticket: String(tr.ticket), ctid: String(tr.ctid || ''), live: !!tr.brokerLive, kind: kindOf[String(tr.ctid || '')] || (tr.brokerLive ? 'live' : 'demo'),
-      pnl: Number(tr.pnl) || 0, closeTime: tr.closeTime || null, account: tr.brokerAccount || '', at: Date.now(),
+      du: uid, ticket: String(it.ticket), ctid: String(it.ctid || ''), live: !!it.live, kind: (kindOf && kindOf[String(it.ctid || '')]) || (it.live ? 'live' : 'demo'),
+      pnl: Number(it.pnl) || 0, closeTime: it.closeTime || null, account: it.account || '', at: Date.now(),
     });
     _proofSeen.set(key, sig); n++;
     if (++inBatch >= 400) { await batch.commit(); batch = store.db.batch(); inBatch = 0; }
   }
   if (inBatch) await batch.commit();
   if (_proofSeen.size > 200000) _proofSeen.clear();
-  if (accounts && accounts.length) {
-    // A complete pull replaces the list (accounts removed from the token drop off);
-    // a partial one only adds to it.
-    await store.db.collection('ctAccounts').doc(uid).set({ accounts: map, at: Date.now() }, { merge: !ok });
+  return n;
+}
+// Proofs for the trades a normal sync just pulled.
+async function saveProofs(uid, trades, accounts, ok) {
+  const kindOf = await writeAccounts(uid, accounts, ok);
+  return writeProofs(uid, trades.map((tr) => ({ ticket: tr.ticket, ctid: tr.ctid, live: tr.brokerLive, pnl: tr.pnl, closeTime: tr.closeTime, account: tr.brokerAccount })), kindOf);
+}
+
+// The proof pass: separate from the trade sync and light (cTrader's deal list
+// only — no order history, symbols or lot sizes). It walks back through a year
+// of history 12 weeks per sync, keeping its place in ctAccounts/{du}, so a
+// timeout or rate limit only costs one step, never the whole backfill. Once
+// done it re-checks the last 8 days every sync, and starts over if an account
+// it has not seen appears on the token.
+const PROOF_STEP = 12 * 7 * 86400000;
+async function proofPass(uid) {
+  if (!configured()) return 0;
+  const ref = store.db.collection('ctAccounts').doc(uid);
+  const snap = await ref.get();
+  const st = (snap.exists && snap.data()) || {};
+  const now = Date.now(), horizon = now - PROOF_BACKFILL_DAYS * 86400000;
+  const done = st.proofDone === true && st.proofV === PROOF_V;
+  const to = done ? now : Math.min(Number(st.proofCursor) || now, now);
+  const from = done ? now - 8 * 86400000 : Math.max(horizon, to - PROOF_STEP);
+  const t = await ensureToken(uid);
+  const r = await engine.fetchDealProofs({ clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, accessToken: t.accessToken, from, to });
+  const kindOf = r.accounts.length ? await writeAccounts(uid, r.accounts, r.ok) : {};
+  const n = await writeProofs(uid, r.deals, kindOf);
+  const seen = r.accounts.map((a) => String(a.accountId));
+  const patch = {};
+  if (r.ok) {
+    if (!done) { patch.proofCursor = from; if (from <= horizon) { patch.proofDone = true; patch.proofV = PROOF_V; } else patch.proofDone = false; }
+    const known = new Set((st.proofCtids || []).map(String));
+    if (done && seen.some((id) => !known.has(id))) { patch.proofDone = false; patch.proofCursor = now; }   // new account: backfill it too
+    patch.proofCtids = [...new Set([...known, ...seen])];
   }
+  patch.proofAt = now;
+  await ref.set(patch, { merge: true });
+  console.log('ctrader: proof pass for', uid, new Date(from).toISOString().slice(0, 10), '→', new Date(to).toISOString().slice(0, 10) + ':', r.deals.length, 'deal(s),', n, 'new proof(s)' + (r.ok ? '' : ' — incomplete, will retry this step') + (patch.proofDone ? ' — backfill complete' : ''));
   return n;
 }
 function toMs(v) {
@@ -242,13 +285,10 @@ async function syncUser(uid, { backfill, journalAccountId } = {}) {
   // One-off: re-pull the 90-day history so trades imported before the open-time
   // fix get their real open time (see repairOpenTimes).
   const needTimeFix = status.openTimeFixV !== OPEN_TIME_FIX_V;
-  const needProof = status.ctProofV !== PROOF_V;
-  const doBackfill = backfill || status.backfillDone !== true || needTimeFix || needProof;
-  const from = needProof
-    ? now - PROOF_BACKFILL_DAYS * 86400000
-    : doBackfill
-      ? now - 90 * 86400000
-      : Math.max(Number(status.lastDealSyncAt || 0), now - 7 * 86400000);
+  const doBackfill = backfill || status.backfillDone !== true || needTimeFix;
+  const from = doBackfill
+    ? now - 90 * 86400000
+    : Math.max(Number(status.lastDealSyncAt || 0), now - 7 * 86400000);
 
   const { accounts, trades, ok } = await engine.fetchClosedTrades({
     uid, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, accessToken: t.accessToken, from, to: now,
@@ -287,7 +327,6 @@ async function syncUser(uid, { backfill, journalAccountId } = {}) {
     patch.lastDealSyncAt = now - 60000;
     if (doBackfill) patch.backfillDone = true;
     if (needTimeFix) patch.openTimeFixV = OPEN_TIME_FIX_V;
-    if (needProof) patch.ctProofV = PROOF_V;
   }
   await setStatus(uid, patch);
   // Deposits / withdrawals ride along, at most every 30 minutes (first time: a year back).
@@ -353,7 +392,7 @@ async function handleCallback(code, state) {
   syncUser(uid, { backfill: true, journalAccountId }).catch(async (e) => {
     console.error('ctrader initial sync failed for', uid, '-', e.message);
     await setStatus(uid, { status: 'error', error: friendlyError(e) }).catch(() => {});
-  });
+  }).then(() => proofPass(uid)).catch((e) => console.warn('ctrader: proof pass failed for', uid, '-', e.message));
   return uid;
 }
 
@@ -368,6 +407,9 @@ async function pollAll() {
   for (const doc of snap.docs) {
     try { await syncUser(doc.id); }
     catch (e) { console.error('ctrader poll sync failed for', doc.id, '-', e.message); }
+    // Runs even when the trade sync failed, so verification never waits on it.
+    try { await proofPass(doc.id); }
+    catch (e) { console.warn('ctrader: proof pass failed for', doc.id, '-', e.message); }
   }
 }
 
@@ -449,4 +491,4 @@ async function getPositions(uid) {
   return list;
 }
 
-module.exports = { init, configured, createAuthUrl, handleCallback, disconnect, syncUser, syncCash, friendlyError, getBars, getPositions, classifyAccount };
+module.exports = { init, configured, createAuthUrl, handleCallback, disconnect, syncUser, syncCash, friendlyError, getBars, getPositions, classifyAccount, proofPass };

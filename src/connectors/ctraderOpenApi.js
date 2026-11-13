@@ -678,4 +678,62 @@ async function fetchCashFlows({ clientId, clientSecret, accessToken, from, to })
   return { ok, items, accounts: meta };
 }
 
-module.exports = { fetchClosedTrades, discoverAccounts, mapDeal, fetchTrendbars, levelsFromOrders, fetchOpenPositions, fetchCashFlows, PT };
+// ── Verified Track Record proofs: closing deals only, nothing else ──────────
+// Same ticket and P&L arithmetic as mapDeal, so a proof matches the trade the
+// sync stored. One request per week per account (plus paging), through the
+// app-wide throttle. ok=false if any account or week failed.
+async function fetchDealProofs({ clientId, clientSecret, accessToken, from, to }) {
+  const accounts = await discoverAccounts({ clientId, clientSecret, accessToken });
+  if (!accounts.length) return { ok: false, accounts: [], deals: [] };
+  const byEnv = { live: [], demo: [] };
+  for (const a of accounts) (a.isLive ? byEnv.live : byEnv.demo).push(a);
+  const meta = [], deals = [];
+  let ok = true;
+  const WINDOW = 7 * 24 * 60 * 60 * 1000 - 3600000, MAX_ROWS = 1000;
+  for (const env of ['live', 'demo']) {
+    if (!byEnv[env].length) continue;
+    const session = new CtSession(env);
+    try {
+      await session.open();
+      await session.appAuth(clientId, clientSecret);
+      for (const acc of byEnv[env]) {
+        const ctid = Number(acc.ctidTraderAccountId), live = !!acc.isLive;
+        const label = (acc.brokerTitleShort ? acc.brokerTitleShort + ' ' : '') + (acc.traderLogin || ctid);
+        try {
+          session.send(PT.ACCOUNT_AUTH_REQ, { ctidTraderAccountId: ctid, accessToken });
+          await session.wait(PT.ACCOUNT_AUTH_RES);
+          let trader = {};
+          try { trader = ((await session.request(PT.TRADER_REQ, PT.TRADER_RES, { ctidTraderAccountId: ctid }, 12000)) || {}).trader || {}; } catch (e) {}
+          logAccountFields(acc, trader);
+          meta.push({ accountId: String(ctid), label, live, brokerName: String(trader.brokerName || ''), brokerTitle: String(acc.brokerTitleShort || ''), registeredAt: Number(trader.registrationTimestamp || 0) || null });
+          for (let ws = from; ws < to; ) {
+            const we = Math.min(ws + WINDOW, to);
+            let cursor = ws;
+            for (let page = 0; page < 20; page++) {
+              const res = await throttledDealList(session, { ctidTraderAccountId: ctid, fromTimestamp: cursor, toTimestamp: we, maxRows: MAX_ROWS });
+              const all = res.deal || [];
+              for (const d of all) {
+                const close = d.closePositionDetail; if (!close) continue;
+                const md = close.moneyDigits != null ? close.moneyDigits : (d.moneyDigits != null ? d.moneyDigits : 2);
+                const ts = Number(d.executionTimestamp || d.createTimestamp || 0);
+                deals.push({ ctid: String(ctid), live, account: label,
+                  ticket: String(d.dealId != null ? d.dealId : (d.orderId || d.positionId || ts)),
+                  pnl: r2(money((close.grossProfit || 0) + (close.swap || 0) + (close.commission || 0), md)),
+                  closeTime: ts ? new Date(ts).toISOString() : null });
+              }
+              if (all.length < MAX_ROWS) break;
+              const maxTs = all.reduce((m, d) => Math.max(m, Number(d.executionTimestamp || d.createTimestamp || 0)), cursor);
+              if (maxTs <= cursor) break;
+              cursor = maxTs + 1;
+            }
+            ws = we;
+          }
+        } catch (e) { ok = false; console.warn('[ctrader] proof deals failed for', ctid, '-', e.message); }
+      }
+    } catch (e) { ok = false; console.warn('[ctrader] proof session', env, '-', e.message); }
+    finally { session.close(); }
+  }
+  return { ok, accounts: meta, deals };
+}
+
+module.exports = { fetchClosedTrades, discoverAccounts, mapDeal, fetchTrendbars, levelsFromOrders, fetchOpenPositions, fetchCashFlows, fetchDealProofs, PT };
