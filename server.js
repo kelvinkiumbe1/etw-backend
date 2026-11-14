@@ -453,6 +453,45 @@ async function requireUltra(req, res, next) {
 // Auto-sync is a Pro feature on both engines (admin decision 2026-10-26).
 const requireDirectPlan = requirePro;
 
+// Accounts in this journal account (other than the one being linked now) that
+// never completed a sync: no lastSyncAt on their status, never on MetaApi, and
+// their hosted record (if any) never synced. They are unlinked from the hosted
+// worker, removed from the account list and their period slot is given back.
+// Anything that ever synced keeps counting, so this can't be used to swap
+// working accounts within a period.
+async function freeFailedMt5Attempts(uid, keepKey, periodKey) {
+  const ref = db.collection('users').doc(uid);
+  const snap = await ref.get();
+  if (!snap.exists) return [];
+  const data = snap.data() || {};
+  const accounts = data.mt5DirectAccounts || {};
+  const freed = [];
+  for (const key of Object.keys(accounts)) {
+    if (key === keepKey) continue;
+    const a = accounts[key] || {};
+    if (a.lastSyncAt || a.metaApiAccountId || a.status === 'connected' || a.status === 'paused') continue;
+    const h = await db.collection(hosted.COL).doc(uid + '_' + key).get().catch(() => null);
+    if (h && h.exists && (h.data() || {}).everSynced) continue;
+    await hosted.unlink(uid, key).catch((e) => console.warn('[mt5] unlink failed attempt:', e.message));
+    freed.push(key);
+  }
+  if (!freed.length) return freed;
+  await db.runTransaction(async (tx) => {
+    const cur = await tx.get(ref);
+    const d = (cur.exists && cur.data()) || {};
+    const usage = d.mt5DirectPeriod || {};
+    const updates = [];
+    freed.forEach((k) => updates.push(new admin.firestore.FieldPath('mt5DirectAccounts', k), admin.firestore.FieldValue.delete()));
+    if (usage.periodKey === periodKey && Array.isArray(usage.accountKeys)) {
+      updates.push('mt5DirectPeriod.accountKeys', usage.accountKeys.filter((k) => !freed.includes(k)), 'mt5DirectPeriod.updatedAt', Date.now());
+    }
+    if (d.mt5Direct && freed.includes(d.mt5Direct.accountKey)) updates.push('mt5Direct', admin.firestore.FieldValue.delete());
+    tx.update(ref, ...updates);
+  });
+  console.log('[mt5] freed', freed.length, 'never-synced attempt(s) for', uid);
+  return freed;
+}
+
 app.post('/api/mt5-direct/connect', authLimiter, requireAuth, withSpace, requireDirectPlan, async (req, res) => {
   const { login, password, server, platform, journalAccountId } = req.body || {};
   if (!login || !password || !server) return res.status(400).json({ error: 'login, password and server are required' });
@@ -467,6 +506,11 @@ app.post('/api/mt5-direct/connect', authLimiter, requireAuth, withSpace, require
     .update(String(platform || 'mt5') + '|' + String(login) + '|' + String(server).toLowerCase()).digest('hex').slice(0, 32);
   const accountLimit = 1;
   const periodKey = String(req.access.expiresAt || req.access.periodStart || req.access.plan || 'active');
+  // A previous attempt that never synced (wrong server name, wrong password,
+  // broker unreachable…) is not a used account: free it so the trader can retry
+  // with corrected details instead of hitting "1 new MT5 account per period".
+  try { await freeFailedMt5Attempts(req.duid, accountKey, periodKey); }
+  catch (e) { console.warn('[mt5] free failed attempts:', e.message); }
   let reservation;
   try {
     reservation = await mt5.reserveAccount(req.duid, accountKey, {
