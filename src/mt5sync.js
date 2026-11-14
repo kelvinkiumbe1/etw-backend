@@ -36,47 +36,38 @@ async function setStatus(uid, patch, accountKey) {
   }, { merge: true });
 }
 
+// Claim this account in the journal account. There is no per-period quota:
+// a trader can retry with corrected details as often as they need. The only
+// rule is one WORKING MT5 / MT4 account per journal account — a different
+// account is refused only while another one is connected, paused (weekend),
+// or still connecting after having synced before. Failed or never-synced
+// attempts never block. (limit / periodKey kept for the caller's signature.)
 async function reserveAccount(uid, accountKey, patch, limit, periodKey) {
   const ref = store.db.collection('users').doc(uid);
   return store.db.runTransaction(async (tx) => {
     const snap = await tx.get(ref);
     const data = snap.exists ? snap.data() : {};
-    const usage = data.mt5DirectPeriod || {};
-    const period = usage.periodKey === periodKey
-      ? usage
-      : { periodKey, accountKeys: [] };
-    const usedKeys = Array.isArray(period.accountKeys) ? period.accountKeys : [];
-    if (!usedKeys.includes(accountKey) && usedKeys.length >= limit) {
-      const e = new Error('Your plan allows ' + limit + ' new MT5 account' + (limit === 1 ? '' : 's') + ' per subscription period.');
-      e.code = 'mt5_period_limit';
-      e.limit = limit;
-      e.used = usedKeys.length;
-      throw e;
-    }
     const accounts = Object.assign({}, data[STATUS_KEY + 'Accounts'] || {});
-    if (!accounts[accountKey] && data[STATUS_KEY] && data[STATUS_KEY].metaApiAccountId) {
+    if (!accounts[accountKey] && data[STATUS_KEY] && data[STATUS_KEY].metaApiAccountId && !data[STATUS_KEY].accountKey) {
       accounts.legacy = data[STATUS_KEY];
     }
-    const linked = Object.keys(accounts).filter((key) => {
-      const item = accounts[key] || {};
-      return item.metaApiAccountId || ['connecting', 'connected', 'paused'].includes(item.status);
-    });
-    if (!accounts[accountKey] && linked.length >= limit) {
-      const e = new Error('Your plan allows ' + limit + ' linked MT5 account' + (limit === 1 ? '' : 's') + '.');
+    const working = (item) => ['connected', 'paused'].includes(item.status) || (item.status === 'connecting' && !!item.lastSyncAt);
+    const busy = Object.keys(accounts).filter((key) => key !== accountKey && working(accounts[key] || {}));
+    if (busy.length >= (limit || 1)) {
+      const cur = accounts[busy[0]] || {};
+      const name = [cur.login, cur.server].filter(Boolean).join(' · ');
+      const e = new Error('Disconnect your current MT5 / MT4 account' + (name ? ' (' + name + ')' : '') + ' first — one account syncs into each journal account. Or add another journal account for it.');
       e.code = 'mt5_account_limit';
-      e.limit = limit;
-      e.linked = linked.length;
+      e.limit = limit || 1;
+      e.linked = busy.length;
       throw e;
     }
     const next = Object.assign({}, accounts[accountKey] || {}, patch, { accountKey, updatedAt: Date.now() });
-    accounts[accountKey] = next;
-    const nextUsedKeys = usedKeys.includes(accountKey) ? usedKeys : usedKeys.concat(accountKey);
     tx.set(ref, {
-      [STATUS_KEY + 'Accounts']: accounts,
+      [STATUS_KEY + 'Accounts']: { [accountKey]: next },
       [STATUS_KEY]: next,
-      mt5DirectPeriod: { periodKey, accountKeys: nextUsedKeys, updatedAt: Date.now() },
     }, { merge: true });
-    return { ...next, reservedNewPeriodSlot: !usedKeys.includes(accountKey) };
+    return { ...next, reservedNewPeriodSlot: false };
   });
 }
 
