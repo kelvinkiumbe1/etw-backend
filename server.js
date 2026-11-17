@@ -146,6 +146,18 @@ const SPACE_SEP = '__';
 function ownerUid(id) { return String(id || '').split(SPACE_SEP)[0]; }
 function isSpaceUid(id) { return String(id || '').indexOf(SPACE_SEP) > 0; }
 const _spaceOk = new Map();   // `${uid}/${accountId}` -> expiry (ms) of a positive ownership check
+// `${uid}/${accountId}/${plan}` -> { exp, blocked } — the plan-allowance check, cached so
+// every API call made from an independent account doesn't re-read the whole
+// accounts list. Keyed by plan, so an upgrade takes effect on the next call.
+const _spaceIdx = new Map();
+function spaceCachePrune() {
+  if (_spaceOk.size + _spaceIdx.size < 20000) return;
+  const now = Date.now();
+  for (const [k, v] of _spaceOk) if (v < now) _spaceOk.delete(k);
+  for (const [k, v] of _spaceIdx) if (v.exp < now) _spaceIdx.delete(k);
+  if (_spaceOk.size > 20000) _spaceOk.clear();
+  if (_spaceIdx.size > 20000) _spaceIdx.clear();
+}
 async function dataUidFor(req) {
   const raw = String(req.get('X-ETW-Space') || (req.body && req.body.etwSpace) || (req.query && req.query.etwSpace) || '').trim();
   if (!raw) return req.uid;
@@ -161,13 +173,20 @@ async function dataUidFor(req) {
   // account past the plan's allowance is locked until the user upgrades.
   const plan = (await planFor(req)) || 'essential';
   const allowed = PLAN_LIMITS[plan].accounts;
-  const all = await db.collection('users').doc(req.uid).collection('accounts').orderBy('created', 'asc').get().catch(() => null);
-  if (all) {
-    const idx = all.docs.findIndex((d) => d.id === raw);
-    if (idx >= allowed) {
-      const e = new Error('Your ' + planTitle(plan) + ' plan includes ' + allowed + ' accounts. Upgrade to use this one.');
-      e.status = 402; e.code = 'account_limit'; throw e;
-    }
+  const ikey = key + '/' + plan;
+  let hit = _spaceIdx.get(ikey);
+  if (!hit || hit.exp < Date.now()) {
+    const all = await db.collection('users').doc(req.uid).collection('accounts').orderBy('created', 'asc').get().catch(() => null);
+    const idx = all ? all.docs.findIndex((d) => d.id === raw) : -1;
+    const blocked = idx >= allowed;
+    // allowed: re-checked every 10 min; blocked: every minute (so an upgrade or
+    // a deleted account frees it quickly); a failed read is not cached.
+    hit = { blocked, exp: Date.now() + (all ? (blocked ? 60 * 1000 : 10 * 60 * 1000) : 0) };
+    if (all) { _spaceIdx.set(ikey, hit); spaceCachePrune(); }
+  }
+  if (hit.blocked) {
+    const e = new Error('Your ' + planTitle(plan) + ' plan includes ' + allowed + ' accounts. Upgrade to use this one.');
+    e.status = 402; e.code = 'account_limit'; throw e;
   }
   return req.uid + SPACE_SEP + raw;
 }
@@ -800,6 +819,113 @@ app.post('/api/cashflow/sync', authLimiter, requireAuth, withSpace, requireSub, 
     if (ct.status === 'connected' && ctrader.configured()) out.ctrader = await ctrader.syncCash(req.duid, { force: true });
     res.json(out);
   } catch (e) { console.error('cashflow/sync:', e.message); res.status(502).json({ ok: false, error: 'cTrader did not answer — try again in a minute.' }); }
+});
+
+// ── Delete synced trades (Accounts menu › Delete synced trades) ──────────
+// The trader picks which connections' trades to remove from the account that
+// is open (X-ETW-Space): MT5 / MT4, cTrader, Notion, Bybit, TradeLocker,
+// DXtrade, or other broker syncs. Manual, AI-logged and file-imported trades
+// are never touched. Deleted broker trades are remembered (syncTombstones/
+// {dataUid}) so the next sync does not bring them back; trades that close
+// after the delete keep syncing as normal.
+const SYNC_DEL_GROUPS = ['mt5', 'ctrader', 'notion', 'bybit', 'tradelocker', 'dxtrade', 'other'];
+const SYNC_REIMPORTS = { mt5: 1, ctrader: 1, bybit: 1, tradelocker: 1, dxtrade: 1 };   // servers that would sync them again
+function syncGroupOf(t) {
+  if (!t) return '';
+  const src = String(t.source || '').toLowerCase(), ex = String(t.execSource || '').toLowerCase(), br = String(t.brokerName || '').toLowerCase();
+  if (/report|csv|file|manual|chat|draft/.test(ex)) return '';                       // file imports / hand-entered
+  if (src === 'notion_import' || ex === 'notion') return 'notion';
+  if (/^(mt[45](-ea|-direct|-live|-initial|-sync)?|metatrader[45]?)$/.test(src)) return 'mt5';
+  if (src === 'ctrader' || src === 'ctrader_open_api') return 'ctrader';
+  if (src === 'bybit') return 'bybit';
+  if (src === 'tradelocker') return 'tradelocker';
+  if (src === 'dxtrade') return 'dxtrade';
+  if (src === 'broker_sync') {
+    if (/ctrader/.test(br)) return 'ctrader';
+    if (/bybit/.test(br)) return 'bybit';
+    if (/tradelocker/.test(br)) return 'tradelocker';
+    if (/dxtrade/.test(br)) return 'dxtrade';
+    if (/mt[45]|metatrader/.test(br)) return 'mt5';
+    return 'other';
+  }
+  return '';
+}
+const TOMB_MAX = 40000;
+const _tombs = new Map();   // dataUid -> { at, set }
+async function tombsFor(duid) {
+  const hit = _tombs.get(duid);
+  if (hit && Date.now() - hit.at < 60 * 1000) return hit.set;
+  let set = new Set();
+  try { const d = await db.collection('syncTombstones').doc(duid).get(); if (d.exists) set = new Set((d.data() || {}).keys || []); } catch (e) {}
+  _tombs.set(duid, { at: Date.now(), set });
+  if (_tombs.size > 2000) _tombs.delete(_tombs.keys().next().value);
+  return set;
+}
+function tombKeys(t) {
+  const g = syncGroupOf(t); if (!g || !SYNC_REIMPORTS[g]) return [];
+  const out = [];
+  if (t.ticket != null && String(t.ticket) !== '') out.push(g + '|' + String(t.ticket));
+  if (t.positionId != null && String(t.positionId) !== '') out.push(g + '|pos:' + String(t.positionId));
+  if (t.extId) out.push(g + '|x:' + String(t.extId));
+  return out;
+}
+// Every connector writes through store.writeTrades — drop anything the trader deleted.
+const _writeTrades = store.writeTrades;
+store.writeTrades = async function (trades) {
+  const list = Array.isArray(trades) ? trades : [];
+  const uids = [...new Set(list.map((t) => t && t.uid).filter(Boolean))];
+  const sets = {};
+  for (const u of uids) sets[u] = await tombsFor(u);
+  const keep = list.filter((t) => { const set = t && sets[t.uid]; return !set || !set.size || !tombKeys(t).some((k) => set.has(k)); });
+  if (keep.length < list.length) console.log('[delete-synced] skipped', list.length - keep.length, 'deleted trade(s) on re-sync');
+  return keep.length ? _writeTrades.call(store, keep) : 0;
+};
+
+app.post('/api/trades/delete-synced', authLimiter, requireAuth, withSpace, async (req, res) => {
+  const want = [...new Set(((req.body && req.body.groups) || []).map(String))].filter((g) => SYNC_DEL_GROUPS.includes(g));
+  if (!want.length) return res.status(400).json({ error: 'Choose at least one source to delete.' });
+  const preview = !!(req.body && req.body.preview);
+  try {
+    const duid = req.duid;
+    // Main journal: trades still tagged with another account's id belong to that account.
+    let others = new Set();
+    if (duid === req.uid) {
+      try { const a = await db.collection('users').doc(req.uid).collection('accounts').orderBy('created', 'asc').get(); a.docs.slice(1).forEach((d) => others.add(d.id)); } catch (e) {}
+    }
+    const snap = await db.collection('trades').where('uid', '==', duid).get();
+    const hits = [], byGroup = {};
+    snap.docs.forEach((d) => {
+      const t = d.data() || {};
+      if (others.size && t.accountId && others.has(t.accountId)) return;
+      const g = syncGroupOf(t);
+      if (!g || !want.includes(g)) return;
+      hits.push({ ref: d.ref, t }); byGroup[g] = (byGroup[g] || 0) + 1;
+    });
+    if (preview) return res.json({ ok: true, preview: true, total: hits.length, byGroup });
+    // Remember them first, so a sync running at this moment cannot re-add them.
+    const keys = []; hits.forEach((h) => tombKeys(h.t).forEach((k) => keys.push(k)));
+    if (keys.length) {
+      const ref = db.collection('syncTombstones').doc(duid);
+      await db.runTransaction(async (tx) => {
+        const cur = await tx.get(ref);
+        const set = new Set((cur.exists && (cur.data() || {}).keys) || []);
+        keys.forEach((k) => { set.delete(k); set.add(k); });
+        const arr = [...set]; tx.set(ref, { keys: arr.slice(-TOMB_MAX), updatedAt: Date.now() });
+      });
+      _tombs.delete(duid);
+    }
+    let deleted = 0;
+    for (let i = 0; i < hits.length; i += 400) {
+      const b = db.batch();
+      hits.slice(i, i + 400).forEach((h) => b.delete(h.ref));
+      await b.commit(); deleted += Math.min(400, hits.length - i);
+    }
+    console.log('[delete-synced]', duid, want.join(','), '->', deleted);
+    res.json({ ok: true, deleted, byGroup });
+  } catch (e) {
+    console.error('delete-synced:', e.message);
+    res.status(500).json({ error: 'Could not delete those trades. Please try again.' });
+  }
 });
 
 // ── TradeLocker ────────────────────────────────────────────
