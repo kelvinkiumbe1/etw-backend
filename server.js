@@ -5,8 +5,6 @@
 //                     POST /api/tradelocker/disconnect
 //   DXtrade ......... POST /api/dxtrade/connect        { webUrl, username, password, domain, journalAccountId }
 //                     POST /api/dxtrade/disconnect
-//   Bybit ........... POST /api/bybit/connect          { apiKey, apiSecret, env, journalAccountId }  (read-only key)
-//                     POST /api/bybit/disconnect
 //   cTrader ......... GET  /api/ctrader/auth           (returns { url } to open — OAuth)
 //                     GET  /api/ctrader/callback       (Spotware redirect target)
 //                     POST /api/ctrader/disconnect
@@ -24,7 +22,6 @@ const mt5 = require('./src/mt5sync');
 const tradelocker = require('./src/connectors/tradelocker');
 const dxtrade = require('./src/connectors/dxtrade');
 const ctrader = require('./src/connectors/ctrader');
-const bybit = require('./src/connectors/bybit');
 const cashflows = require('./src/cashflows');
 const gumroad = require('./src/gumroad');
 const mt5ea = require('./src/connectors/mt5ea');
@@ -84,6 +81,32 @@ mt5.init();
 ctrader.init();
 // onDeplete is injected rather than required, so tokens.js does not have to
 // require mt5sync.js (which would be a cycle via store).
+// MT5_ENGINE=hosted sends new links to our own worker (src/hostedSync.js) AND
+// retires the MetaApi engine: legacy MetaApi-linked accounts are never resumed,
+// pulled or re-deployed again, so MetaApi's own failures (expired subscription,
+// "balance is not enough", quota errors) can no longer surface to users. Those
+// accounts keep every imported trade and show one clear ask instead: reconnect
+// once, which routes them through the hosted worker.
+const HOSTED_ENGINE = String(process.env.MT5_ENGINE || '').trim().toLowerCase() === 'hosted';
+const RELINK_HOSTED_MSG = 'MT5 sync has moved to ETW’s own sync engine. Reconnect this account once — login, investor (read-only) password and server — and syncing resumes automatically. Your imported trades are safe.';
+// true = this account is a legacy MetaApi link and has been retired (caller must
+// NOT touch MetaApi for it). Hosted accounts and non-hosted mode return false.
+async function retireIfMetaApi(uid, accountKey) {
+  if (!HOSTED_ENGINE) return false;
+  try {
+    const d = await db.collection('users').doc(uid).get();
+    const data = d.exists ? d.data() : {};
+    const acc = (data.mt5DirectAccounts || {})[accountKey]
+      || ((((data.mt5Direct || {}).accountKey) || 'legacy') === accountKey ? data.mt5Direct : null);
+    if (!acc || hosted.isHosted(acc)) return false;
+    if (acc.errorCode !== 'relink_hosted') {
+      await mt5.stopSync(uid, { undeploy: true, accountKey }).catch(() => {});
+      await mt5.setStatus(uid, { status: 'error', error: RELINK_HOSTED_MSG, errorCode: 'relink_hosted', syncing: false }, accountKey).catch(() => {});
+      console.log('[mt5] retired MetaApi account', uid, accountKey, '-> relink_hosted');
+    }
+    return true;
+  } catch (e) { return false; }
+}
 tokens.init({
   onDeplete: async (uid) => {
     await mt5.stopSync(uid, { undeploy: true }).catch(() => {});
@@ -95,11 +118,13 @@ tokens.init({
   // scheduled pull checks the plan first, so Essential accounts that were linked
   // before the change never sync again until the user upgrades to Pro.
   onResume: async (uid, accountKey) => {
+    if (await retireIfMetaApi(uid, accountKey)) return;
     const g = await directPlanGate(uid);
     if (g === 'pro') return mt5.resumeOne(uid, accountKey);
     if (g === 'locked') await holdDirectForPro(uid, accountKey);
   },
   onPull:   async (uid, accountKey) => {
+    if (await retireIfMetaApi(uid, accountKey)) return;
     const g = await directPlanGate(uid);
     if (g === 'pro') return mt5.pullOnce(uid, accountKey);
     if (g === 'locked') await holdDirectForPro(uid, accountKey);
@@ -200,6 +225,7 @@ async function releaseDirectForPro(uid) {
     let keys = Object.keys(accs).filter((k) => accs[k] && accs[k].status === 'pro_required' && !hosted.isHosted(accs[k]));
     if (!keys.length && data.mt5Direct && data.mt5Direct.status === 'pro_required' && !hosted.isHosted(data.mt5Direct)) keys = [data.mt5Direct.accountKey || 'legacy'];
     for (const k of keys) {
+      if (await retireIfMetaApi(uid, k)) continue;
       await mt5.setStatus(uid, { status: 'connecting', error: null }, k).catch(() => {});
       mt5.resumeOne(uid, k)
         .then(() => mt5.setStatus(uid, { status: 'connected', error: null }, k).catch(() => {}))
@@ -294,7 +320,7 @@ app.get('/', (_req, res) => res.json({
   ok: true,
   service: 'etw-sync-backend',
   version: 'ea-2',
-  platforms: { mt5: true, mt4: true, mt5ea: true, tradelocker: true, dxtrade: true, ctrader: ctrader.configured(), bybit: hosted.configured() },
+  platforms: { mt5: true, mt4: true, mt5ea: true, tradelocker: true, dxtrade: true, ctrader: ctrader.configured() },
   email: email.configured(),
   eodhd: require('./src/eodhd').configured(),
   gumroad: gumroad.configured(),
@@ -421,12 +447,50 @@ async function requireUltra(req, res, next) {
 }
 
 // ── MT5 / MT4 ──────────────────────────────────────────────
-// MT5_ENGINE=hosted sends new links to our own worker (src/hostedSync.js) instead
-// of MetaApi. Hosted sync is on every plan (Essential 1 account, Pro 3); MetaApi
-// stays Pro-only. Accounts already on MetaApi keep running until re-linked.
-const HOSTED_ENGINE = String(process.env.MT5_ENGINE || '').trim().toLowerCase() === 'hosted';
+// HOSTED_ENGINE (defined above, next to retireIfMetaApi) sends new links to our
+// own worker (src/hostedSync.js) instead of MetaApi, and retires legacy MetaApi
+// accounts the moment anything would touch them.
 // Auto-sync is a Pro feature on both engines (admin decision 2026-10-26).
 const requireDirectPlan = requirePro;
+
+// Accounts in this journal account (other than the one being linked now) that
+// never completed a sync: no lastSyncAt on their status, never on MetaApi, and
+// their hosted record (if any) never synced. They are unlinked from the hosted
+// worker, removed from the account list and their period slot is given back.
+// Anything that ever synced keeps counting, so this can't be used to swap
+// working accounts within a period.
+async function freeFailedMt5Attempts(uid, keepKey, periodKey) {
+  const ref = db.collection('users').doc(uid);
+  const snap = await ref.get();
+  if (!snap.exists) return [];
+  const data = snap.data() || {};
+  const accounts = data.mt5DirectAccounts || {};
+  const freed = [];
+  for (const key of Object.keys(accounts)) {
+    if (key === keepKey) continue;
+    const a = accounts[key] || {};
+    if (a.lastSyncAt || a.metaApiAccountId || a.status === 'connected' || a.status === 'paused') continue;
+    const h = await db.collection(hosted.COL).doc(uid + '_' + key).get().catch(() => null);
+    if (h && h.exists && (h.data() || {}).everSynced) continue;
+    await hosted.unlink(uid, key).catch((e) => console.warn('[mt5] unlink failed attempt:', e.message));
+    freed.push(key);
+  }
+  if (!freed.length) return freed;
+  await db.runTransaction(async (tx) => {
+    const cur = await tx.get(ref);
+    const d = (cur.exists && cur.data()) || {};
+    const usage = d.mt5DirectPeriod || {};
+    const updates = [];
+    freed.forEach((k) => updates.push(new admin.firestore.FieldPath('mt5DirectAccounts', k), admin.firestore.FieldValue.delete()));
+    if (usage.periodKey === periodKey && Array.isArray(usage.accountKeys)) {
+      updates.push('mt5DirectPeriod.accountKeys', usage.accountKeys.filter((k) => !freed.includes(k)), 'mt5DirectPeriod.updatedAt', Date.now());
+    }
+    if (d.mt5Direct && freed.includes(d.mt5Direct.accountKey)) updates.push('mt5Direct', admin.firestore.FieldValue.delete());
+    tx.update(ref, ...updates);
+  });
+  console.log('[mt5] freed', freed.length, 'never-synced attempt(s) for', uid);
+  return freed;
+}
 
 app.post('/api/mt5-direct/connect', authLimiter, requireAuth, withSpace, requireDirectPlan, async (req, res) => {
   const { login, password, server, platform, journalAccountId } = req.body || {};
@@ -442,6 +506,11 @@ app.post('/api/mt5-direct/connect', authLimiter, requireAuth, withSpace, require
     .update(String(platform || 'mt5') + '|' + String(login) + '|' + String(server).toLowerCase()).digest('hex').slice(0, 32);
   const accountLimit = 1;
   const periodKey = String(req.access.expiresAt || req.access.periodStart || req.access.plan || 'active');
+  // A previous attempt that never synced (wrong server name, wrong password,
+  // broker unreachable…) is not a used account: free it so the trader can retry
+  // with corrected details instead of hitting "1 new MT5 account per period".
+  try { await freeFailedMt5Attempts(req.duid, accountKey, periodKey); }
+  catch (e) { console.warn('[mt5] free failed attempts:', e.message); }
   let reservation;
   try {
     reservation = await mt5.reserveAccount(req.duid, accountKey, {
@@ -565,7 +634,7 @@ app.post('/api/mt5-direct/mode', authLimiter, requireAuth, withSpace, requirePro
 
     // Only reshape the connection if one exists. Switching while disconnected
     // just records the preference for the next connect.
-    if (d.status === 'paused') mt5.resumeOne(req.duid, accountKey).catch((e) => console.error('mode resume:', e.message));
+    if (d.status === 'paused' && !(await retireIfMetaApi(req.duid, accountKey))) mt5.resumeOne(req.duid, accountKey).catch((e) => console.error('mode resume:', e.message));
     res.json({ ok: true, mode });
   } catch (e) {
     console.error('mt5 mode:', e.message);
@@ -700,14 +769,22 @@ app.get('/api/cashflow/balances', marketLimiter, requireAuth, withSpace, require
     const ct = (u.exists && u.data().ctrader) || {};
     if (ct.status === 'connected') Object.keys(ct.cashBalances || {}).forEach((id) => {
       const b = ct.cashBalances[id] || {};
-      out.accounts.push({ source: 'ctrader', accountId: ct.journalAccountId || '', label: b.label || ('cTrader ' + id), balance: b.balance, equity: null, currency: '', at: b.at || 0, live: !!b.live });
+      out.accounts.push({ source: 'ctrader', via: 'ctrader', login: String(id), accountId: ct.journalAccountId || '', label: b.label || ('cTrader ' + id), balance: b.balance, equity: null, currency: '', at: b.at || 0, live: !!b.live });
     });
     const mt5 = (bp.exists && bp.data().mt5) || {};
     Object.keys(mt5).forEach((slot) => {
       const x = mt5[slot] || {};
       if (!x.balance && !x.equity) return;
       if (Date.now() - (+x.at || 0) > 30 * 86400000) return;
-      out.accounts.push({ source: 'mt5', accountId: x.accountId || '', label: ((x.server ? x.server + ' ' : '') + (x.login || '')).trim() || 'MT5', balance: x.balance, equity: x.equity, currency: x.currency || '', at: x.at || 0, hosted: !!x.hosted });
+      out.accounts.push({ source: 'mt5', via: x.hosted ? 'hosted' : 'ea', login: x.login || '', accountId: x.accountId || '', label: ((x.server ? x.server + ' ' : '') + (x.login || '')).trim() || 'MT5', balance: x.balance, equity: x.equity, currency: x.currency || '', at: x.at || 0, hosted: !!x.hosted });
+    });
+    // MT5 accounts linked through MetaApi report balance/equity on every sync.
+    const api = (bp.exists && bp.data().mt5api) || {};
+    Object.keys(api).forEach((slot) => {
+      const x = api[slot] || {};
+      if (Date.now() - (+x.at || 0) > 30 * 86400000) return;
+      if (out.accounts.some((a) => a.source === 'mt5' && a.login && a.login === x.login)) return;   // same account also on the EA
+      out.accounts.push({ source: 'mt5', via: 'direct', accountId: x.accountId || '', login: x.login || '', label: ((x.server ? x.server + ' ' : '') + (x.login || '')).trim() || 'MT5', balance: x.balance, equity: x.equity, currency: x.currency || '', at: x.at || 0 });
     });
     // MT5 accounts with no deposit in their history (prop firms): make sure the estimated starting balance exists.
     await Promise.all(Object.keys(mt5).map((slot) => { const x = mt5[slot] || {}; return x.balance > 0 && Date.now() - (+x.at || 0) <= 30 * 86400000 ? cashflows.ensureMt5Initial(req.duid, x, { everyMs: 10 * 60 * 1000 }) : null; }));
@@ -752,28 +829,6 @@ app.post('/api/dxtrade/connect', authLimiter, requireAuth, withSpace, requireSub
 app.post('/api/dxtrade/disconnect', requireAuth, withSpace, async (req, res) => {
   try { await dxtrade.stopSync(req.duid); } catch (e) {}
   await store.setStatus(req.duid, 'dxtrade', { status: 'disconnected' }).catch(() => {});
-  res.json({ ok: true });
-});
-
-// ── Bybit ──────────────────────────────────────────────────
-// Read-only API key, verified before we answer so a bad / trading-enabled key
-// fails in the form; the history import then runs in the background.
-app.post('/api/bybit/connect', authLimiter, requireAuth, withSpace, requireSub, async (req, res) => {
-  const { apiKey, apiSecret, env, journalAccountId } = req.body || {};
-  if (!apiKey || !apiSecret) return res.status(400).json({ error: 'apiKey and apiSecret are required' });
-  if (String(apiKey).length > 200 || String(apiSecret).length > 200) return res.status(400).json({ error: 'That does not look like a Bybit API key.' });
-  if (!hosted.configured()) return res.status(503).json({ error: 'Bybit sync is not configured on the server yet.' });
-  try {
-    await bybit.connect(req.duid, { apiKey, apiSecret, env, journalAccountId });
-    res.json({ ok: true, status: 'connecting' });
-  } catch (e) {
-    console.warn('bybit connect:', e.message);
-    res.status(400).json({ error: bybit.friendlyError(e), code: e.code || undefined });
-  }
-});
-app.post('/api/bybit/disconnect', requireAuth, withSpace, async (req, res) => {
-  try { await bybit.disconnect(req.duid); } catch (e) {}
-  await store.setStatus(req.duid, 'bybit', { status: 'disconnected' }).catch(() => {});
   res.json({ ok: true });
 });
 
@@ -991,6 +1046,9 @@ require('./src/mcp').mount(app, {
   planOf: async (uid) => { const p = await mcpPlanOf(uid); return p === 'essential' ? null : p; },
   accountLimit: async (uid) => { const p = await mcpPlanOf(uid); return (PLAN_LIMITS[p] || PLAN_LIMITS.essential).accounts; },
 });
+
+// ── Verified Track Record: server-side proof of performance (src/trackrecord.js) ──
+require('./src/trackrecord').mount(app, { db, requireAuth, getUser: (uid) => admin.auth().getUser(uid) });
 
 // ── Notion Sync: import a trading journal kept in Notion (see src/notionSync.js) ──
 require('./src/notionSync').mount(app, { requireAuth, requireSub, limiter: rl(60 * 1000, 90, 'Too many Notion requests, please wait a moment.'), db, admin });
@@ -2895,8 +2953,12 @@ const port = process.env.PORT || 8080;
 app.listen(port, () => {
   console.log('etw-sync-backend listening on :' + port);
 tokens.startMeter();
-mt5.resumeAll();
-bybit.resumeAll();
+// Hosted engine: never re-deploy MetaApi accounts at boot — deploying is what
+// makes MetaApi bill (and fail with its own balance/subscription errors).
+if (HOSTED_ENGINE) {
+  console.log('[mt5] hosted engine on — MetaApi boot resume skipped; legacy accounts retire on first touch');
+  setTimeout(() => { hosted.healUnknownServer().catch(() => {}); }, 8000);
+} else mt5.resumeAll();
 // 2FA retired: remove leftover 2FA claims/flags from every account (see backfillMfaClaims).
 setTimeout(() => { backfillMfaClaims().catch(() => {}); }, 3000);
 // Essential users linked MT5 Direct before it moved to Pro: stop them right after

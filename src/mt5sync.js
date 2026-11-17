@@ -36,47 +36,38 @@ async function setStatus(uid, patch, accountKey) {
   }, { merge: true });
 }
 
+// Claim this account in the journal account. There is no per-period quota:
+// a trader can retry with corrected details as often as they need. The only
+// rule is one WORKING MT5 / MT4 account per journal account — a different
+// account is refused only while another one is connected, paused (weekend),
+// or still connecting after having synced before. Failed or never-synced
+// attempts never block. (limit / periodKey kept for the caller's signature.)
 async function reserveAccount(uid, accountKey, patch, limit, periodKey) {
   const ref = store.db.collection('users').doc(uid);
   return store.db.runTransaction(async (tx) => {
     const snap = await tx.get(ref);
     const data = snap.exists ? snap.data() : {};
-    const usage = data.mt5DirectPeriod || {};
-    const period = usage.periodKey === periodKey
-      ? usage
-      : { periodKey, accountKeys: [] };
-    const usedKeys = Array.isArray(period.accountKeys) ? period.accountKeys : [];
-    if (!usedKeys.includes(accountKey) && usedKeys.length >= limit) {
-      const e = new Error('Your plan allows ' + limit + ' new MT5 account' + (limit === 1 ? '' : 's') + ' per subscription period.');
-      e.code = 'mt5_period_limit';
-      e.limit = limit;
-      e.used = usedKeys.length;
-      throw e;
-    }
     const accounts = Object.assign({}, data[STATUS_KEY + 'Accounts'] || {});
-    if (!accounts[accountKey] && data[STATUS_KEY] && data[STATUS_KEY].metaApiAccountId) {
+    if (!accounts[accountKey] && data[STATUS_KEY] && data[STATUS_KEY].metaApiAccountId && !data[STATUS_KEY].accountKey) {
       accounts.legacy = data[STATUS_KEY];
     }
-    const linked = Object.keys(accounts).filter((key) => {
-      const item = accounts[key] || {};
-      return item.metaApiAccountId || ['connecting', 'connected', 'paused'].includes(item.status);
-    });
-    if (!accounts[accountKey] && linked.length >= limit) {
-      const e = new Error('Your plan allows ' + limit + ' linked MT5 account' + (limit === 1 ? '' : 's') + '.');
+    const working = (item) => ['connected', 'paused'].includes(item.status) || (item.status === 'connecting' && !!item.lastSyncAt);
+    const busy = Object.keys(accounts).filter((key) => key !== accountKey && working(accounts[key] || {}));
+    if (busy.length >= (limit || 1)) {
+      const cur = accounts[busy[0]] || {};
+      const name = [cur.login, cur.server].filter(Boolean).join(' · ');
+      const e = new Error('Disconnect your current MT5 / MT4 account' + (name ? ' (' + name + ')' : '') + ' first — one account syncs into each journal account. Or add another journal account for it.');
       e.code = 'mt5_account_limit';
-      e.limit = limit;
-      e.linked = linked.length;
+      e.limit = limit || 1;
+      e.linked = busy.length;
       throw e;
     }
     const next = Object.assign({}, accounts[accountKey] || {}, patch, { accountKey, updatedAt: Date.now() });
-    accounts[accountKey] = next;
-    const nextUsedKeys = usedKeys.includes(accountKey) ? usedKeys : usedKeys.concat(accountKey);
     tx.set(ref, {
-      [STATUS_KEY + 'Accounts']: accounts,
+      [STATUS_KEY + 'Accounts']: { [accountKey]: next },
       [STATUS_KEY]: next,
-      mt5DirectPeriod: { periodKey, accountKeys: nextUsedKeys, updatedAt: Date.now() },
     }, { merge: true });
-    return { ...next, reservedNewPeriodSlot: !usedKeys.includes(accountKey) };
+    return { ...next, reservedNewPeriodSlot: false };
   });
 }
 
@@ -226,6 +217,19 @@ async function syncOnce(sync) {
     }).filter(Boolean);
     if (cash.length) { await cashflows.writeCash(cash); cash.forEach((c) => sync.cashWritten.add(c.extId.split('_').pop())); }
   } catch (e) { console.warn('mt5: cash flow write failed:', e.message); }
+  // Account balance / equity straight from the broker → Deposits & Withdrawals dashboard
+  // (brokerPositions/{uid}.mt5api — separate from the EA's open-positions slots).
+  try {
+    const info = await sync.rpc.getAccountInformation();
+    if (info && Number.isFinite(Number(info.balance))) {
+      const slot = 'a' + String(sync.accountKey || sync.login || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 32);
+      const rec = { at: Date.now(), accountId: sync.accountId || '', login: String(sync.login || info.login || ''), server: String(sync.server || info.server || '').slice(0, 80),
+        currency: String(info.currency || '').slice(0, 6), balance: Number(info.balance) || 0, equity: Number.isFinite(Number(info.equity)) ? Number(info.equity) : null,
+        platform: sync.platform || 'mt5', name: String(info.name || '').slice(0, 60) };
+      await store.db.collection('brokerPositions').doc(sync.uid).set({ mt5api: { [slot]: rec } }, { merge: true });
+      cashflows.ensureMt5Initial(sync.uid, rec, { everyMs: 60 * 60 * 1000 }).catch(() => {});
+    }
+  } catch (e) { console.warn('mt5: account balance read failed:', e.message); }
   await setStatus(sync.uid, {
     status: 'connected', platform: sync.platform, login: String(sync.login || ''), server: sync.server || '',
     metaApiAccountId: sync.account.id, historyImported: sync.written.size, lastSyncAt: Date.now(), error: null,
