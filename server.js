@@ -1084,6 +1084,9 @@ app.post('/api/ai/groq', aiLimiter, requireAuth, requirePro, aiQuota, async (req
         max_tokens: Math.min(Number(body.max_tokens) || 1024, ultra ? 8192 : 4096),
         ...reasoning,
         ...(body.response_format ? { response_format: body.response_format } : {}),
+        // ETW AI tools (journal look-ups the app runs itself): passed through as-is, bounded.
+        ...(Array.isArray(body.tools) && body.tools.length && body.tools.length <= 16 && JSON.stringify(body.tools).length < 20000
+          ? { tools: body.tools, ...(['auto', 'none', 'required'].includes(body.tool_choice) ? { tool_choice: body.tool_choice } : {}) } : {}),
         ...(wantStream ? { stream: true } : {}),
       }),
     });
