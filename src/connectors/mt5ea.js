@@ -126,9 +126,31 @@ async function boundLogin(uid) {
   bindCache.set(uid, { at: Date.now(), login }); cap(bindCache);
   return login;
 }
+// A hosted key belongs to one linked MT5 account. If the worker's terminal
+// ever runs logged in to a different login (a slot that reopened an account it
+// had used before), its deals must not land in this journal account.
+async function hostedLogin(k) {
+  if (k.hostedLogin !== undefined) return k.hostedLogin;
+  let login = '';
+  try {
+    const d = await store.db.collection('mt5Hosted').doc(k.uid + '_' + k.accountKey).get();
+    if (d.exists) login = String(d.data().login || '').replace(/[^0-9]/g, '');
+  } catch (e) { return ''; }
+  k.hostedLogin = login;
+  return login;
+}
 async function checkLogin(key, k, meta) {
   const login = String((meta && meta.login) || '').replace(/[^0-9]/g, '').slice(0, 20);
-  if (!login || k.hosted) return;
+  if (!login) return;
+  if (k.hosted) {
+    const want = await hostedLogin(k);
+    if (want && want !== login) {
+      console.warn('[mt5ea] hosted push refused: key for #' + want + ' sent deals from #' + login + ' (uid ' + String(k.uid).slice(0, 8) + '…)');
+      const e = new Error('These deals are from MT5 account #' + login + ', not #' + want + '.');
+      e.status = 409; e.code = 'wrong_login'; throw e;
+    }
+    return;
+  }
   if (k.mt5Login && String(k.mt5Login) === login) return;
   const bound = k.mt5Login ? String(k.mt5Login) : await boundLogin(k.uid);
   if (bound && bound !== login) {
@@ -251,6 +273,7 @@ async function positions(key, list, meta) {
   const k = await keyData(key);
   if (!k) { const e = new Error('Invalid sync key'); e.status = 401; throw e; }
   await checkAccess(k.uid);
+  if (k.hosted) await checkLogin(key, k, meta);
   const clean = (Array.isArray(list) ? list : []).slice(0, 200).map((p) => ({
     id: String(p.ticket || p.id || '').slice(0, 32),
     pair: String(p.symbol || '').slice(0, 32),
