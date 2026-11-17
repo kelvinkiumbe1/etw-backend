@@ -180,6 +180,24 @@ async function planFor(uid, cache) {
   return p;
 }
 
+// The EA on the worker remembers the deals it has posted per MT5 LOGIN
+// (Common\Files\ETW_sent_<login>.txt), not per sync key. A login linked to a
+// second journal account (an independent account, or after moving it) found
+// every deal "already sent" and the new account stayed empty. The worker now
+// keeps one list per job; this says which job inherits the login's old list:
+// the oldest link of that login that has actually received trades. Every other
+// link starts empty and gets the full history (the push path dedups per
+// journal account, so nothing is written twice).
+async function ownsSentList(d, cache) {
+  const login = String(d.login || '');
+  if (!cache.has(login)) {
+    const s = await store.db.collection(COL).where('login', '==', login).get();
+    cache.set(login, s.docs.map((x) => ({ id: x.id, created: x.data().createdAt || 0, active: (x.data().lastActivityAt || 0) > 0 })));
+  }
+  const first = cache.get(login).filter((x) => x.active).sort((a, b) => a.created - b.created)[0];
+  return !!first && first.id === docId(d.uid, d.accountKey);
+}
+
 const HOLD_MSG = {
   subscription_required: 'Sync is paused because your subscription is not active. It resumes automatically when you renew.',
   pro_required: 'Auto-sync is a Pro feature. Upgrade to Pro and syncing resumes automatically — no need to reconnect. Your imported trades are safe.',
@@ -193,6 +211,7 @@ async function claim(workerId, max) {
   const now = Date.now();
   const snap = await store.db.collection(COL).where('dueAt', '<=', now).orderBy('dueAt').limit(max * 4).get();
   const plans = new Map();
+  const owners = new Map();
   const jobs = [];
   for (const doc of snap.docs) {
     if (jobs.length >= max) break;
@@ -224,9 +243,14 @@ async function claim(workerId, max) {
       await mt5.setStatus(d.uid, { status: 'error', error: 'Please re-enter your investor password to resume sync.' }, d.accountKey).catch(() => {});
       continue;
     }
+    const seedSent = await ownsSentList(d, owners).catch(() => true);
     jobs.push({
       jobId: doc.id, leaseId, login: d.login, server: d.server, platform: d.platform,
-      password, syncKey: d.eaKey,
+      password, syncKey: d.eaKey, seedSent,
+      // Read the whole deal history until this link has received a trade
+      // (a first run on a fresh terminal can come back before MT5 has
+      // downloaded the account's history).
+      fullScan: !d.everSynced || !(d.lastActivityAt > 0),
       pro: !!plan.pro,                      // the worker keeps live terminals for Pro accounts first
     });
     // Lets the journal show "Syncing now…" for every run, not just the first.
@@ -371,12 +395,24 @@ async function report(workerId, { jobId, leaseId, result, sent, failed, openPosi
     console.log('[hosted]', jobId.slice(0, 8) + '…', 'server corrected:', JSON.stringify(d.server), '->', JSON.stringify(fixedServer));
   }
 
-  if (result === 'done') {
+  if (result === 'done' && !d.everSynced && sent === 0 && !(Number(openPositions) > 0) && (d.emptyRuns || 0) < 2) {
+    // First sync came back empty. A terminal that has just logged in to an
+    // account for the first time often has not downloaded its deal history
+    // yet, so "0 trades" here is not proof the account is empty. Try again
+    // soon instead of calling it synced and waiting 15 minutes.
+    patch.emptyRuns = (d.emptyRuns || 0) + 1;
+    patch.loginFails = 0; patch.workerFails = 0; patch.unknownServerRuns = 0;
+    patch.dueAt = now + 3 * MIN;
+    status = { status: 'connecting', syncing: false, error: null, loadingHistory: true, live: false };
+  } else if (result === 'done') {
     patch.loginFails = 0; patch.workerFails = 0; patch.unknownServerRuns = 0; patch.everSynced = true; patch.lastSyncAt = now;
     patch.openPositions = Math.max(0, Number(openPositions) || 0);
     if (sent > 0) patch.lastActivityAt = now;
     patch.dueAt = nextDue(Object.assign({}, d, patch), now);
-    status = { status: 'connected', syncing: false, error: null, lastSyncAt: now, nextSyncAt: patch.dueAt, pausedReason: null, errorCode: null, lastSent: sent, live: !!live };
+    patch.emptyRuns = 0;
+    status = { status: 'connected', syncing: false, error: null, lastSyncAt: now, nextSyncAt: patch.dueAt, pausedReason: null, errorCode: null, lastSent: sent, live: !!live, loadingHistory: false,
+      // never received a single trade: the card says so instead of a bare "Synced"
+      noTrades: !(patch.lastActivityAt || d.lastActivityAt) };
     if (access === 'trading' || access === 'investor') status.masterPassword = access === 'trading';
   } else if (result === 'unknown_server') {
     // The worker searched MT5's broker directory and found no such server. That
@@ -399,6 +435,13 @@ async function report(workerId, { jobId, leaseId, result, sent, failed, openPosi
       const near = await suggestServers(d.server).catch(() => []);
       status = { status: 'error', syncing: false, error: UNKNOWN_SERVER_MSG(d.server, near), errorCode: 'unknown_server', suggestions: near, live: false };
     }
+  } else if (result === 'wrong_account') {
+    // The terminal ran logged in to another MT5 account (the worker refuses
+    // to count that run, and the backend refuses its deals). Retry soon.
+    patch.workerFails = (d.workerFails || 0) + 1;
+    patch.dueAt = now + 3 * MIN;
+    console.warn('[hosted]', jobId, 'terminal was on another account:', String(detail || '').slice(0, 120));
+    status = { syncing: false, live: false };
   } else if (result === 'not_connected' && detail === 'invalid_account') {
     // The broker answered and said no. A first link is almost always the
     // details, so say so at once; an account that has synced before gets a
