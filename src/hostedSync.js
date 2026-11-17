@@ -32,6 +32,8 @@ const RETRY_EVERY = 10 * MIN;             // worker-side failure (timeout, EA di
 const cooldownMin = String(process.env.HOSTED_SYNC_NOW_COOLDOWN_MIN || '').trim() === '' ? NaN : Number(process.env.HOSTED_SYNC_NOW_COOLDOWN_MIN);
 const SYNC_NOW_COOLDOWN = (Number.isFinite(cooldownMin) && cooldownMin >= 0 ? cooldownMin : 60) * MIN;
 const MAX_LOGIN_FAILS = 3;                // then stop until the user re-enters details
+const UNKNOWN_SERVER_RETRY = 24 * 60 * MIN; // "no such server": try again daily...
+const UNKNOWN_SERVER_TRIES = 7;           // ...for a week, then wait for the user to reconnect
 
 const ref = (id) => store.db.collection(COL).doc(id);
 const docId = (uid, accountKey) => uid + '_' + accountKey;
@@ -110,6 +112,10 @@ async function syncNow(uid, accountKey) {
     if (wait > 0) {
       const e = new Error('You can sync this account again in ' + Math.ceil(wait / MIN) + ' min.');
       e.status = 429; e.retryInMin = Math.ceil(wait / MIN); throw e;
+    }
+    if (d.loginFails >= MAX_LOGIN_FAILS && d.lastResult === 'unknown_server') {
+      const e = new Error('We could not find the broker server "' + d.server + '". Check the server name exactly as MT5 shows it and connect the account again.');
+      e.status = 409; e.code = 'unknown_server'; throw e;
     }
     if (d.loginFails >= MAX_LOGIN_FAILS) {
       const e = new Error('The broker rejected these details. Re-enter your login, investor password and server.');
@@ -260,7 +266,8 @@ function nextDue(d, now) {
 const BAD_PASSWORD_MSG = 'The broker says this login or investor password is wrong. Check them in MT5 and connect again.';
 const UNKNOWN_SERVER_MSG = (server, near) => 'We could not find a broker server called "' + server + '". '
   + (near.length ? 'Did you mean ' + near.map((n) => '"' + n + '"').join(' or ') + '? ' : '')
-  + 'Copy the server name exactly as MT5 shows it (File → Login to Trade Account, e.g. "ICMarketsSC-MT5-2") and connect again.';
+  + 'Copy the server name exactly as MT5 shows it (File → Login to Trade Account, e.g. "ICMarketsSC-MT5-2") and connect again. '
+  + 'We will also retry once a day for a week.';
 const UNREACHABLE_MSG = (server) => 'We cannot reach the broker server "' + server + '" right now. We will keep trying — no action needed.';
 
 // "Did you mean": servers other accounts have synced from, close to what the
@@ -308,7 +315,7 @@ async function report(workerId, { jobId, leaseId, result, sent, failed, openPosi
   let status = null;
 
   if (result === 'done') {
-    patch.loginFails = 0; patch.workerFails = 0; patch.everSynced = true; patch.lastSyncAt = now;
+    patch.loginFails = 0; patch.workerFails = 0; patch.unknownServerTries = 0; patch.everSynced = true; patch.lastSyncAt = now;
     patch.openPositions = Math.max(0, Number(openPositions) || 0);
     if (sent > 0) patch.lastActivityAt = now;
     patch.dueAt = nextDue(Object.assign({}, d, patch), now);
@@ -316,9 +323,12 @@ async function report(workerId, { jobId, leaseId, result, sent, failed, openPosi
     if (access === 'trading' || access === 'investor') status.masterPassword = access === 'trading';
   } else if (result === 'unknown_server') {
     // The worker searched MT5's broker directory and found no such server.
-    // Retrying won't help until the user fixes the name.
+    // Usually the user has to fix the name, but retry once a day for a week:
+    // the worker learns new spellings ("Headway _Real" -> "Headway-Real") and
+    // brokers add servers, so a later run can succeed with no action needed.
     patch.loginFails = MAX_LOGIN_FAILS;
-    patch.dueAt = Number.MAX_SAFE_INTEGER;
+    patch.unknownServerTries = (d.unknownServerTries || 0) + 1;
+    patch.dueAt = patch.unknownServerTries < UNKNOWN_SERVER_TRIES ? now + UNKNOWN_SERVER_RETRY : Number.MAX_SAFE_INTEGER;
     const near = await suggestServers(d.server).catch(() => []);
     status = { status: 'error', syncing: false, error: UNKNOWN_SERVER_MSG(d.server, near), errorCode: 'unknown_server', suggestions: near, live: false };
   } else if (result === 'not_connected' && detail === 'invalid_account') {
