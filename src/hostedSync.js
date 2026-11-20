@@ -90,7 +90,7 @@ async function link(uid, { accountKey, login, password, server, platform, journa
   await mt5.setStatus(uid, {
     status: 'connecting', engine: 'hosted', platform: platform === 'mt4' ? 'mt4' : 'mt5',
     login: String(login), server: String(server), journalAccountId: journalAccountId || '',
-    error: null, errorCode: null, masterPassword: null, syncing: false, queuedAt: Date.now(), metaApiAccountId: null,
+    error: null, errorCode: null, masterPassword: null, syncing: false, queuedAt: Date.now(), metaApiAccountId: null, stuck: null,
   }, accountKey);
   return { ok: true };
 }
@@ -308,6 +308,33 @@ const UNKNOWN_SERVER_MSG = (server, near) => 'We could not find a broker server 
   + (near.length ? 'Did you mean ' + near.map((n) => '"' + n + '"').join(' or ') + '? ' : '')
   + 'We also tried it with and without a space before the number. Copy the server name exactly as MT5 shows it, spaces included (File → Login to Trade Account, e.g. "FundedNext-Server 2"), and connect again — '
   + 'or, if the name is already exact (new prop-firm servers can take a while to appear in the directory), no action is needed: we keep checking every few hours and will connect as soon as it answers.';
+// An account that keeps failing on our side gets a plain reason on its card
+// (status.stuck), instead of an old "Synced 3h ago" that looks fine. The
+// worker's detail says what went wrong; cleared by the next good sync.
+const STUCK_AFTER = 3;
+function stuckReason(result, detail) {
+  const d = String(detail || '').toLowerCase();
+  if (result === 'not_connected') return 'broker_unreachable';
+  if (result === 'wrong_account') return 'worker';
+  if (result === 'send_failed') return 'save_failed';
+  if (/ea never started|chart symbol/.test(d)) return 'symbols';
+  if (/hung at start-up/.test(d)) return 'worker';
+  if (/did not finish synchroniz/.test(d)) return 'broker_slow';
+  return 'other';
+}
+const STUCK_MSG = {
+  broker_unreachable: (s) => 'Your broker\'s server "' + s + '" is not answering. We keep retrying automatically. If your broker moved your account to a new server, disconnect and connect again with the new server name.',
+  symbols: () => 'We are matching your broker\'s symbol names for this account. Sync retries automatically — no action needed.',
+  broker_slow: () => 'Your broker is slow to send this account\'s data. We keep retrying automatically — no action needed.',
+  save_failed: () => 'Trades were found but could not be saved. We are looking into it — no action needed.',
+  worker: () => 'Our sync server had trouble with this account. It retries automatically — no action needed.',
+  other: () => 'This account has not synced in the last few tries. We keep retrying automatically. If it lasts more than a day, please contact support.',
+};
+function stuckStatus(result, detail, server, fails, since) {
+  const reason = stuckReason(result, detail);
+  return { reason, fails, since: since || Date.now(), message: STUCK_MSG[reason](server) };
+}
+
 const UNREACHABLE_MSG = (server) => 'We cannot reach the broker server "' + server + '" right now. We will keep trying — no action needed.';
 
 // "Did you mean": servers other accounts have synced from, close to what the
@@ -467,8 +494,15 @@ async function report(workerId, { jobId, leaseId, result, sent, failed, openPosi
     patch.dueAt = now + RETRY_EVERY * Math.min(patch.workerFails, 6);
     console.warn('[hosted]', jobId, result, 'x' + patch.workerFails, String(detail || '').slice(0, 200));
     status = (!d.everSynced && patch.workerFails >= 3)
-      ? { status: 'error', syncing: false, error: 'We could not sync this account yet. We will keep retrying — no action needed.', live: false }
+      ? { status: 'error', syncing: false, error: STUCK_MSG[stuckReason(result, detail)](d.server), errorCode: 'sync_stuck', live: false }
       : { syncing: false, live: false };
+  }
+  if (result === 'done') {
+    if (d.stuckSince) { patch.stuckSince = null; status = Object.assign(status || {}, { stuck: null }); }
+  } else if (d.everSynced && (patch.workerFails || 0) >= STUCK_AFTER) {
+    // Has synced before, now failing on our side or the broker's: say why.
+    patch.stuckSince = d.stuckSince || now;
+    status = Object.assign(status || {}, { stuck: stuckStatus(result, detail, d.server, patch.workerFails, patch.stuckSince) });
   }
   await r.update(patch);
   if (fixedServer) status = Object.assign(status || {}, { server: fixedServer });
