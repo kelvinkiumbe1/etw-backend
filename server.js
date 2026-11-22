@@ -2533,6 +2533,23 @@ async function uidForSubscription(subscriptionId) {
   return null;
 }
 
+// The membership that backs this trader's access, taken from OUR sales records
+// (gumroadSales is server-only), never from users/{uid}.subscription. The
+// latest charge we actually granted to this uid decides it, so nobody can
+// point their account at someone else's membership and collect its charges.
+async function subscriptionIdForUid(uid) {
+  try {
+    const q = await db.collection('gumroadSales').where('uid', '==', uid).limit(100).get();
+    let best = null;
+    for (const d of q.docs) {
+      const x = d.data() || {};
+      if (x.status !== 'GRANTED' || !x.subscriptionId) continue;
+      if (!best || Number(x.at || 0) > Number(best.at || 0)) best = x;
+    }
+    return best ? String(best.subscriptionId) : null;
+  } catch (e) { console.warn('[gumroad] subscription for uid', uid + ':', e.message); return null; }
+}
+
 // Charges parked while a higher plan was active (see settleGumroadSale).
 async function settleHeldSales(uid) {
   let n = 0;
@@ -2572,8 +2589,9 @@ async function refreshMembership(uid, opts) {
   const ref = db.collection('users').doc(uid);
   const snap = await ref.get();
   const cur = (snap.exists && snap.data().subscription) || {};
-  const subId = cur.subscriptionId;
-  if (!subId || cur.comp) return null;
+  if (cur.comp) return null;
+  const subId = await subscriptionIdForUid(uid);   // trusted source, not the doc
+  if (!subId) return null;
   let sub;
   try { sub = await gumroad.getSubscriber(subId); }
   catch (e) { console.warn('[gumroad] membership refresh', uid + ':', e.message); return null; }
@@ -2612,7 +2630,8 @@ async function handleMembershipEvent(subscriptionId, body) {
   const mirror = membershipMirror(sub);
   // A different membership than the one backing access (e.g. the old plan after
   // an upgrade) only updates that side note.
-  if (cur.subscriptionId && cur.subscriptionId !== subId) {
+  const backing = await subscriptionIdForUid(uid);
+  if (backing && backing !== subId) {
     if (cur.extraMembership && cur.extraMembership.subscriptionId === subId) {
       await ref.set({ subscription: { extraMembership: { membershipStatus: mirror.membershipStatus, autoRenew: mirror.autoRenew } } }, { merge: true });
     }
