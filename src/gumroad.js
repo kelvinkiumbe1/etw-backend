@@ -59,6 +59,14 @@ function productKeys(p) {
     .concat((p.builtin || []).map(normalizeKey));
 }
 
+// Admin diagnostic: plan/cycle -> product keys accepted right now. The env
+// variables are optional extras; the built-in memberships always match.
+function acceptedProducts() {
+  const out = {};
+  for (const p of PRODUCTS) out[p.plan + '/' + (p.cycle || 'monthly')] = productKeys(p);
+  return out;
+}
+
 // ── Auto-Sync token packs ──────────────────────────────────────────────────
 // These are NOT subscriptions: they buy a prepaid token balance that the sync
 // meter draws down (see src/tokens.js). Kept in a separate map from PRODUCTS so
@@ -209,4 +217,4 @@ async function recentSales(days) {
   return sales;
 }
 
-module.exports = { configured, matchSale, matchTokenSale, tokenProductMap, getSale, getSubscriber, normalizeKey, ensureResourceSubscriptions, listResourceSubscriptions, recentSales };
+module.exports = { configured, matchSale, matchTokenSale, tokenProductMap, getSale, getSubscriber, acceptedProducts, normalizeKey, ensureResourceSubscriptions, listResourceSubscriptions, recentSales };
