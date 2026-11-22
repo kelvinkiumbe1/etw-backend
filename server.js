@@ -3060,12 +3060,8 @@ app.get('/api/admin/gumroad-probe', authLimiter, requireAdmin, async (req, res) 
   const out = {
     configured: gumroad.configured(),
     tokenSet: !!process.env.GUMROAD_ACCESS_TOKEN,
-    products: {
-      essential: !!process.env.GUMROAD_PRODUCT_ESSENTIAL,
-      pro: !!process.env.GUMROAD_PRODUCT_PRO,
-      essentialYearly: !!process.env.GUMROAD_PRODUCT_ESSENTIAL_YEARLY,
-      proYearly: !!process.env.GUMROAD_PRODUCT_PRO_YEARLY,
-    },
+    // Which product keys each plan accepts (built-in memberships + any env extras).
+    products: gumroad.acceptedProducts(),
   };
   if (!out.configured) return res.status(503).json(out);
   try {
