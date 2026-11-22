@@ -2159,21 +2159,22 @@ async function sendReceiptEmail(uid, order, expiresAt) {
     const user = await admin.auth().getUser(uid);
     if (!user.email) return;
     const isUpgrade = order.kind === 'upgrade';
+    const isRenewal = order.kind === 'renewal';
     const planName = planTitle(order.plan);
     const body = isUpgrade
       ? `<p>You're on <b>Pro</b> — Mentor mode, ETW AI and Trade Replay are unlocked right now.</p>
          <p>You paid only the difference (<b>${money(order.amount, order.currency)}</b>), and your end date is unchanged: <b>${nice(expiresAt)}</b>.</p>`
-      : `<p>Thanks — your payment of <b>${money(order.amount, order.currency)}</b> went through and your <b>${planName}</b> plan is active.</p>
+      : `<p>${isRenewal ? `Your <b>${planName}</b> membership renewed automatically — <b>${money(order.amount, order.currency)}</b> was charged to your saved card and your access now runs to <b>${nice(expiresAt)}</b>.` : `Thanks — your payment of <b>${money(order.amount, order.currency)}</b> went through and your <b>${planName}</b> plan is active.`}</p>
          <table style="border-collapse:collapse;margin:14px 0;font-size:14px">
            <tr><td style="padding:4px 14px 4px 0;color:#666">Plan</td><td><b>${planName}</b> (${['yearly','quarterly','monthly'].indexOf(order.cycle) >= 0 ? order.cycle : 'monthly'})</td></tr>
            <tr><td style="padding:4px 14px 4px 0;color:#666">Amount</td><td>${money(order.amount, order.currency)}</td></tr>
            <tr><td style="padding:4px 14px 4px 0;color:#666">Access until</td><td>${nice(expiresAt)}</td></tr>
-           <tr><td style="padding:4px 14px 4px 0;color:#666">Auto-renew</td><td>Yes — manage or cancel any time from your Gumroad receipt</td></tr>
+           <tr><td style="padding:4px 14px 4px 0;color:#666">Auto-renew</td><td>Yes — your card is charged automatically each period. Manage or cancel any time from your Gumroad receipt or library</td></tr>
          </table>`;
     await email.sendEmail({
       to: user.email, toName: user.displayName || '',
-      subject: isUpgrade ? "You're on ETW Journal Pro" : 'Payment received — ETW Journal ' + planName,
-      html: emailShell(isUpgrade ? 'Welcome to Pro' : 'Payment received', body, 'Open your journal', APP_URL + '/journal.html'),
+      subject: isUpgrade ? "You're on ETW Journal Pro" : isRenewal ? 'Your ETW Journal ' + planName + ' membership renewed' : 'Payment received — ETW Journal ' + planName,
+      html: emailShell(isUpgrade ? 'Welcome to Pro' : isRenewal ? 'Membership renewed' : 'Payment received', body, 'Open your journal', APP_URL + '/journal.html'),
     });
   } catch (e) { console.warn('receipt email:', e.message); }
 }
@@ -2222,6 +2223,8 @@ async function sweepSubscriptions() {
     const sub = doc.data().subscription || {};
     if (sub.comp || sub.status !== 'active') { out.skipped++; continue; }
     if (Number(sub.remindedFor || 0) === Number(sub.expiresAt)) { out.skipped++; continue; }  // once per period
+    // An alive membership renews by itself — no "pay again" email for it.
+    if (sub.autoRenew && sub.subscriptionId) { out.skipped++; continue; }
     try {
       const user = await admin.auth().getUser(doc.id);
       if (!user.email) { out.skipped++; continue; }
@@ -2248,6 +2251,11 @@ async function sweepSubscriptions() {
 
   for (const doc of gone.docs) {
     try {
+      const gsub = doc.data().subscription || {};
+      if (gsub.subscriptionId && gsub.autoRenew && gsub.status === 'active') {
+        const r = await refreshMembership(doc.id, { force: true }).catch(() => null);
+        if (r && r.healed) { out.renewed = (out.renewed || 0) + 1; continue; }
+      }
       if (await notifyExpired(doc.id, doc.ref, doc.data().subscription || {})) out.expired++;
       else out.skipped++;
     } catch (e) { console.warn('sweep expire ' + doc.id + ':', e.message); }
@@ -2338,6 +2346,14 @@ async function settleGumroadSale(saleId, ping) {
     if (/^[A-Za-z0-9]{10,128}$/.test(rawUid)) {
       try { return (await admin.auth().getUser(rawUid)).uid; } catch (e) { /* stale uid — try email */ }
     }
+    // Automatic renewal charges don't always carry the checkout's url_params,
+    // but they carry the membership's subscription_id: the account that the
+    // first charge of this membership unlocked is the one it keeps renewing.
+    const subId = String(sale.subscription_id || (ping && ping.subscription_id) || '').trim();
+    if (subId) {
+      const u = await uidForSubscription(subId);
+      if (u) return u;
+    }
     if (sale.email) {
       try { return (await admin.auth().getUserByEmail(String(sale.email).trim())).uid; } catch (e) { /* no account */ }
     }
@@ -2391,19 +2407,73 @@ async function settleGumroadSale(saleId, ping) {
   const amount = rawPrice.includes('$') ? priceNum : priceNum / 100;
   const currency = String(sale.currency || 'USD').toUpperCase();
 
+  const subscriptionId = sale.subscription_id || null;
+  const recurring = !!((ping && String(ping.is_recurring_charge) === 'true') || sale.is_recurring_charge === true
+    || String(sale.is_recurring_charge) === 'true');
+
+  // Two memberships at once (someone upgraded and hasn't cancelled the old
+  // one yet): a renewal of the LOWER plan must never pull the higher plan's
+  // access down. Record the charge, keep the better plan and its end date, and
+  // flag it so the app can tell them they're still paying for the old one.
+  const RANK = { essential: 1, pro: 2, ultra: 3 };
+  try {
+    const u = await admin.auth().getUser(uid);
+    const c = u.customClaims || {};
+    const curSnap = await db.collection('users').doc(uid).get();
+    const cur = (curSnap.exists && curSnap.data().subscription) || {};
+    const higherActive = c.subscribed && Number(c.expiresAt) > Date.now() && !cur.comp
+      && (RANK[c.plan] || 0) > (RANK[plan] || 0)
+      && subscriptionId && cur.subscriptionId !== subscriptionId;
+    if (higherActive) {
+      // HELD, not GRANTED: once the higher plan runs out this charge is settled
+      // for real (see settleHeldSales) — so a deliberate downgrade still gets
+      // every day it paid for, just after the better plan ends.
+      await ref.set({
+        status: 'HELD', uid, plan, cycle, at: Date.now(), heldUnder: c.plan, heldUntil: Number(c.expiresAt),
+        email: sale.email || null, subscriptionId, recurring, amount, currency,
+      }, { merge: true });
+      await db.collection('users').doc(uid).set({ subscription: { extraMembership: {
+        plan, cycle, subscriptionId, lastChargeAt: Date.now(), amount, currency,
+      } } }, { merge: true });
+      console.warn(`[gumroad] ${uid} paid ${plan} (sale ${saleId}) while on active ${c.plan} — held until it ends`);
+      return { ok: true, uid, plan: c.plan, held: true, expiresAt: Number(c.expiresAt) };
+    }
+  } catch (e) { /* the normal grant below is the safe default */ }
+
+  // Moving from an older one-off plan onto an auto-renewing membership of the
+  // SAME plan: the days already paid for are kept, and the new period starts
+  // after them. (Renewals of the same membership start from now — the charge
+  // lands on the renewal date, so nothing is lost.)
+  let keepUntil = 0;
+  try {
+    const u2 = await admin.auth().getUser(uid);
+    const c2 = u2.customClaims || {};
+    const s2 = await db.collection('users').doc(uid).get();
+    const cur2 = (s2.exists && s2.data().subscription) || {};
+    const prevExp = Number(c2.expiresAt || 0);
+    if (!recurring && subscriptionId && !cur2.comp && c2.subscribed && c2.plan === plan
+        && prevExp > Date.now() && cur2.subscriptionId !== subscriptionId) {
+      keepUntil = prevExp + (PLAN_DAYS[cycle] || 31) * DAY_MS;
+    }
+  } catch (e) { /* default: a fresh period from now */ }
+
   const expiresAt = await grantSubscription(uid, plan, cycle, {
-    provider: 'gumroad', saleId, subscriptionId: sale.subscription_id || null,
-  });
+    provider: 'gumroad', saleId, subscriptionId,
+    // Auto-renew state, shown in Settings. A charge means the membership is alive.
+    autoRenew: !!subscriptionId, membershipStatus: subscriptionId ? 'alive' : null,
+    lastChargeAt: Date.now(), renewals: recurring ? admin.firestore.FieldValue.increment(1) : admin.firestore.FieldValue.increment(0),
+    cancelledAt: null, endedAt: null, failedAt: null,
+  }, keepUntil);
   await ref.set({
     status: 'GRANTED', uid, plan, cycle, expiresAt, at: Date.now(),
-    email: sale.email || null, subscriptionId: sale.subscription_id || null,
-    recurring: !!(ping && String(ping.is_recurring_charge) === 'true'),
+    email: sale.email || null, subscriptionId, recurring,
     amount, currency,
   }, { merge: true });
+  if (recurring) console.log(`[gumroad] auto-renewed ${plan}/${cycle} for ${uid} (sale ${saleId}) — access until ${new Date(expiresAt).toISOString()}`);
 
   // Receipt + audience sync are fire-and-forget: access is already granted, and
   // a Brevo hiccup must never turn a successful payment into an error.
-  sendReceiptEmail(uid, { plan, cycle, kind: 'new', amount, currency }, expiresAt).catch(() => {});
+  sendReceiptEmail(uid, { plan, cycle, kind: recurring ? 'renewal' : 'new', amount, currency }, expiresAt).catch(() => {});
   syncBrevoContact(uid, { force: true }).catch(() => {});
   // Referral reward for whoever referred this buyer (verified sale only).
   await referralOnPaidSale({ uid, plan, cycle, saleId, saleEmail: sale.email || '' })
@@ -2435,6 +2505,124 @@ async function reconcileGumroadSales(days = 3) {
     } catch (e) { console.warn('[gumroad] reconcile', saleId + ':', e.message); }
   }
   return { checked, healed };
+}
+
+// ══════════════════════════════════════════════════════════════
+//  AUTO-RENEWING MEMBERSHIPS — keeping the app in step with Gumroad
+// ══════════════════════════════════════════════════════════════
+// How a renewal reaches the app:
+//  1. Gumroad charges the saved card and fires the sale Ping → /api/gumroad/ping
+//     → settleGumroadSale() grants a fresh period (the access end date moves on).
+//  2. If that ping is missed (Render asleep, deploy), it is caught by: the
+//     reconcile sweep (boot, every few hours, the daily cron), and by
+//     refreshMembership() the moment the trader opens the app near/after the
+//     end date — it asks Gumroad for the membership's charges and settles any
+//     we haven't seen.
+//  3. Cancellation / end / restart arrive as resource-subscription posts; they
+//     only update the "auto-renew" state shown in Settings. Access itself always
+//     runs to the end of the period already paid for.
+
+// Which account does a Gumroad membership belong to? The one its earlier
+// charges were granted to.
+async function uidForSubscription(subscriptionId) {
+  if (!subscriptionId) return null;
+  try {
+    const q = await db.collection('gumroadSales').where('subscriptionId', '==', String(subscriptionId)).limit(10).get();
+    for (const d of q.docs) { const x = d.data(); if (x && x.uid && (x.status === 'GRANTED' || x.status === 'HELD')) return x.uid; }
+  } catch (e) { console.warn('[gumroad] uid for subscription', subscriptionId + ':', e.message); }
+  return null;
+}
+
+// Charges parked while a higher plan was active (see settleGumroadSale).
+async function settleHeldSales(uid) {
+  let n = 0;
+  try {
+    const q = await db.collection('gumroadSales').where('uid', '==', uid).where('status', '==', 'HELD').limit(5).get();
+    for (const d of q.docs) {
+      try { const r = await settleGumroadSale(d.id, { subscription_id: d.data().subscriptionId || '' }); if (r && r.ok && !r.held) n++; }
+      catch (e) { console.warn('[gumroad] held sale', d.id + ':', e.message); }
+    }
+  } catch (e) { /* index still building or no held sales */ }
+  return n;
+}
+
+// Mirror a membership's live Gumroad state onto users/{uid}.subscription.
+function membershipMirror(sub) {
+  const st = String(sub.status || '').toLowerCase();
+  const ms = (v) => { const t = v ? Date.parse(v) : NaN; return isFinite(t) ? t : null; };
+  return {
+    membershipStatus: st || null,
+    autoRenew: st === 'alive' || st === 'pending_failure',
+    cancelledAt: ms(sub.cancelled_at) || ms(sub.user_requested_cancellation_at),
+    endedAt: ms(sub.ended_at),
+    failedAt: ms(sub.failed_at),
+    membershipCheckedAt: Date.now(),
+  };
+}
+
+// Ask Gumroad about this trader's membership: update the auto-renew mirror and
+// settle any renewal charge whose ping we never received. Throttled per uid.
+const _memRefreshAt = new Map();
+async function refreshMembership(uid, opts) {
+  const force = !!(opts && opts.force);
+  if (!gumroad.configured()) return null;
+  const last = _memRefreshAt.get(uid) || 0;
+  if (!force && Date.now() - last < 10 * 60 * 1000) return null;
+  _memRefreshAt.set(uid, Date.now());
+  const ref = db.collection('users').doc(uid);
+  const snap = await ref.get();
+  const cur = (snap.exists && snap.data().subscription) || {};
+  const subId = cur.subscriptionId;
+  if (!subId || cur.comp) return null;
+  let sub;
+  try { sub = await gumroad.getSubscriber(subId); }
+  catch (e) { console.warn('[gumroad] membership refresh', uid + ':', e.message); return null; }
+  let healed = 0;
+  const ids = Array.isArray(sub.purchase_ids) ? sub.purchase_ids.slice(-6) : [];
+  for (const id of ids) {
+    try {
+      const seen = await db.collection('gumroadSales').doc(String(id)).get();
+      if (seen.exists && ['GRANTED', 'HELD', 'REFUNDED'].includes(seen.data().status)) continue;
+      const r = await settleGumroadSale(String(id), { subscription_id: subId, url_params: { uid } });
+      if (r && r.ok && !r.already) healed++;
+    } catch (e) { console.warn('[gumroad] refresh settle', id + ':', e.message); }
+  }
+  await ref.set({ subscription: membershipMirror(sub) }, { merge: true });
+  if (healed) console.log(`[gumroad] membership refresh for ${uid}: settled ${healed} missed renewal charge(s)`);
+  return { status: sub.status, healed };
+}
+
+// Cancellation / subscription_ended / subscription_restarted / subscription_updated
+// posts. Unauthenticated, so only the subscription id is used — the real state
+// is fetched from Gumroad with our token.
+async function handleMembershipEvent(subscriptionId, body) {
+  const subId = String(subscriptionId || '').trim();
+  if (!subId) return { ok: false, reason: 'no subscription_id' };
+  let sub;
+  try { sub = await gumroad.getSubscriber(subId); }
+  catch (e) { return { ok: false, reason: 'unknown subscription' }; }
+  let uid = await uidForSubscription(subId);
+  if (!uid && sub.user_email) {
+    try { uid = (await admin.auth().getUserByEmail(String(sub.user_email).trim())).uid; } catch (e) { /* no account */ }
+  }
+  if (!uid) return { ok: false, reason: 'no matching account' };
+  const ref = db.collection('users').doc(uid);
+  const snap = await ref.get();
+  const cur = (snap.exists && snap.data().subscription) || {};
+  const mirror = membershipMirror(sub);
+  // A different membership than the one backing access (e.g. the old plan after
+  // an upgrade) only updates that side note.
+  if (cur.subscriptionId && cur.subscriptionId !== subId) {
+    if (cur.extraMembership && cur.extraMembership.subscriptionId === subId) {
+      await ref.set({ subscription: { extraMembership: { membershipStatus: mirror.membershipStatus, autoRenew: mirror.autoRenew } } }, { merge: true });
+    }
+    return { ok: true, uid, side: true };
+  }
+  await ref.set({ subscription: mirror }, { merge: true });
+  // A restart charges the card — make sure that charge is settled right away.
+  if (mirror.autoRenew) refreshMembership(uid, { force: true }).catch(() => {});
+  console.log(`[gumroad] membership ${subId} for ${uid}: ${sub.status}`);
+  return { ok: true, uid, status: sub.status };
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -2916,8 +3104,18 @@ app.get('/api/admin/user', authLimiter, requireAdmin, async (req, res) => {
 app.post('/api/gumroad/ping', webhookLimiter, async (req, res) => {
   try {
     const b = req.body || {};
-    // Sales pings carry sale_id; refund/dispute resource posts have been seen
-    // with id — accept either, the sale is re-fetched by id regardless.
+    // Membership lifecycle posts (cancelled, ended, restarted, plan changed)
+    // carry a subscription_id but no sale_id.
+    const isMembershipEvent = !b.sale_id && b.subscription_id && (
+      b.resource_name ? /cancellation|subscription_/.test(String(b.resource_name))
+        : ('cancelled' in b || 'ended_at' in b || 'ended_reason' in b || 'restarted_at' in b || 'new_plan' in b || 'old_plan' in b || 'cancelled_at' in b));
+    if (isMembershipEvent) {
+      const r = await handleMembershipEvent(b.subscription_id, b);
+      return res.status(200).json({ status: r.ok ? 'ok' : 'ignored', reason: r.reason });
+    }
+    // Sales pings carry sale_id (every automatic renewal charge is one); refund/
+    // dispute resource posts have been seen with id — accept either, the sale is
+    // re-fetched by id regardless.
     const saleId = String(b.sale_id || b.id || '').trim();
     if (!saleId) return res.status(200).json({ status: 'ignored', reason: 'no sale_id' });
     const r = await settleGumroadSale(saleId, b);
@@ -2962,6 +3160,28 @@ app.get('/api/subscribe/me', requireAuth, async (req, res) => {
       if (stale || c.plan !== 'ultra') await grantSubscription(req.uid, 'ultra', 'yearly', { comp: true });
       return res.json({ access: true, comp: true, plan: 'ultra', pro: true, ultra: true, limits: limitsFor('ultra') });
     }
+    // Auto-renewing memberships: near or past the end date, ask Gumroad whether
+    // the card was charged and settle any renewal whose ping never arrived —
+    // so the app sees the new end date the moment the trader opens it. A charge
+    // parked under a higher plan is settled once that plan has run out.
+    let subDoc = {};
+    try {
+      const us = await db.collection('users').doc(req.uid).get();
+      subDoc = (us.exists && us.data().subscription) || {};
+      const c0 = user.customClaims || {};
+      const exp0 = Number(c0.expiresAt || subDoc.expiresAt || 0);
+      let changed = false;
+      if (subDoc.subscriptionId && !subDoc.comp && (!exp0 || exp0 - Date.now() < 2 * DAY_MS)) {
+        const r = await refreshMembership(req.uid);
+        changed = !!(r && r.healed);
+      }
+      if (!c0.subscribed || exp0 < Date.now()) changed = (await settleHeldSales(req.uid)) > 0 || changed;
+      if (changed) {
+        const us2 = await db.collection('users').doc(req.uid).get();
+        subDoc = (us2.exists && us2.data().subscription) || {};
+      }
+    } catch (e) { console.warn('subscribe/me membership check:', e.message); }
+
     const a = await access.accessFor(req.uid, null);   // null = always read fresh claims
     const p = tokenPlan(req.token) || planOfAccess(a);
     // A lapsed plan is reported as lapsed: pro/ultra are false and the old plan
@@ -2991,6 +3211,28 @@ app.get('/api/subscribe/me', requireAuth, async (req, res) => {
     // cancel the Essential membership from the Gumroad receipt — the pricing
     // page explains this next to the button.
     if (a.active && p !== 'ultra') out.upgrade = { via: 'gumroad', to: out.pro ? 'ultra' : 'pro' };
+
+    // Auto-renew state for Settings / the plans page. nextChargeAt is the next
+    // automatic charge (same calendar day each month / quarter / year).
+    if (subDoc.subscriptionId && !subDoc.comp) {
+      const months = { monthly: 1, quarterly: 3, yearly: 12 }[subDoc.cycle] || 1;
+      let next = null;
+      if (subDoc.autoRenew && subDoc.lastChargeAt) {
+        const d = new Date(Number(subDoc.lastChargeAt)); d.setUTCMonth(d.getUTCMonth() + months);
+        next = d.getTime();
+      }
+      out.renewal = {
+        autoRenew: !!subDoc.autoRenew, status: subDoc.membershipStatus || null,
+        nextChargeAt: next, cancelledAt: subDoc.cancelledAt || null, failedAt: subDoc.failedAt || null,
+        lastChargeAt: subDoc.lastChargeAt || null, cycle: subDoc.cycle || null,
+        manageUrl: 'https://app.gumroad.com/library',
+      };
+      const x = subDoc.extraMembership;
+      if (x && x.subscriptionId && x.subscriptionId !== subDoc.subscriptionId && x.autoRenew !== false
+          && Number(x.lastChargeAt) > Date.now() - 400 * DAY_MS) {
+        out.renewal.alsoPaying = { plan: x.plan, cycle: x.cycle };
+      }
+    }
     res.json(out);
   } catch (e) {
     console.error('subscribe/me:', e.message);
@@ -3105,6 +3347,15 @@ setTimeout(() => { sweepDirectPlans().catch(() => {}); }, 90000);
   }
   // Boot-time reconciliation: exactly the moment missed pings need healing is
   // right after downtime — which is right now, since we just started.
+  // Renewal charges whose ping was missed are healed every 3 hours as well as
+  // at boot and from the daily cron.
+  if (gumroad.configured()) {
+    setInterval(() => {
+      reconcileGumroadSales(2)
+        .then((r) => { if (r.healed) console.log('[gumroad] periodic reconcile:', JSON.stringify(r)); })
+        .catch((e) => console.warn('[gumroad] periodic reconcile:', e.message));
+    }, 3 * 60 * 60 * 1000);
+  }
   if (gumroad.configured()) {
     reconcileGumroadSales(3)
       .then((r) => { if (r.checked) console.log('[gumroad] boot reconcile:', JSON.stringify(r)); })
