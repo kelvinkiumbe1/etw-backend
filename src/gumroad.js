@@ -16,10 +16,11 @@
 // access token, and only that verified copy decides who gets access to what.
 const API = 'https://api.gumroad.com/v2';
 
+// The access token is the only hard requirement: the auto-renewing membership
+// products are built in below, so plan sales match even before any
+// GUMROAD_PRODUCT_* variable is set.
 function configured() {
-  return !!(process.env.GUMROAD_ACCESS_TOKEN
-    && process.env.GUMROAD_PRODUCT_ESSENTIAL
-    && process.env.GUMROAD_PRODUCT_PRO);
+  return !!process.env.GUMROAD_ACCESS_TOKEN;
 }
 
 // Accept a permalink ('etw-pro'), a product id, or a pasted URL
@@ -33,17 +34,30 @@ function normalizeKey(v) {
 // Product → plan/cycle mapping. The two monthly products are required; the
 // yearly ones are optional extras (they are SEPARATE Gumroad products, since
 // one product can't sell two cadences at two prices).
+//
+// AUTO-RENEWING MEMBERSHIPS: each plan/cycle is a Gumroad membership product
+// (built in below — their permalinks are public, not secrets). Gumroad charges
+// the saved card every period and pings us with a NEW sale for each charge, so
+// every renewal lands here like a purchase and pushes the access end date on.
+// Each env var may hold several products, comma-separated; whatever is in it
+// (e.g. the older one-off plan products) keeps matching too, so refunds and the
+// reconcile sweep still recognise sales made before the switch.
 const PRODUCTS = [
-  { env: 'GUMROAD_PRODUCT_ULTRA_YEARLY',        plan: 'ultra',     cycle: 'yearly' },
-  { env: 'GUMROAD_PRODUCT_ULTRA_QUARTERLY',     plan: 'ultra',     cycle: 'quarterly' },
-  { env: 'GUMROAD_PRODUCT_ULTRA',               plan: 'ultra',     cycle: null },
-  { env: 'GUMROAD_PRODUCT_ESSENTIAL_YEARLY',    plan: 'essential', cycle: 'yearly' },
-  { env: 'GUMROAD_PRODUCT_PRO_YEARLY',          plan: 'pro',       cycle: 'yearly' },
-  { env: 'GUMROAD_PRODUCT_ESSENTIAL_QUARTERLY', plan: 'essential', cycle: 'quarterly' },
-  { env: 'GUMROAD_PRODUCT_PRO_QUARTERLY',       plan: 'pro',       cycle: 'quarterly' },
-  { env: 'GUMROAD_PRODUCT_ESSENTIAL',           plan: 'essential', cycle: null },
-  { env: 'GUMROAD_PRODUCT_PRO',                 plan: 'pro',       cycle: null },
+  { env: 'GUMROAD_PRODUCT_ULTRA_YEARLY',        plan: 'ultra',     cycle: 'yearly',    builtin: ['woyvhw'] },
+  { env: 'GUMROAD_PRODUCT_ULTRA_QUARTERLY',     plan: 'ultra',     cycle: 'quarterly', builtin: ['bjzbo'] },
+  { env: 'GUMROAD_PRODUCT_ULTRA',               plan: 'ultra',     cycle: null,        builtin: ['avzke'] },
+  { env: 'GUMROAD_PRODUCT_ESSENTIAL_YEARLY',    plan: 'essential', cycle: 'yearly',    builtin: ['zyzcrs'] },
+  { env: 'GUMROAD_PRODUCT_PRO_YEARLY',          plan: 'pro',       cycle: 'yearly',    builtin: ['jnjatl'] },
+  { env: 'GUMROAD_PRODUCT_ESSENTIAL_QUARTERLY', plan: 'essential', cycle: 'quarterly', builtin: ['fgwpe'] },
+  { env: 'GUMROAD_PRODUCT_PRO_QUARTERLY',       plan: 'pro',       cycle: 'quarterly', builtin: ['bjooc'] },
+  { env: 'GUMROAD_PRODUCT_ESSENTIAL',           plan: 'essential', cycle: null,        builtin: ['lnwmoi'] },
+  { env: 'GUMROAD_PRODUCT_PRO',                 plan: 'pro',       cycle: null,        builtin: ['hqreye'] },
 ];
+// Every product key (permalink or id) that sells this plan/cycle.
+function productKeys(p) {
+  return String(process.env[p.env] || '').split(',').map(normalizeKey).filter(Boolean)
+    .concat((p.builtin || []).map(normalizeKey));
+}
 
 // ── Auto-Sync token packs ──────────────────────────────────────────────────
 // These are NOT subscriptions: they buy a prepaid token balance that the sync
@@ -90,8 +104,7 @@ function matchSale(sale) {
   const keys = [sale.product_id, sale.product_permalink, sale.permalink]
     .filter(Boolean).map(normalizeKey);
   for (const p of PRODUCTS) {
-    const want = normalizeKey(process.env[p.env]);
-    if (!want || !keys.includes(want)) continue;
+    if (!productKeys(p).some((k) => keys.includes(k))) continue;
     const r = String(sale.subscription_duration || sale.recurrence || '').toLowerCase();
     return { plan: p.plan, cycle: p.cycle || (r === 'yearly' ? 'yearly' : (r === 'quarterly' || r === 'every_3_months') ? 'quarterly' : 'monthly') };
   }
@@ -117,14 +130,35 @@ async function getSale(saleId) {
   return json.sale;
 }
 
-// Refund/dispute notifications are NOT covered by the Settings → Ping URL
-// (that only fires on sales); they arrive via the Resource Subscriptions API,
-// registered programmatically. Called once at boot — idempotent: an existing
-// registration for the same resource + post_url is left alone.
+// A membership as Gumroad sees it right now: status (alive, pending_cancellation,
+// pending_failure, failed_payment, cancelled, fixed_subscription_period_ended),
+// cancelled_at / ended_at / failed_at, recurrence. Fetched under OUR token, so
+// it is the authentic state — the cancellation/ended posts themselves are
+// unauthenticated and are only ever used as a cue to come and look here.
+async function getSubscriber(subscriptionId) {
+  if (!configured()) throw Object.assign(new Error('Gumroad is not configured'), { status: 503 });
+  const r = await fetch(API + '/subscribers/' + encodeURIComponent(subscriptionId)
+    + '?access_token=' + encodeURIComponent(process.env.GUMROAD_ACCESS_TOKEN));
+  const text = await r.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch (e) { /* keep raw text for the error */ }
+  if (!r.ok || !json || json.success !== true || !json.subscriber) {
+    throw Object.assign(new Error('Gumroad subscriber ' + r.status + ': ' + text.slice(0, 200)), { status: r.status || 502 });
+  }
+  return json.subscriber;
+}
+
+// Refunds, disputes and the membership lifecycle (cancelled, ended, restarted,
+// tier/plan changed) are NOT covered by the Settings → Ping URL (that only
+// fires on sales — including every automatic renewal charge); they arrive via
+// the Resource Subscriptions API, registered programmatically. Called once at
+// boot — idempotent: an existing registration for the same resource + post_url
+// is left alone.
+const RESOURCES = ['refund', 'dispute', 'cancellation', 'subscription_ended', 'subscription_restarted', 'subscription_updated'];
 async function ensureResourceSubscriptions(postUrl) {
   const token = process.env.GUMROAD_ACCESS_TOKEN;
   const out = {};
-  for (const name of ['refund', 'dispute']) {
+  for (const name of RESOURCES) {
     try {
       const list = await fetch(API + '/resource_subscriptions?resource_name=' + name
         + '&access_token=' + encodeURIComponent(token));
@@ -148,7 +182,7 @@ async function ensureResourceSubscriptions(postUrl) {
 async function listResourceSubscriptions() {
   const token = process.env.GUMROAD_ACCESS_TOKEN;
   const out = {};
-  for (const name of ['refund', 'dispute']) {
+  for (const name of RESOURCES) {
     const r = await fetch(API + '/resource_subscriptions?resource_name=' + name
       + '&access_token=' + encodeURIComponent(token));
     const j = await r.json().catch(() => null);
@@ -175,4 +209,4 @@ async function recentSales(days) {
   return sales;
 }
 
-module.exports = { configured, matchSale, matchTokenSale, tokenProductMap, getSale, normalizeKey, ensureResourceSubscriptions, listResourceSubscriptions, recentSales };
+module.exports = { configured, matchSale, matchTokenSale, tokenProductMap, getSale, getSubscriber, normalizeKey, ensureResourceSubscriptions, listResourceSubscriptions, recentSales };
