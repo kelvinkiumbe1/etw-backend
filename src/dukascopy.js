@@ -56,13 +56,45 @@ function cacheSet(url, bars, ttlMs) {
   while (cache.size > MAX_FILES) cache.delete(cache.keys().next().value);
 }
 
+// ── Persistent store for finished files ────────────────────────────────────
+// Dukascopy's CDN is slow (8-12 s a file) and often refuses requests outright,
+// and every deploy empties the memory cache. When a chart's files don't come
+// back in time, Backtesting has nothing real to show for US100. A finished
+// period never changes, so each file is fetched from Dukascopy once and kept
+// in Firestore (dukaFiles/*, server-only: the rules' catch-all denies clients)
+// as the original LZMA bytes, a few KB to ~40 KB each.
+let _db = null;
+function db() {
+  if (_db === false) return null;
+  if (_db) return _db;
+  try { _db = require('./firebaseAdmin').admin.firestore(); } catch (e) { _db = false; }
+  return _db || null;
+}
+const storeId = (url) => url.slice(BASE.length + 1).replace(/\//g, '_');
+async function storedFile(url) {
+  const d = db(); if (!d) return undefined;
+  try {
+    const snap = await d.collection('dukaFiles').doc(storeId(url)).get();
+    if (!snap.exists) return undefined;
+    const x = snap.data() || {};
+    return x.empty ? null : Buffer.from(x.data);         // null = Dukascopy has no file for it
+  } catch (e) { return undefined; }
+}
+function keepFile(url, buf) {
+  const d = db(); if (!d) return;
+  if (buf && buf.length > 900 * 1024) return;               // Firestore document limit
+  d.collection('dukaFiles').doc(storeId(url))
+    .set(buf ? { data: buf, at: Date.now() } : { empty: true, at: Date.now() })
+    .catch((e) => console.warn('[dukascopy] store:', e.message));
+}
+
 async function fetchFile(url) {
   // Dukascopy's CDN times out now and then, and answers 503 when asked for
   // many files at once; a retry after a pause almost always works.
   let lastErr;
-  for (let attempt = 0; attempt < 4; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), 20000);
+    const timer = setTimeout(() => ctl.abort(), 15000);
     try {
       const r = await fetch(url, { signal: ctl.signal, headers: { 'User-Agent': 'Mozilla/5.0 (ETW Journal)' } });
       if (r.status === 404) return null;                    // no data for that period
@@ -185,11 +217,15 @@ async function getCandles({ symbol, interval, from, to }) {
     }));
   }
   let missing = 0, lastErr = null;
-  const parts = await mapLimit(files, 3, async (f) => {
+  const parts = await mapLimit(files, 4, async (f) => {
     const hit = cacheGet(f.url);
     if (hit) return hit;
     try {
-      const buf = await fetchFile(f.url);
+      let buf = f.done ? await storedFile(f.url) : undefined;
+      if (buf === undefined) {
+        buf = await fetchFile(f.url);
+        if (f.done) keepFile(f.url, buf);
+      }
       const bars = buf ? parse(buf, f.start, inst.scale) : [];
       cacheSet(f.url, bars, f.done ? 30 * DAY * 1000 : 60 * 1000);
       return bars;
