@@ -10,7 +10,7 @@ function configured() {
 
 // Returns { ok, reason, status, body, messageId } so callers can report *why* a
 // send failed. sendEmail() below keeps the plain boolean contract.
-async function sendEmailVerbose({ to, toName, subject, html }) {
+async function sendEmailVerbose({ to, toName, subject, html, headers }) {
   if (!configured()) {
     console.log('[email] BREVO not configured — skipping send:', subject);
     return { ok: false, reason: 'not_configured' };
@@ -29,6 +29,8 @@ async function sendEmailVerbose({ to, toName, subject, html }) {
         to: [{ email: to, name: toName || to }],
         subject,
         htmlContent: html,
+        // Optional extra mail headers (e.g. List-Unsubscribe for product updates).
+        ...(headers && typeof headers === 'object' ? { headers } : {}),
       }),
     });
     const body = await r.text().catch(() => '');
