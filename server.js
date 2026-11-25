@@ -2222,7 +2222,7 @@ async function notifyExpired(uid, ref, sub) {
         html: emailShell('Your subscription has ended',
           `<p>Your <b>${planTitle(sub.plan)}</b> plan ended on <b>${nice(sub.expiresAt)}</b>, so journalling, broker sync and analytics are locked for now.</p>
            <p><b>Nothing has been deleted.</b> Every trade, note and playbook is exactly where you left it and comes straight back the moment you resubscribe.</p>`,
-          'Reactivate my plan', APP_URL + '/payment.html'),
+          'Reactivate my plan', APP_URL + '/payment'),
       });
     }
   } catch (e) { console.warn('expiry email ' + uid + ':', e.message); }
@@ -2262,7 +2262,7 @@ async function sweepSubscriptions() {
         html: emailShell('Your plan is about to end',
           `<p>Your <b>${planTitle(sub.plan)}</b> plan ends on <b>${nice(sub.expiresAt)}</b> — that's ${left} day${left === 1 ? '' : 's'} away.</p>
            <p>Nothing renews automatically, so pay again before then to keep going. Your trades stay exactly where they are either way; they just become read-only until you're back.</p>`,
-          'Pay for another period', APP_URL + '/payment.html'),
+          'Pay for another period', APP_URL + '/payment'),
       });
       await doc.ref.set({ subscription: { remindedFor: Number(sub.expiresAt) } }, { merge: true });
       out.warned++;
@@ -3091,7 +3091,7 @@ const ANNOUNCEMENTS = {
        <p>Hi${name ? ' ' + escapeHtml(name) : ''},</p>
        <p>ETW Journal has a new logo: gold ETW lettering with a quill, on our signature purple.</p>
        <p><b>Your journal is still here.</b> Every trade, note and playbook you saved is exactly where you left it. Pick a plan and it all opens up again, right where you stopped.</p>`,
-      'Reactivate my plan', APP_URL + '/payment.html'),
+      'Reactivate my plan', APP_URL + '/payment'),
       'You’re getting this because you had an ETW Journal plan.', unsub),
   },
 };
@@ -3250,7 +3250,7 @@ app.post('/api/admin/revoke', authLimiter, requireAdmin, async (req, res) => {
           `<p>Your ETW Journal subscription has been closed, so journalling, broker sync and analytics are locked.</p>`
           + (reason ? `<p><b>Reason:</b> ${escapeHtml(reason)}</p>` : '')
           + `<p><b>Nothing has been deleted.</b> Every trade, note and playbook is exactly where you left it and comes straight back if you subscribe again.</p>`,
-          'View plans', APP_URL + '/payment.html'),
+          'View plans', APP_URL + '/payment'),
       }).catch((e) => ({ ok: false, reason: 'threw', body: e.message }));
       notified = !!sent.ok;
       if (!sent.ok) notifyError = [sent.reason, sent.status, sent.body].filter(Boolean).join(' ');
