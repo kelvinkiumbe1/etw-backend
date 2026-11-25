@@ -3050,6 +3050,85 @@ app.post('/api/admin/email-test', authLimiter, requireAdmin, async (req, res) =>
   });
 });
 
+// ══════════════════════════════════════════════════════════════
+//  ADMIN: one-off announcement to active subscribers (new brand logo)
+// ══════════════════════════════════════════════════════════════
+// Same route as every other account email: Brevo transactional through
+// email.sendEmail() and the shared emailShell(). Admin-only (ADMIN_SECRET or an
+// admin uid), dry run unless {"send":true}, and each user is stamped with
+// announcements.<id> once their email goes out, so running it again never sends
+// anyone a second copy. Works in batches (default 100) to stay well inside the
+// request timeout and Brevo's rate limit — call again until `remaining` is 0.
+const BRAND_LOGO_URL = process.env.BRAND_LOGO_URL || 'https://etwjournal.space/assets/etw-logo-email-v4.png';
+const ANNOUNCEMENTS = {
+  'brand-2026-11': {
+    subject: 'ETW Journal has a new look',
+    html: (name) => emailShell('Meet the new ETW Journal logo',
+      `<p style="text-align:center;margin:6px 0 18px"><img src="${BRAND_LOGO_URL}" width="120" height="120" alt="The new ETW Journal logo" style="display:inline-block;width:120px;height:120px;border:0;border-radius:26px"></p>
+       <p>Hi${name ? ' ' + escapeHtml(name) : ''},</p>
+       <p>ETW Journal has a new logo: gold ETW lettering with a quill, on our signature purple. You'll see it across the app, on your home-screen icon, in your browser tab and on etwjournal.space.</p>
+       <p><b>Nothing else changes.</b> Your trades, notes, playbooks, plan and sign-in stay exactly as they were, and there's nothing you need to do.</p>
+       <p style="color:#555;font-size:13px">Still seeing the old icon on your phone? On iPhone, remove the home-screen shortcut and add it again from Safari. On Android it updates by itself within a few days, or straight away if you reinstall it.</p>`,
+      'Open your journal', APP_URL + '/journal.html'),
+  },
+};
+
+app.post('/api/admin/announce', authLimiter, requireAdmin, async (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || '');
+  const A = ANNOUNCEMENTS[id];
+  if (!A) return res.status(400).json({ error: 'unknown announcement id', ids: Object.keys(ANNOUNCEMENTS) });
+  const send = b.send === true;
+  const batch = Math.min(Math.max(parseInt(b.limit, 10) || 100, 1), 300);
+  if (send && !email.configured()) return res.status(503).json({ error: 'Brevo is not configured (BREVO_API_KEY / BREVO_SENDER).' });
+  // {"testTo":"you@example.com"} sends this one email to that address only, so you can see it in a real inbox first.
+  const testTo = String(b.testTo || '').trim();
+  if (testTo) {
+    const r = await email.sendEmailVerbose({ to: testTo, toName: '', subject: A.subject, html: A.html('') });
+    return res.status(r.ok ? 200 : 502).json({ id, test: true, to: testTo, ...r });
+  }
+
+  const now = Date.now();
+  const out = { id, send, sent: 0, failed: 0, eligible: 0, alreadySent: 0, skipped: 0, remaining: 0, failures: [], sample: [] };
+  try {
+    // Active, paying members: status active and not past their end date. Comp
+    // (your own) accounts are left out.
+    const snap = await db.collection('users').where('subscription.status', '==', 'active').get();
+    const todo = [];
+    for (const doc of snap.docs) {
+      const d = doc.data() || {}, sub = d.subscription || {};
+      if (sub.comp) { out.skipped++; continue; }
+      // A Gumroad membership stays active past expiresAt while its renewal is in flight.
+      if (Number(sub.expiresAt) && Number(sub.expiresAt) < now && !(sub.autoRenew && sub.subscriptionId)) { out.skipped++; continue; }
+      if (d.announcements && d.announcements[id]) { out.alreadySent++; continue; }
+      todo.push(doc);
+    }
+    out.eligible = todo.length;
+    const slice = todo.slice(0, batch);
+    for (const doc of slice) {
+      let user;
+      try { user = await admin.auth().getUser(doc.id); } catch (e) { out.skipped++; continue; }
+      if (!user.email || user.disabled) { out.skipped++; continue; }
+      if (!send) { if (out.sample.length < 20) out.sample.push(user.email); continue; }
+      const r = await email.sendEmailVerbose({ to: user.email, toName: user.displayName || '', subject: A.subject, html: A.html(user.displayName || '') });
+      if (r.ok) {
+        out.sent++;
+        await doc.ref.set({ announcements: { [id]: { sentAt: Date.now(), messageId: r.messageId || null } } }, { merge: true });
+      } else {
+        out.failed++;
+        if (out.failures.length < 20) out.failures.push({ email: user.email, reason: r.reason, status: r.status || null });
+      }
+      await new Promise((ok) => setTimeout(ok, 150));   // gentle on Brevo's rate limit
+    }
+    out.remaining = send ? Math.max(0, todo.length - out.sent - out.failed) : todo.length;
+    console.log('[announce]', id, JSON.stringify({ send, sent: out.sent, failed: out.failed, remaining: out.remaining, by: req.adminBy }));
+    res.json(out);
+  } catch (e) {
+    console.error('announce:', e.message);
+    res.status(500).json({ error: 'announce failed', detail: e.message, ...out });
+  }
+});
+
 app.post('/api/admin/revoke', authLimiter, requireAdmin, async (req, res) => {
   try {
     const b = req.body || {};
