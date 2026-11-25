@@ -432,6 +432,8 @@ const APPCHECK_EXEMPT = [
   // Admin routes carry their own stronger auth (admin uid or ADMIN_SECRET) and
   // must stay callable from a terminal, where no App Check token exists.
   /^\/api\/admin\//,
+  // Unsubscribe links are opened from an email, and mail apps post to them for one-click unsubscribe.
+  /^\/api\/email\/unsubscribe/,
 ];
 app.use(function (req, res, next) {
   if (!req.path.startsWith('/api/')) return next();
@@ -3060,18 +3062,112 @@ app.post('/api/admin/email-test', authLimiter, requireAdmin, async (req, res) =>
 // anyone a second copy. Works in batches (default 100) to stay well inside the
 // request timeout and Brevo's rate limit — call again until `remaining` is 0.
 const BRAND_LOGO_URL = process.env.BRAND_LOGO_URL || 'https://etwjournal.space/assets/etw-logo-email-v4.png';
+const BRAND_LOGO_HTML = `<p style="text-align:center;margin:6px 0 18px"><img src="${BRAND_LOGO_URL}" width="120" height="120" alt="The new ETW Journal logo" style="display:inline-block;width:120px;height:120px;border:0;border-radius:26px"></p>`;
+// Footer line with the unsubscribe link, added inside emailShell's wrapper.
+function withUnsubscribe(html, why, url) {
+  if (!url) return html;
+  const foot = `<p style="color:#999;font-size:12px;margin-top:6px">${why} <a href="${url}" style="color:#999">Unsubscribe from product updates</a>.</p>`;
+  return html.replace(/<\/div>\s*$/, foot + '</div>');
+}
+// audience: 'active' = paying members now · 'lapsed' = their plan ended (not refunds, not comp).
 const ANNOUNCEMENTS = {
   'brand-2026-11': {
+    audience: 'active',
     subject: 'ETW Journal has a new look',
     html: (name) => emailShell('Meet the new ETW Journal logo',
-      `<p style="text-align:center;margin:6px 0 18px"><img src="${BRAND_LOGO_URL}" width="120" height="120" alt="The new ETW Journal logo" style="display:inline-block;width:120px;height:120px;border:0;border-radius:26px"></p>
+      `${BRAND_LOGO_HTML}
        <p>Hi${name ? ' ' + escapeHtml(name) : ''},</p>
        <p>ETW Journal has a new logo: gold ETW lettering with a quill, on our signature purple. You'll see it across the app, on your home-screen icon, in your browser tab and on etwjournal.space.</p>
        <p><b>Nothing else changes.</b> Your trades, notes, playbooks, plan and sign-in stay exactly as they were, and there's nothing you need to do.</p>
        <p style="color:#555;font-size:13px">Still seeing the old icon on your phone? On iPhone, remove the home-screen shortcut and add it again from Safari. On Android it updates by itself within a few days, or straight away if you reinstall it.</p>`,
       'Open your journal', APP_URL + '/journal.html'),
   },
+  'brand-2026-11-lapsed': {
+    audience: 'lapsed',
+    unsubscribe: true,
+    subject: 'ETW Journal has a new look',
+    html: (name, unsub) => withUnsubscribe(emailShell('Meet the new ETW Journal logo',
+      `${BRAND_LOGO_HTML}
+       <p>Hi${name ? ' ' + escapeHtml(name) : ''},</p>
+       <p>ETW Journal has a new logo: gold ETW lettering with a quill, on our signature purple.</p>
+       <p><b>Your journal is still here.</b> Every trade, note and playbook you saved is exactly where you left it. Pick a plan and it all opens up again, right where you stopped.</p>`,
+      'Reactivate my plan', APP_URL + '/payment.html'),
+      'You’re getting this because you had an ETW Journal plan.', unsub),
+  },
 };
+
+// ── Unsubscribe from product updates ──────────────────────────────
+// Signed per-user links (HMAC with a random key kept server-side in Firestore,
+// created on first use), so nobody can unsubscribe someone else. Opening the
+// link shows a confirm button (mail scanners that pre-open links can't
+// unsubscribe anyone); the button and mail apps' one-click unsubscribe POST.
+// Sets users/{uid}.emailPrefs.announcements = false; every announcement skips
+// those users. Account emails (receipts, resets, security) are unaffected.
+let _unsubKey = null;
+async function unsubKey() {
+  if (_unsubKey) return _unsubKey;
+  const ref = db.collection('serverConfig').doc('unsubscribe');
+  await db.runTransaction(async (tx) => {
+    const s = await tx.get(ref);
+    if (s.exists && s.data().key) { _unsubKey = s.data().key; return; }
+    _unsubKey = crypto.randomBytes(32).toString('base64url');
+    tx.set(ref, { key: _unsubKey, createdAt: Date.now() });
+  });
+  return _unsubKey;
+}
+async function unsubToken(uid) { return crypto.createHmac('sha256', await unsubKey()).update('unsub|' + uid).digest('base64url').slice(0, 32); }
+function backendBase() {
+  return (process.env.PUBLIC_BACKEND_URL || process.env.RENDER_EXTERNAL_URL || 'https://etwappmeta5-2.onrender.com').replace(/\/+$/, '');
+}
+async function unsubUrl(uid) { return backendBase() + '/api/email/unsubscribe?u=' + encodeURIComponent(uid) + '&t=' + (await unsubToken(uid)); }
+function unsubPage(title, body, form) {
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title></head>
+  <body style="margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#140A24;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;color:#eeecf7;padding:20px">
+  <div style="max-width:420px;width:100%;background:#1E1233;border:1px solid rgba(255,255,255,.08);border-radius:20px;padding:30px 26px;text-align:center">
+  <img src="${BRAND_LOGO_URL}" width="72" height="72" alt="ETW Journal" style="border-radius:17px">
+  <h2 style="margin:16px 0 8px;font-size:20px">${title}</h2><p style="color:#a7a1bf;line-height:1.55;margin:0">${body}</p>${form || ''}</div></body></html>`;
+}
+async function unsubCheck(q) {
+  const uid = String((q && q.u) || ''), t = String((q && q.t) || '');
+  if (!/^[A-Za-z0-9_-]{6,128}$/.test(uid) || !t) return null;
+  return secretMatches(t, await unsubToken(uid)) ? uid : null;
+}
+app.get('/api/email/unsubscribe', authLimiter, async (req, res) => {
+  try {
+    const uid = await unsubCheck(req.query);
+    if (!uid) return res.status(400).type('html').send(unsubPage('This link isn’t valid', 'It may have been copied incompletely. Open it again from the email.'));
+    const action = '/api/email/unsubscribe?u=' + encodeURIComponent(uid) + '&t=' + encodeURIComponent(String(req.query.t));
+    res.type('html').send(unsubPage('Stop product updates?', 'You won’t get emails like the new-logo announcement any more. Receipts, password resets and security alerts still arrive.',
+      `<form method="post" action="${action}" style="margin-top:22px"><button style="width:100%;padding:13px;border:0;border-radius:12px;background:linear-gradient(135deg,#7C3AED,#DB2777);color:#fff;font-weight:700;font-size:15px;cursor:pointer">Unsubscribe</button></form>`));
+  } catch (e) { console.error('unsubscribe page:', e.message); res.status(500).type('html').send(unsubPage('Something went wrong', 'Please try again in a minute.')); }
+});
+app.post('/api/email/unsubscribe', authLimiter, async (req, res) => {
+  try {
+    const uid = await unsubCheck(req.query);
+    if (!uid) return res.status(400).type('html').send(unsubPage('This link isn’t valid', 'Open it again from the email.'));
+    await db.collection('users').doc(uid).set({ emailPrefs: { announcements: false, announcementsOffAt: Date.now() } }, { merge: true });
+    console.log('[unsubscribe]', uid);
+    res.type('html').send(unsubPage('You’re unsubscribed', 'You won’t get product update emails from ETW Journal any more. Your account and journal are unaffected.'));
+  } catch (e) { console.error('unsubscribe:', e.message); res.status(500).type('html').send(unsubPage('Something went wrong', 'Please try again in a minute.')); }
+});
+
+// Who an announcement goes to. Returns { todo: [doc], skipped, alreadySent }.
+async function announceAudience(id, A, now) {
+  const out = { todo: [], skipped: 0, alreadySent: 0, optedOut: 0 };
+  const statuses = A.audience === 'lapsed' ? ['active', 'expired'] : ['active'];
+  const snap = await db.collection('users').where('subscription.status', 'in', statuses).get();
+  for (const doc of snap.docs) {
+    const d = doc.data() || {}, sub = d.subscription || {};
+    if (sub.comp) { out.skipped++; continue; }
+    // A Gumroad membership stays active past expiresAt while its renewal is in flight.
+    const live = sub.status === 'active' && !(Number(sub.expiresAt) && Number(sub.expiresAt) < now && !(sub.autoRenew && sub.subscriptionId));
+    if (A.audience === 'lapsed' ? live : !live) { out.skipped++; continue; }
+    if (d.emailPrefs && d.emailPrefs.announcements === false) { out.optedOut++; continue; }
+    if (d.announcements && d.announcements[id]) { out.alreadySent++; continue; }
+    out.todo.push(doc);
+  }
+  return out;
+}
 
 app.post('/api/admin/announce', authLimiter, requireAdmin, async (req, res) => {
   const b = req.body || {};
@@ -3084,25 +3180,19 @@ app.post('/api/admin/announce', authLimiter, requireAdmin, async (req, res) => {
   // {"testTo":"you@example.com"} sends this one email to that address only, so you can see it in a real inbox first.
   const testTo = String(b.testTo || '').trim();
   if (testTo) {
-    const r = await email.sendEmailVerbose({ to: testTo, toName: '', subject: A.subject, html: A.html('') });
+    let link = '';
+    if (A.unsubscribe) { try { link = await unsubUrl((await admin.auth().getUserByEmail(testTo)).uid); } catch (e) { link = backendBase() + '/api/email/unsubscribe?u=test&t=test'; } }
+    const r = await email.sendEmailVerbose({ to: testTo, toName: '', subject: A.subject, html: A.html('', link),
+      headers: link ? { 'List-Unsubscribe': '<' + link + '>', 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' } : undefined });
     return res.status(r.ok ? 200 : 502).json({ id, test: true, to: testTo, ...r });
   }
 
   const now = Date.now();
-  const out = { id, send, sent: 0, failed: 0, eligible: 0, alreadySent: 0, skipped: 0, remaining: 0, failures: [], sample: [] };
+  const out = { id, audience: A.audience, send, sent: 0, failed: 0, eligible: 0, alreadySent: 0, optedOut: 0, skipped: 0, remaining: 0, failures: [], sample: [] };
   try {
-    // Active, paying members: status active and not past their end date. Comp
-    // (your own) accounts are left out.
-    const snap = await db.collection('users').where('subscription.status', '==', 'active').get();
-    const todo = [];
-    for (const doc of snap.docs) {
-      const d = doc.data() || {}, sub = d.subscription || {};
-      if (sub.comp) { out.skipped++; continue; }
-      // A Gumroad membership stays active past expiresAt while its renewal is in flight.
-      if (Number(sub.expiresAt) && Number(sub.expiresAt) < now && !(sub.autoRenew && sub.subscriptionId)) { out.skipped++; continue; }
-      if (d.announcements && d.announcements[id]) { out.alreadySent++; continue; }
-      todo.push(doc);
-    }
+    const aud = await announceAudience(id, A, now);
+    const todo = aud.todo;
+    out.skipped = aud.skipped; out.alreadySent = aud.alreadySent; out.optedOut = aud.optedOut;
     out.eligible = todo.length;
     const slice = todo.slice(0, batch);
     for (const doc of slice) {
@@ -3110,7 +3200,9 @@ app.post('/api/admin/announce', authLimiter, requireAdmin, async (req, res) => {
       try { user = await admin.auth().getUser(doc.id); } catch (e) { out.skipped++; continue; }
       if (!user.email || user.disabled) { out.skipped++; continue; }
       if (!send) { if (out.sample.length < 20) out.sample.push(user.email); continue; }
-      const r = await email.sendEmailVerbose({ to: user.email, toName: user.displayName || '', subject: A.subject, html: A.html(user.displayName || '') });
+      const link = A.unsubscribe ? await unsubUrl(doc.id) : '';
+      const r = await email.sendEmailVerbose({ to: user.email, toName: user.displayName || '', subject: A.subject, html: A.html(user.displayName || '', link),
+        headers: link ? { 'List-Unsubscribe': '<' + link + '>', 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' } : undefined });
       if (r.ok) {
         out.sent++;
         await doc.ref.set({ announcements: { [id]: { sentAt: Date.now(), messageId: r.messageId || null } } }, { merge: true });
