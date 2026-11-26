@@ -7,6 +7,8 @@
 //                     POST /api/dxtrade/disconnect
 //   Bybit ........... POST /api/bybit/connect          { apiKey, apiSecret, env, journalAccountId }  (read-only key)
 //                     POST /api/bybit/disconnect
+//   IBKR ............ POST /api/ibkr/connect           { token, queryId, journalAccountId }  (Flex Web Service, read-only)
+//                     POST /api/ibkr/disconnect
 //   cTrader ......... GET  /api/ctrader/auth           (returns { url } to open — OAuth)
 //                     GET  /api/ctrader/callback       (Spotware redirect target)
 //                     POST /api/ctrader/disconnect
@@ -25,6 +27,7 @@ const tradelocker = require('./src/connectors/tradelocker');
 const dxtrade = require('./src/connectors/dxtrade');
 const ctrader = require('./src/connectors/ctrader');
 const bybit = require('./src/connectors/bybit');
+const ibkr = require('./src/connectors/ibkr');
 const cashflows = require('./src/cashflows');
 const gumroad = require('./src/gumroad');
 const mt5ea = require('./src/connectors/mt5ea');
@@ -342,7 +345,7 @@ app.get('/', (_req, res) => res.json({
   ok: true,
   service: 'etw-sync-backend',
   version: 'ea-2',
-  platforms: { mt5: true, mt4: true, mt5ea: true, tradelocker: true, dxtrade: true, ctrader: ctrader.configured(), bybit: hosted.configured() },
+  platforms: { mt5: true, mt4: true, mt5ea: true, tradelocker: true, dxtrade: true, ctrader: ctrader.configured(), bybit: hosted.configured(), ibkr: hosted.configured() },
   email: email.configured(),
   eodhd: require('./src/eodhd').configured(),
   gumroad: gumroad.configured(),
@@ -833,8 +836,8 @@ app.post('/api/cashflow/sync', authLimiter, requireAuth, withSpace, requireSub, 
 // are never touched. Deleted broker trades are remembered (syncTombstones/
 // {dataUid}) so the next sync does not bring them back; trades that close
 // after the delete keep syncing as normal.
-const SYNC_DEL_GROUPS = ['mt5', 'ctrader', 'notion', 'bybit', 'tradelocker', 'dxtrade', 'other'];
-const SYNC_REIMPORTS = { mt5: 1, ctrader: 1, bybit: 1, tradelocker: 1, dxtrade: 1 };   // servers that would sync them again
+const SYNC_DEL_GROUPS = ['mt5', 'ctrader', 'notion', 'bybit', 'ibkr', 'tradelocker', 'dxtrade', 'other'];
+const SYNC_REIMPORTS = { mt5: 1, ctrader: 1, bybit: 1, ibkr: 1, tradelocker: 1, dxtrade: 1 };   // servers that would sync them again
 function syncGroupOf(t) {
   if (!t) return '';
   const src = String(t.source || '').toLowerCase(), ex = String(t.execSource || '').toLowerCase(), br = String(t.brokerName || '').toLowerCase();
@@ -843,6 +846,7 @@ function syncGroupOf(t) {
   if (/^(mt[45](-ea|-direct|-live|-initial|-sync)?|metatrader[45]?)$/.test(src)) return 'mt5';
   if (src === 'ctrader' || src === 'ctrader_open_api') return 'ctrader';
   if (src === 'bybit') return 'bybit';
+  if (src === 'ibkr') return 'ibkr';
   if (src === 'tradelocker') return 'tradelocker';
   if (src === 'dxtrade') return 'dxtrade';
   if (src === 'broker_sync') {
@@ -982,6 +986,30 @@ app.post('/api/bybit/connect', authLimiter, requireAuth, withSpace, requireSub, 
 app.post('/api/bybit/disconnect', requireAuth, withSpace, async (req, res) => {
   try { await bybit.disconnect(req.duid); } catch (e) {}
   await store.setStatus(req.duid, 'bybit', { status: 'disconnected' }).catch(() => {});
+  res.json({ ok: true });
+});
+
+// ── Interactive Brokers (Flex Web Service) ─────────────────
+// Token + Activity Flex Query ID. Checked with IB before we answer, so a wrong
+// token or query fails in the form; the report import then runs in the background.
+app.post('/api/ibkr/connect', authLimiter, requireAuth, withSpace, requireSub, async (req, res) => {
+  const { token, queryId, journalAccountId } = req.body || {};
+  const tok = String(token || '').trim(), qid = String(queryId || '').trim();
+  if (!tok || !qid) return res.status(400).json({ error: 'Your Flex token and Query ID are both required.' });
+  if (!/^[A-Za-z0-9]{8,64}$/.test(tok)) return res.status(400).json({ error: 'That does not look like a Flex Web Service token. Copy the whole Current Token from IBKR.' });
+  if (!/^\d{3,12}$/.test(qid)) return res.status(400).json({ error: 'The Query ID is a number, shown next to your Activity Flex Query in IBKR.' });
+  if (!hosted.configured()) return res.status(503).json({ error: 'Interactive Brokers sync is not configured on the server yet.' });
+  try {
+    await ibkr.connect(req.duid, { token: tok, queryId: qid, journalAccountId: String(journalAccountId || '').slice(0, 128) });
+    res.json({ ok: true, status: 'connecting' });
+  } catch (e) {
+    console.warn('ibkr connect:', e.flexCode || '', e.message);
+    res.status(400).json({ error: ibkr.friendlyError(e), code: e.flexCode || e.code || undefined });
+  }
+});
+app.post('/api/ibkr/disconnect', requireAuth, withSpace, async (req, res) => {
+  try { await ibkr.disconnect(req.duid); } catch (e) {}
+  await store.setStatus(req.duid, 'ibkr', { status: 'disconnected' }).catch(() => {});
   res.json({ ok: true });
 });
 
@@ -3602,6 +3630,7 @@ app.listen(port, () => {
   console.log('etw-sync-backend listening on :' + port);
 tokens.startMeter();
 bybit.resumeAll();   // Bybit links poll from this process; restart them after every deploy
+ibkr.resumeAll();    // same for Interactive Brokers Flex links
 // Hosted engine: never re-deploy MetaApi accounts at boot — deploying is what
 // makes MetaApi bill (and fail with its own balance/subscription errors).
 if (HOSTED_ENGINE) {
