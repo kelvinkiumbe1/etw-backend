@@ -8,7 +8,7 @@
 //
 //  What counts as verified
 //    · the account is connected by autosync (ETW EA, hosted worker, MetaApi
-//      direct, cTrader Open API) — never by upload
+//      direct, cTrader Open API, Interactive Brokers Flex) — never by upload
 //    · the connection is real money: a live broker server or a paid prop firm
 //      account (demo / trial / practice / contest servers are rejected)
 //    · the trade itself carries an autosync source tag and still matches the
@@ -44,7 +44,7 @@ const day = (ms) => (iso(ms) || '').slice(0, 10);
 
 const SEP = '__';
 // Autosync source tags the app and this backend stamp on broker-pulled trades.
-const SYNCED = /^(mt[45](-ea|-direct|-live)?|ctrader_open_api)$/;
+const SYNCED = /^(mt[45](-ea|-direct|-live)?|ctrader_open_api|ibkr)$/;
 // File-based imports are editable before upload, so they never verify.
 const FILEISH = /^(mt5-report|file-import|csv|notion)$/;
 // Server names that mean "not real money" at every broker / prop firm.
@@ -145,6 +145,21 @@ function mount(app, opts) {
             server: '', login: S(id), loginMasked: mask(id), label,
             brand: brandOf(label) || 'cTrader', live: !!b.live && !DEMO_RE.test(label), demoReason: !b.live ? 'cTrader reports this as a demo environment account.' : (DEMO_RE.test(label) ? 'The account label "' + label + '" marks it as demo / trial.' : ''),
             lastSync: +b.at || 0, balance: b.balance != null ? r2(num(b.balance)) : undefined,
+          });
+        });
+      }
+      // Interactive Brokers (Flex Web Service): one entry per IBKR account in the report.
+      // Paper-trading accounts (ids starting DU) are demo.
+      const ib = (u.exists && (u.data() || {}).ibkr) || {};
+      if (ib.status === 'connected') {
+        const accs = ib.accounts || {};
+        Object.keys(accs).forEach((id) => {
+          const b = accs[id] || {}, paper = /^DU/i.test(id);
+          out.push({
+            kind: 'IBKR', via: 'IBKR Flex Web Service',
+            server: '', login: S(id), loginMasked: mask(id), label: 'IBKR ' + id,
+            brand: 'Interactive Brokers', live: !paper, demoReason: paper ? 'IBKR account ' + mask(id) + ' is a paper-trading account.' : '',
+            lastSync: +ib.lastSyncAt || +b.at || 0, balance: b.nav != null ? r2(num(b.nav)) : undefined, currency: S(b.currency) || undefined,
           });
         });
       }
@@ -427,7 +442,7 @@ function mount(app, opts) {
       return '<div class="acc' + (a.verified ? ' ok' : '') + '">'
         + '<div class="at"><i>' + (logo ? '<img src="' + esc(logo) + '" alt="" referrerpolicy="no-referrer" onerror="this.remove()">' : '') + esc((c.brand || a.name || 'E').slice(0, 2).toUpperCase()) + '</i>'
         + '<div class="an"><b>' + esc(c.brand || a.name) + '</b><span>' + esc(a.name) + (c.server ? ' · ' + esc(c.server) : c.label ? ' · ' + esc(c.label) : '') + (c.loginMasked ? ' ' + esc(c.loginMasked) : '') + '</span></div>'
-        + '<div class="tags">' + (c.kind ? '<em class="tag ' + (c.live ? 'lv' : 'dm') + '">' + (c.live ? 'Live' : 'Demo') + '</em><em class="tag">' + esc(c.kind === 'cTrader' ? 'cTrader' : 'MT5') + '</em>' : '') + badgeHtml(a.status, a.asOf) + '</div></div>'
+        + '<div class="tags">' + (c.kind ? '<em class="tag ' + (c.live ? 'lv' : 'dm') + '">' + (c.live ? 'Live' : 'Demo') + '</em><em class="tag">' + esc(c.kind === 'cTrader' ? 'cTrader' : c.kind === 'IBKR' ? 'IBKR' : 'MT5') + '</em>' : '') + badgeHtml(a.status, a.asOf) + '</div></div>'
         + (a.verified && as.trades
           ? '<div class="am">' + kpi('Trades', as.trades) + kpi('Win rate', as.winRate == null ? '—' : as.winRate + '%') + kpi('Net P&amp;L', fmt$(as.netPnl), as.netPnl >= 0 ? 'g' : 'r') + kpi('Profit factor', esc(S(as.profitFactor))) + kpi('Max drawdown', fmt$(as.maxDrawdown), 'r') + kpi('Period', esc(fmtD(as.from)) + ' – ' + esc(fmtD(as.to)), 'sm') + '</div>'
           : '<div class="why">' + (a.reasons || []).map((r) => '<p>' + esc(r) + '</p>').join('') + '</div>')
