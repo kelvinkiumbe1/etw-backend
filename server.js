@@ -798,6 +798,12 @@ app.get('/api/cashflow/balances', marketLimiter, requireAuth, withSpace, require
       const b = ct.cashBalances[id] || {};
       out.accounts.push({ source: 'ctrader', via: 'ctrader', login: String(id), accountId: ct.journalAccountId || '', label: b.label || ('cTrader ' + id), balance: b.balance, equity: null, currency: '', at: b.at || 0, live: !!b.live });
     });
+    const ib = (u.exists && u.data().ibkr) || {};
+    if (ib.status === 'connected') Object.keys(ib.accounts || {}).forEach((id) => {
+      const b = ib.accounts[id] || {};
+      if (b.nav == null) return;
+      out.accounts.push({ source: 'ibkr', via: 'flex', login: String(id), accountId: ib.journalAccountId || '', label: 'IBKR ' + id, balance: b.nav, equity: b.nav, currency: b.currency || '', at: +ib.lastSyncAt || b.at || 0, live: !ibkr.isPaper(id) });
+    });
     const mt5 = (bp.exists && bp.data().mt5) || {};
     Object.keys(mt5).forEach((slot) => {
       const x = mt5[slot] || {};
@@ -823,6 +829,8 @@ app.post('/api/cashflow/sync', authLimiter, requireAuth, withSpace, requireSub, 
   const out = { ok: true, ctrader: null };
   try {
     const u = await db.collection('users').doc(req.duid).get();
+    const ib = (u.exists && u.data().ibkr) || {};
+    if (ib.status === 'connected') out.ibkr = ibkr.syncNow(req.duid) ? 'started' : 'recent';   // runs in the background
     const ct = (u.exists && u.data().ctrader) || {};
     if (ct.status === 'connected' && ctrader.configured()) out.ctrader = await ctrader.syncCash(req.duid, { force: true });
     res.json(out);
