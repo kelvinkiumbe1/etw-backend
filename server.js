@@ -1084,6 +1084,87 @@ app.get('/api/ai/usage', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Lookup failed.' }); }
 });
 
+// ── Groq free-plan limits are per MODEL and shared by every user ─────────
+// On the free plan each chat model has its own 8,000 tokens-per-minute budget
+// for the whole organisation (all ETW users together), and a request counts its
+// prompt PLUS max_tokens. One busy minute on openai/gpt-oss-120b used to turn
+// into "The AI assistant is busy" for everyone. Now a request that hits a
+// per-minute (or daily) limit moves to the next model in the pool, each with its
+// own budget; a model that said "wait" is skipped until its reset time, and if
+// every model is busy the server waits a few seconds for the first one to free
+// up before giving up. Requests with images stay on the model they asked for.
+const AI_POOL = String(process.env.GROQ_MODEL_POOL || 'openai/gpt-oss-120b,qwen/qwen3.8-27b,openai/gpt-oss-20b')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+const _aiCool = new Map();   // `${keyTag}|${model}` -> epoch ms when it may be tried again
+function aiParseWait(v) {
+  // "7.66s", "1m2.5s", "2h3m", "250ms" or plain seconds
+  const s = String(v || '').trim(); if (!s) return 0;
+  if (/^\d+(\.\d+)?$/.test(s)) return Math.ceil(parseFloat(s) * 1000);
+  let ms = 0, m;
+  const re = /(\d+(?:\.\d+)?)(ms|h|m|s)/g;
+  while ((m = re.exec(s))) ms += parseFloat(m[1]) * ({ ms: 1, s: 1000, m: 60000, h: 3600000 }[m[2]]);
+  return Math.ceil(ms);
+}
+function aiCooldownFor(r, text) {
+  const daily = /per day|TPD|RPD/i.test(text);
+  const fromMsg = (String(text).match(/try again in\s+([0-9hms.]+)/i) || [])[1];
+  const ms = aiParseWait(fromMsg) || aiParseWait(r.headers.get('retry-after')) || aiParseWait(r.headers.get('x-ratelimit-reset-tokens')) || (daily ? 10 * 60000 : 20000);
+  return Math.min(Math.max(ms, 1500), daily ? 6 * 3600000 : 90000);
+}
+function aiHasImage(messages) {
+  return Array.isArray(messages) && messages.some((m) => Array.isArray(m && m.content) && m.content.some((c) => c && c.type === 'image_url'));
+}
+async function groqChatPooled(key, body, ultra) {
+  const keyTag = crypto.createHash('sha1').update(key).digest('hex').slice(0, 8);
+  const asked = body.model || AI_POOL[0];
+  const pool = aiHasImage(body.messages) || AI_POOL.indexOf(asked) < 0 && /vision|scout|maverick|llava/i.test(asked)
+    ? [asked] : [asked].concat(AI_POOL.filter((m) => m !== asked));
+  let last = null;
+  for (let pass = 0; pass < 2; pass++) {
+    let soonest = Infinity;
+    for (const model of pool) {
+      const ck = keyTag + '|' + model, until = _aiCool.get(ck) || 0;
+      if (until > Date.now()) { soonest = Math.min(soonest, until); continue; }
+      const gptOss = /gpt-oss/.test(model);
+      const effort = ['low', 'medium', 'high'].includes(body.reasoning_effort) ? body.reasoning_effort : null;
+      const payload = {
+        model,
+        messages: body.messages,
+        temperature: typeof body.temperature === 'number' ? body.temperature : 0.7,
+        max_tokens: Math.min(Number(body.max_tokens) || 1024, ultra ? 8192 : 4096),
+        ...(gptOss && effort && (effort !== 'high' || ultra) ? { reasoning_effort: effort } : {}),
+        // qwen thinks out loud by default; keep that out of the answer.
+        ...(/qwen/i.test(model) ? { reasoning_format: 'hidden' } : {}),
+        ...(body.response_format ? { response_format: body.response_format } : {}),
+        ...(Array.isArray(body.tools) && body.tools.length && body.tools.length <= 16 && JSON.stringify(body.tools).length < 20000
+          ? { tools: body.tools, ...(['auto', 'none', 'required'].includes(body.tool_choice) ? { tool_choice: body.tool_choice } : {}) } : {}),
+        ...(body.stream === true ? { stream: true } : {}),
+      };
+      const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+        body: JSON.stringify(payload),
+      });
+      if (r.status !== 429) {
+        if (model !== asked) console.log('[ai] served on', model, '(', asked, 'was busy )');
+        return { r, model };
+      }
+      const text = await r.text().catch(() => '');
+      const wait = aiCooldownFor(r, text);
+      _aiCool.set(ck, Date.now() + wait);
+      soonest = Math.min(soonest, Date.now() + wait);
+      last = { status: 429, text, wait };
+      console.warn('[ai] 429 on', model, '- cooling', Math.round(wait / 1000) + 's');
+    }
+    // Every model is cooling down: wait for the first one if that is only a few seconds away.
+    const gap = soonest - Date.now();
+    if (pass === 0 && isFinite(gap) && gap <= 12000) { await new Promise((ok) => setTimeout(ok, Math.max(gap, 300))); continue; }
+    const retryAfter = Math.max(1, Math.ceil((isFinite(gap) ? gap : (last && last.wait) || 20000) / 1000));
+    return { busy: true, retryAfter, text: (last && last.text) || '' };
+  }
+  return { busy: true, retryAfter: 20, text: (last && last.text) || '' };
+}
+
 app.post('/api/ai/groq', aiLimiter, requireAuth, requirePro, aiQuota, async (req, res) => {
   // Ultra can run on its own Groq key (GROQ_API_KEY_ULTRA) so its requests have
   // their own rate-limit bucket and never queue behind other plans.
@@ -1091,32 +1172,17 @@ app.post('/api/ai/groq', aiLimiter, requireAuth, requirePro, aiQuota, async (req
   const key = (ultra && process.env.GROQ_API_KEY_ULTRA) || process.env.GROQ_API_KEY || '';
   if (!key) return res.status(503).json({ error: 'AI is not configured on the server.' });
   const body = req.body || {};
-  // Reasoning depth for gpt-oss models: Ultra picks per question (light for quick
-  // answers = faster, deeper for long analyses); "high" is Ultra-only.
-  const effort = ['low', 'medium', 'high'].includes(body.reasoning_effort) ? body.reasoning_effort : null;
-  const reasoning = effort && /gpt-oss/.test(String(body.model || 'openai/gpt-oss-120b')) && (effort !== 'high' || ultra) ? { reasoning_effort: effort } : {};
   if (!Array.isArray(body.messages) || !body.messages.length) return res.status(400).json({ error: 'messages[] is required' });
   const wantStream = body.stream === true;
   try {
-    const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
-      body: JSON.stringify({
-        // Keep this in sync with window.ETW_AI_MODELS.main in journal.html — a stale
-        // default here silently retires the AI for any caller that omits a model.
-        // (llama-3.3-70b-versatile was shut down by Groq on 2026-08-16.)
-        model: body.model || 'openai/gpt-oss-120b',
-        messages: body.messages,
-        temperature: typeof body.temperature === 'number' ? body.temperature : 0.7,
-        max_tokens: Math.min(Number(body.max_tokens) || 1024, ultra ? 8192 : 4096),
-        ...reasoning,
-        ...(body.response_format ? { response_format: body.response_format } : {}),
-        // ETW AI tools (journal look-ups the app runs itself): passed through as-is, bounded.
-        ...(Array.isArray(body.tools) && body.tools.length && body.tools.length <= 16 && JSON.stringify(body.tools).length < 20000
-          ? { tools: body.tools, ...(['auto', 'none', 'required'].includes(body.tool_choice) ? { tool_choice: body.tool_choice } : {}) } : {}),
-        ...(wantStream ? { stream: true } : {}),
-      }),
-    });
+    const out = await groqChatPooled(key, body, ultra);
+    if (out.busy) {
+      // Same shape Groq uses, so the app's existing "busy, try again in N seconds" handling reads it.
+      res.set('Retry-After', String(out.retryAfter));
+      return res.status(429).json({ error: { message: 'Rate limit reached: every ETW AI model is busy. Please try again in ' + out.retryAfter + 's.', type: 'tokens', code: 'rate_limit_exceeded' } });
+    }
+    const r = out.r;
+    res.set('X-ETW-AI-Model', out.model);
 
     // ── Streaming: pipe Groq's SSE straight through to the browser ──
     // no-transform + X-Accel-Buffering:no stop Render's proxy from buffering
