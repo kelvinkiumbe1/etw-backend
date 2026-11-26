@@ -19,6 +19,7 @@ const store = require('../store');
 const access = require('../access');
 const { encrypt, decrypt } = require('../hostedSync');
 const { getSessionFromTime } = require('../tradeMapper');
+const cashflows = require('../cashflows');
 
 const STATUS_KEY = 'ibkr';
 const SOURCE = 'ibkr';
@@ -176,6 +177,7 @@ function toTrades(rows, { uid, accountId }) {
       swap: 0, commission: r2(g.comm * fx),
       session: getSessionFromTime(openMs), ticket: 'ib-' + (g.orderId || g.key),
       assetClass: g.asset, instrument: g.desc, currency: g.currency, ibkrAccount: g.acct,
+      brokerAccount: g.acct ? 'IBKR ' + g.acct : '', vPnl: p,   // broker's own figure: the Verified Track Record voids the trade if pnl is edited away from it
       source: SOURCE, brokerName: 'Interactive Brokers', rr: '', notes: '', rules: '', psychology: '', model: '',
       accountId: accountId || '', createdAt: Date.now(), updatedAt: Date.now(),
     });
@@ -199,11 +201,56 @@ function readStatement(xml) {
   return rows;
 }
 
+// IBKR paper-trading accounts have ids starting with DU; they never count as live.
+const isPaper = (acct) => /^DU/i.test(String(acct || ''));
+
+// Account value and base currency per IBKR account (Change in NAV / Account Information sections).
+function readAccounts(xml, rows, at) {
+  const out = {};
+  const add = (id) => { id = String(id || '').trim(); if (!id) return null; if (!out[id]) out[id] = { live: !isPaper(id), at }; return out[id]; };
+  elements(xml, 'FlexStatement').forEach((s) => add(s.accountId));
+  rows.forEach((r) => add(r.accountId));
+  elements(xml, 'AccountInformation').forEach((a) => { const o = add(a.accountId); if (o && a.currency) o.currency = a.currency; if (o && a.accountType) o.type = a.accountType; });
+  elements(xml, 'ChangeInNAV').forEach((n) => { const o = add(n.accountId); if (o && n.endingValue !== undefined && n.endingValue !== '') o.nav = r2(num(n.endingValue)); });
+  return out;
+}
+
+// Cash Transactions section → deposits, withdrawals, dividends, interest, fees.
+// Amounts converted to the account's base currency, like the trades.
+function classifyCash(type, amount) {
+  const t = String(type || '').toLowerCase(), a = num(amount);
+  if (/deposit|withdraw/.test(t)) return { kind: a >= 0 ? 'deposit' : 'withdrawal', sub: a >= 0 ? 'Deposit' : 'Withdrawal' };
+  if (/lieu|dividend/.test(t)) return { kind: 'other', sub: 'Dividend' };
+  if (/tax/.test(t)) return { kind: 'other', sub: 'Tax' };
+  if (/interest/.test(t)) return { kind: 'other', sub: 'Interest' };
+  if (/commission/.test(t)) return { kind: 'other', sub: 'Commission' };
+  if (/fee/.test(t)) return { kind: 'other', sub: 'Fee' };
+  return { kind: 'other', sub: 'Balance change' };
+}
+function toCash(xml, { uid, accountId }, accounts) {
+  const all = elements(xml, 'CashTransaction').filter((r) => r.currency !== 'BASE_SUMMARY' && !/SUMMARY/i.test(String(r.levelOfDetail || '')));
+  return all.map((r) => {
+    const amt = num(r.amount); if (!amt) return null;
+    const ts = parseFlexTime(r.dateTime, r.settleDate || r.reportDate); if (!ts) return null;
+    const c = classifyCash(r.type, amt), acct = r.accountId || '';
+    const base = (accounts[acct] && accounts[acct].currency) || '';
+    const fx = num(r.fxRateToBase) || 1;
+    const extId = r.transactionID || [acct, r.type, r.currency, r.amount, r.dateTime || r.settleDate || r.reportDate, r.description].join('|');
+    return { uid, accountId: accountId || '', source: SOURCE, extId: 'ib_' + extId, kind: c.kind, sub: c.sub,
+      amount: base && r.currency === base ? amt : amt * fx, currency: base || (fx === 1 ? r.currency || '' : ''), ts,
+      note: String(r.description || r.type || '').slice(0, 300), balance: null, brokerAccount: acct ? 'IBKR ' + acct : 'IBKR' };
+  }).filter(Boolean);
+}
+
 async function importOnce(ctx) {
   const xml = await fetchStatement(ctx.creds);
   const rows = readStatement(xml);
   const fresh = toTrades(rows, ctx).filter((t) => !ctx.written.has(t.ticket));
   if (fresh.length) { await store.writeTrades(fresh); fresh.forEach((t) => ctx.written.add(t.ticket)); }
+  const accounts = readAccounts(xml, rows, Date.now());
+  ctx.accounts = accounts;
+  ctx.hasCash = /<CashTransactions\b/.test(xml);
+  try { await cashflows.writeCash(toCash(xml, ctx, accounts)); } catch (e) { console.warn('[ibkr] cash', ctx.uid, e.message); }
   return fresh.length;
 }
 
@@ -230,23 +277,33 @@ async function run(uid, link, creds) {
   active.set(uid, state);
   const ctx = { uid, accountId: link.journalAccountId || '', creds, written: await store.existingTickets(uid, SOURCE, link.journalAccountId || '') };
   const tick = async (first) => {
-    if (state.stopped) return;
+    if (state.stopped || state.running) return;
+    state.running = true;
     try {
       if (first) await setStatus(uid, { status: 'connecting', error: null, note: 'Fetching your report from Interactive Brokers. This can take a minute or two.' });
       await importOnce(ctx);
       const t = Date.now();
       await ref(uid).set({ lastSyncAt: t }, { merge: true });
-      await setStatus(uid, { status: 'connected', historyImported: ctx.written.size, lastSyncAt: t, error: null,
-        note: 'Connected. IBKR updates these reports once a day after the market closes, so new trades show up the next day.' });
+      const ids = Object.keys(ctx.accounts || {});
+      await setStatus(uid, { status: 'connected', historyImported: ctx.written.size, lastSyncAt: t, error: null, accounts: ctx.accounts || {},
+        demo: ids.length > 0 && ids.every(isPaper),
+        note: 'Connected. IBKR updates these reports once a day after the market closes, so new trades show up the next day.' +
+          (ctx.hasCash ? '' : ' To import deposits and withdrawals too, add the Cash Transactions section to your Flex Query.') });
     } catch (e) {
       console.error('ibkr sync', uid, e.flexCode || '', e.message);
       if (isAuthError(e)) { await stopSync(uid); await setStatus(uid, { status: 'error', error: friendlyError(e) }).catch(() => {}); return; }
       if (first) await setStatus(uid, { status: 'connected', historyImported: ctx.written.size, error: null, note: friendlyError(e) }).catch(() => {});
     }
-    if (!state.stopped) state.timer = setTimeout(() => tick(false), first && ctx.written.size === 0 ? 20 * 60 * 1000 : POLL_MS);
+    state.running = false;
+    if (!state.stopped) { if (state.timer) clearTimeout(state.timer); state.timer = setTimeout(() => tick(false), first && ctx.written.size === 0 ? 20 * 60 * 1000 : POLL_MS); }
   };
+  state.kick = () => { if (state.stopped || Date.now() - (state.lastKick || 0) < 10 * 60 * 1000) return false; state.lastKick = Date.now(); if (state.timer) clearTimeout(state.timer); tick(false); return true; };
   await tick(true);
 }
+
+// "Sync now" on Deposits & Withdrawals: fetch the report again in the background
+// (at most every 10 minutes; IB limits how often a token may ask).
+function syncNow(uid) { const s = active.get(uid); return !!(s && s.kick && s.kick()); }
 
 // Called from the route: checks token + query with IB, stores encrypted, then imports in the background.
 async function connect(uid, { token, queryId, journalAccountId }) {
@@ -257,7 +314,7 @@ async function connect(uid, { token, queryId, journalAccountId }) {
     tokenHint: creds.token.slice(0, 3) + '…' + creds.token.slice(-3),
     cred: encrypt(JSON.stringify(creds), uid), createdAt: Date.now(), lastSyncAt: null };
   await ref(uid).set(link);
-  await setStatus(uid, { status: 'connecting', queryId: creds.queryId, tokenHint: link.tokenHint, error: null, historyImported: 0 });
+  await setStatus(uid, { status: 'connecting', queryId: creds.queryId, tokenHint: link.tokenHint, journalAccountId: link.journalAccountId, error: null, historyImported: 0, accounts: {} });
   // Leave a gap after the check: IB allows one request a second, ten a minute.
   setTimeout(() => run(uid, link, creds).catch(async (e) => {
     console.error('ibkr:', e.message);
@@ -297,4 +354,4 @@ async function resumeAll() {
   if (snap.size) console.log('[ibkr] resuming', snap.size, 'link(s)');
 }
 
-module.exports = { connect, disconnect, stopSync, resumeAll, friendlyError, _toTrades: toTrades, _readStatement: readStatement, _parseFlexTime: parseFlexTime, _fetchStatement: fetchStatement };
+module.exports = { connect, disconnect, stopSync, resumeAll, syncNow, isPaper, friendlyError, _toCash: toCash, _readAccounts: readAccounts, _toTrades: toTrades, _readStatement: readStatement, _parseFlexTime: parseFlexTime, _fetchStatement: fetchStatement };
