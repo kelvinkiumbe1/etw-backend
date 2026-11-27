@@ -3171,8 +3171,64 @@ function withUnsubscribe(html, why, url) {
   const foot = `<p style="color:#999;font-size:12px;margin-top:6px">${why} <a href="${url}" style="color:#999">Unsubscribe from product updates</a>.</p>`;
   return html.replace(/<\/div>\s*$/, foot + '</div>');
 }
-// audience: 'active' = paying members now · 'lapsed' = their plan ended (not refunds, not comp).
+// ── Marketing layout (win-back) ──────────────────────────────────
+// 600px table layout with inline styles so it holds up in Gmail, Outlook and
+// Apple Mail. The hero image links to the payment page like the button.
+const WINBACK_IMG = process.env.WINBACK_IMG_URL || 'https://etwjournal.space/assets/etw-email-winback-2026-11.jpg';
+function marketingShell({ preheader, hero, heroAlt, heroLink, body, cta, ctaLink, footNote, unsub }) {
+  const pre = preheader ? `<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent">${escapeHtml(preheader)}&#8199;&#65279;&#847;&#8199;&#65279;&#847;&#8199;&#65279;&#847;</div>` : '';
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light only"></head>
+<body style="margin:0;padding:0;background:#F2EFFA">${pre}
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F2EFFA"><tr><td align="center" style="padding:24px 12px">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:100%;max-width:600px;background:#ffffff;border-radius:18px;overflow:hidden;font-family:Inter,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:#1d1530">
+<tr><td style="background:#170A33;padding:0"><a href="${heroLink}" style="display:block"><img src="${hero}" width="600" alt="${escapeHtml(heroAlt)}" style="display:block;width:100%;max-width:600px;height:auto;border:0"></a></td></tr>
+<tr><td style="padding:30px 34px 8px;font-size:16px;line-height:1.6">${body}</td></tr>
+<tr><td align="center" style="padding:10px 34px 6px"><a href="${ctaLink}" style="display:inline-block;background:#6D4AFF;color:#ffffff;text-decoration:none;font-weight:700;font-size:16px;padding:15px 34px;border-radius:12px">${cta}</a></td></tr>
+<tr><td align="center" style="padding:6px 34px 28px;font-size:13px;color:#6b6585">Plans from $7 a month. Cancel any time.</td></tr>
+<tr><td style="padding:18px 34px 26px;border-top:1px solid #eeeaf7;font-size:12px;line-height:1.6;color:#8a84a3">${footNote}${unsub ? ` <a href="${unsub}" style="color:#8a84a3">Unsubscribe from product updates</a>.` : ''}<br>ETW Journal · <a href="https://etwjournal.space" style="color:#8a84a3">etwjournal.space</a></td></tr>
+</table></td></tr></table></body></html>`;
+}
+function featureRows(items) {
+  return '<table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px 0 6px;width:100%">' + items.map(([b, s]) =>
+    `<tr><td valign="top" style="width:30px;padding:7px 0"><span style="display:inline-block;width:20px;height:20px;border-radius:10px;background:#EDE8FF;color:#6D4AFF;font-size:13px;line-height:20px;text-align:center;font-weight:700">&#10003;</span></td>
+     <td style="padding:6px 0;font-size:15px;line-height:1.5;color:#3b3452"><b style="color:#1d1530">${b}</b> ${s}</td></tr>`).join('') + '</table>';
+}
+const WINBACK_FEATURES = [
+  ['Trades sync themselves.', 'MT5, MT4, cTrader, TradeLocker, DXtrade, Bybit and Interactive Brokers, with your past history imported.'],
+  ['See where you make and lose money.', 'P&amp;L calendar, win rate, profit factor and drawdown by day, week and month.'],
+  ['ETW AI reads your journal.', 'Ask it about your trades and it points out the patterns behind your wins and losses (Pro and Ultra).'],
+  ['A track record you can share.', 'Built only from live synced trades, so the numbers can be trusted.'],
+];
+const firstName = (n) => escapeHtml(String(n || '').trim().split(/\s+/)[0] || '');
+
+// audience: 'active' = paying members now · 'lapsed' = their plan ended (not refunds, not comp)
+//           'winback' = every account without a live plan: past subscribers + people who never subscribed.
+//           html(name, unsub, ctx) gets ctx.lapsed so each group reads the right copy.
 const ANNOUNCEMENTS = {
+  'winback-2026-11': {
+    audience: 'winback',
+    unsubscribe: true,
+    subject: (ctx) => ctx && ctx.lapsed ? 'Your ETW Journal is still here' : 'Your trading journal is ready when you are',
+    html: (name, unsub, ctx) => {
+      const lapsed = !!(ctx && ctx.lapsed), nm = firstName(name);
+      const intro = lapsed
+        ? `<p style="margin:0 0 14px">Hi${nm ? ' ' + nm : ''},</p>
+           <p style="margin:0 0 14px">Your ETW Journal is still here. Every trade, note and playbook you saved is exactly where you left it.</p>
+           <p style="margin:0">Reactivate your plan and it all opens up again, with everything ETW does today:</p>`
+        : `<p style="margin:0 0 14px">Hi${nm ? ' ' + nm : ''},</p>
+           <p style="margin:0 0 14px">You created an ETW Journal account but haven't picked a plan yet. Choose one, connect your trading account once, and your trades start filling your journal on their own.</p>
+           <p style="margin:0">Here's what you get:</p>`;
+      return marketingShell({
+        preheader: lapsed ? 'Every trade and note you saved is waiting. Pick up where you left off.' : 'Connect MT5 once and every trade is journaled for you.',
+        hero: WINBACK_IMG, heroAlt: 'ETW Journal dashboard with P&L calendar, and the Connect MT5 screen', heroLink: APP_URL + '/payment',
+        body: intro + featureRows(WINBACK_FEATURES),
+        cta: lapsed ? 'Reactivate my plan' : 'Choose my plan', ctaLink: APP_URL + '/payment',
+        footNote: lapsed ? 'You’re getting this because you had an ETW Journal plan.' : 'You’re getting this because you created an ETW Journal account.',
+        unsub,
+      });
+    },
+  },
+
   'brand-2026-11': {
     audience: 'active',
     subject: 'ETW Journal has a new look',
@@ -3253,8 +3309,12 @@ app.post('/api/email/unsubscribe', authLimiter, async (req, res) => {
   } catch (e) { console.error('unsubscribe:', e.message); res.status(500).type('html').send(unsubPage('Something went wrong', 'Please try again in a minute.')); }
 });
 
+// A plan counts as live while active and unexpired (a Gumroad membership stays
+// active past expiresAt while its renewal is in flight).
+const subLive = (sub, now) => sub.status === 'active' && !(Number(sub.expiresAt) && Number(sub.expiresAt) < now && !(sub.autoRenew && sub.subscriptionId));
 // Who an announcement goes to. Returns { todo: [doc], skipped, alreadySent }.
 async function announceAudience(id, A, now) {
+  if (A.audience === 'winback') return winbackAudience(id, now);
   const out = { todo: [], skipped: 0, alreadySent: 0, optedOut: 0 };
   const statuses = A.audience === 'lapsed' ? ['active', 'expired'] : ['active'];
   const snap = await db.collection('users').where('subscription.status', 'in', statuses).get();
@@ -3271,6 +3331,39 @@ async function announceAudience(id, A, now) {
   return out;
 }
 
+// Win-back: every sign-in account with an email and no live plan. Accounts that
+// never subscribed may have no users doc at all, so this walks Firebase Auth and
+// reads the users docs in batches. Skips comp plans, refunds/chargebacks, opt-outs,
+// disabled accounts and anyone already sent this id. todo items carry .lapsed.
+async function winbackAudience(id, now) {
+  const out = { todo: [], skipped: 0, alreadySent: 0, optedOut: 0, lapsed: 0, never: 0, unverified: 0 };
+  let token;
+  do {
+    const page = await admin.auth().listUsers(1000, token);
+    token = page.pageToken;
+    const users = page.users.filter((u) => u.email && !u.disabled);
+    out.skipped += page.users.length - users.length;
+    for (let i = 0; i < users.length; i += 100) {
+      const chunk = users.slice(i, i + 100);
+      const snaps = await db.getAll(...chunk.map((u) => db.collection('users').doc(u.uid)));
+      snaps.forEach((s, k) => {
+        const d = s.exists ? (s.data() || {}) : {}, sub = d.subscription || {}, u = chunk[k];
+        if (sub.comp || subLive(sub, now)) { out.skipped++; return; }
+        if (/refund|chargeback|dispute|revoked/i.test(String(sub.status || ''))) { out.skipped++; return; }
+        if (d.emailPrefs && d.emailPrefs.announcements === false) { out.optedOut++; return; }
+        if (d.announcements && d.announcements[id]) { out.alreadySent++; return; }
+        const lapsed = !!(sub.status || sub.plan || sub.expiresAt);
+        lapsed ? out.lapsed++ : out.never++;
+        if (!u.emailVerified) out.unverified++;
+        out.todo.push({ id: u.uid, ref: db.collection('users').doc(u.uid), lapsed, user: u });
+      });
+    }
+  } while (token);
+  // Past subscribers first: they know the product.
+  out.todo.sort((a, b) => (b.lapsed ? 1 : 0) - (a.lapsed ? 1 : 0));
+  return out;
+}
+
 app.post('/api/admin/announce', authLimiter, requireAdmin, async (req, res) => {
   const b = req.body || {};
   const id = String(b.id || '');
@@ -3284,7 +3377,8 @@ app.post('/api/admin/announce', authLimiter, requireAdmin, async (req, res) => {
   if (testTo) {
     let link = '';
     if (A.unsubscribe) { try { link = await unsubUrl((await admin.auth().getUserByEmail(testTo)).uid); } catch (e) { link = backendBase() + '/api/email/unsubscribe?u=test&t=test'; } }
-    const r = await email.sendEmailVerbose({ to: testTo, toName: '', subject: A.subject, html: A.html('', link),
+    const tctx = { lapsed: b.testLapsed !== false };
+    const r = await email.sendEmailVerbose({ to: testTo, toName: '', subject: typeof A.subject === 'function' ? A.subject(tctx) : A.subject, html: A.html(String(b.testName || ''), link, tctx),
       headers: link ? { 'List-Unsubscribe': '<' + link + '>', 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' } : undefined });
     return res.status(r.ok ? 200 : 502).json({ id, test: true, to: testTo, ...r });
   }
@@ -3296,14 +3390,16 @@ app.post('/api/admin/announce', authLimiter, requireAdmin, async (req, res) => {
     const todo = aud.todo;
     out.skipped = aud.skipped; out.alreadySent = aud.alreadySent; out.optedOut = aud.optedOut;
     out.eligible = todo.length;
+    if (A.audience === 'winback') { out.lapsed = aud.lapsed; out.neverSubscribed = aud.never; out.unverifiedEmails = aud.unverified; }
     const slice = todo.slice(0, batch);
     for (const doc of slice) {
-      let user;
-      try { user = await admin.auth().getUser(doc.id); } catch (e) { out.skipped++; continue; }
+      let user = doc.user;
+      if (!user) { try { user = await admin.auth().getUser(doc.id); } catch (e) { out.skipped++; continue; } }
       if (!user.email || user.disabled) { out.skipped++; continue; }
-      if (!send) { if (out.sample.length < 20) out.sample.push(user.email); continue; }
+      if (!send) { if (out.sample.length < 20) out.sample.push(user.email + (A.audience === 'winback' ? (doc.lapsed ? ' (past plan)' : ' (never subscribed)') : '')); continue; }
       const link = A.unsubscribe ? await unsubUrl(doc.id) : '';
-      const r = await email.sendEmailVerbose({ to: user.email, toName: user.displayName || '', subject: A.subject, html: A.html(user.displayName || '', link),
+      const ctx = { lapsed: !!doc.lapsed };
+      const r = await email.sendEmailVerbose({ to: user.email, toName: user.displayName || '', subject: typeof A.subject === 'function' ? A.subject(ctx) : A.subject, html: A.html(user.displayName || '', link, ctx),
         headers: link ? { 'List-Unsubscribe': '<' + link + '>', 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' } : undefined });
       if (r.ok) {
         out.sent++;
