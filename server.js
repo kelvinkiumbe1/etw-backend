@@ -3359,8 +3359,11 @@ async function winbackAudience(id, now) {
       });
     }
   } while (token);
-  // Past subscribers first: they know the product.
-  out.todo.sort((a, b) => (b.lapsed ? 1 : 0) - (a.lapsed ? 1 : 0));
+  // Past subscribers first (they know the product), then confirmed addresses,
+  // and never-confirmed addresses last: those are the ones that bounce, and
+  // bounces hurt the sender reputation every other email depends on.
+  const rank = (x) => (x.lapsed ? 0 : 2) + (x.user.emailVerified ? 0 : 1);
+  out.todo.sort((a, b) => rank(a) - rank(b));
   return out;
 }
 
