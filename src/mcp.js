@@ -666,9 +666,37 @@ function mount(app, opts) {
     },
     {
       name: 'get_trading_rules', title: 'Trading rules',
-      description: 'The trader\'s own trading rules (risk rules, checklist items). Compare them with trades\' rule checks to judge discipline.',
+      description: 'The trader\'s own trading rules: their personal rule checklist (the rules they tick on each trade) and any older saved rules. Compare them with trades\' rule checks, mistakes and tags to judge discipline.',
       inputSchema: { type: 'object', properties: { account: ACCOUNT }, additionalProperties: false }, annotations: RO,
-      run: async (ctx, a) => { let out = []; for (const acc of await pickAccounts(ctx, a.account)) out = out.concat((await docsOf('trading_rules', acc.du)).map((x) => Object.assign({ account: acc.name }, x))); return { rules: out }; },
+      run: async (ctx, a) => {
+        const accs = await pickAccounts(ctx, a.account);
+        // The app keeps the trader's rules in the Rule checklist of the trade form:
+        // users/{login uid}/prefs/ruleChecklist { items: [{ id, text, example? }] }, one list
+        // for the whole login. Older versions saved it per journal account, and before
+        // that as documents in the top-level trading_rules collection; all are read.
+        const seen = new Set(), rules = [];
+        const add = (r) => { const k = low(r.rule).replace(/\s+/g, ' '); if (!k || seen.has(k)) return; seen.add(k); rules.push(r); };
+        const checklist = async (du) => cached('rck:' + du, 60e3, async () => {
+          const snap = await db.collection('users').doc(du).collection('prefs').doc('ruleChecklist').get().catch(() => null);
+          const items = snap && snap.exists ? (snap.data() || {}).items : null;
+          return Array.isArray(items) ? items : [];
+        });
+        for (const du of [ctx.uid].concat(accs.map((x) => x.du).filter((d) => d !== ctx.uid))) {
+          for (const it of await checklist(du)) {
+            if (!it || !S(it.text).trim()) continue;
+            add(Object.assign({ rule: clip(S(it.text).trim(), 300), source: 'Rule checklist (all accounts)' }, it.example ? { example: true, note: 'One of the app\'s example rules, not one the trader wrote.' } : {}));
+          }
+        }
+        for (const acc of accs) {
+          for (const x of await docsOf('trading_rules', acc.du)) {
+            const text = S(x.text || x.rule || x.title || x.name).trim();
+            if (text) add(Object.assign({ rule: clip(text, 300), source: 'Saved rules', account: acc.name }, x.category ? { category: S(x.category) } : {}));
+            else rules.push(Object.assign({ account: acc.name, source: 'Saved rules' }, x));
+          }
+        }
+        return rules.length ? { total: rules.length, rules }
+          : { total: 0, rules: [], note: 'The trader has not written any rules yet. They can add them in ETW Journal: open Add Trade, then the Rule checklist, and use "Add rule".' };
+      },
     },
     {
       name: 'search_journal', title: 'Search the journal',
