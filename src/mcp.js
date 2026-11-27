@@ -502,7 +502,7 @@ function mount(app, opts) {
 
   // ════════════════════════ tools ════════════════════════
   function toolErr(msg) { const e = new Error(msg); e.tool = true; return e; }
-  const ACCOUNT = { type: 'string', description: 'Journal account name or id (see list_accounts). "all" (default) combines every account; "main" is the main journal.' };
+  const ACCOUNT = { type: 'string', description: 'Journal account name or id. "all" (default) combines every account; "main" is the main journal.' };
   const DATE_FILTERS = {
     period: { type: 'string', enum: ['today', 'yesterday', 'this_week', 'last_7_days', 'last_30_days', 'last_90_days', 'this_month', 'last_month', 'this_year', 'all_time'], description: 'Quick date range (UTC). Overrides from/to.' },
     from: { type: 'string', description: 'Start date, YYYY-MM-DD (UTC), inclusive.' },
@@ -525,7 +525,7 @@ function mount(app, opts) {
   const TOOLS = [
     {
       name: 'get_journal_overview', title: 'Journal overview',
-      description: 'Start here. Summary of the trader\'s ETW Journal: accounts, all-time and last-30-day performance, deposits/withdrawals totals and the most recent trades. Use it to orient before deeper questions.',
+      description: 'Summary of the trader\'s ETW Journal: accounts, all-time and last-30-day performance, deposits/withdrawals totals and the most recent trades.',
       inputSchema: { type: 'object', properties: { account: ACCOUNT }, additionalProperties: false }, annotations: RO,
       run: async (ctx, a) => {
         const accs = await pickAccounts(ctx, a.account);
@@ -554,7 +554,7 @@ function mount(app, opts) {
     },
     {
       name: 'search_trades', title: 'Search trades',
-      description: 'List closed trades with filters (date range, symbol, direction, result, session, strategy, tag, emotion, text, P&L range). Newest first. Each trade has an id you can pass to get_trade for full details.',
+      description: 'List closed trades with filters (date range, symbol, direction, result, session, strategy, tag, emotion, text, P&L range). Newest first by default. Each result includes the trade id.',
       inputSchema: { type: 'object', properties: Object.assign({}, TRADE_FILTERS, {
         sort: { type: 'string', enum: ['newest', 'oldest', 'best', 'worst'], description: 'Order of results (default newest).' },
         limit: { type: 'integer', minimum: 1, maximum: 500, description: 'Max trades to return (default 50).' },
@@ -571,7 +571,7 @@ function mount(app, opts) {
     {
       name: 'get_trade', title: 'Get trade details',
       description: 'Everything journaled for one trade: prices, size, times, notes, mistakes, rule checklist, tags, screenshots (URLs) and merged partials.',
-      inputSchema: { type: 'object', properties: { trade_id: { type: 'string', description: 'Trade id from search_trades.' } }, required: ['trade_id'], additionalProperties: false }, annotations: RO,
+      inputSchema: { type: 'object', properties: { trade_id: { type: 'string', description: 'Trade id.' } }, required: ['trade_id'], additionalProperties: false }, annotations: RO,
       run: async (ctx, a) => {
         const id = S(a.trade_id).replace(/^trade:/, '');
         for (const acc of await pickAccounts(ctx, 'all')) {
@@ -623,7 +623,7 @@ function mount(app, opts) {
     },
     {
       name: 'get_cash_flows', title: 'Deposits & withdrawals',
-      description: 'Live account balances reported by the broker (MT5, cTrader, prop firm accounts), plus deposits, withdrawals and other balance changes (bonuses, fees, credit) imported from MT5 / cTrader or added by hand, with totals and return on deposits. Withdrawals are not losses and deposits are not profit.',
+      description: 'Live account balances reported by the broker (MT5, cTrader, prop firm accounts), plus deposits, withdrawals and other balance changes (bonuses, fees, credit) imported from MT5 / cTrader or added by hand, with totals and return on deposits. Deposits and withdrawals are reported separately from trading P&L.',
       inputSchema: { type: 'object', properties: Object.assign({ account: ACCOUNT }, DATE_FILTERS, { limit: { type: 'integer', minimum: 1, maximum: 500, description: 'Max operations to list (default 100).' } }), additionalProperties: false }, annotations: RO,
       run: async (ctx, a) => {
         const accs = await pickAccounts(ctx, a.account);
@@ -645,7 +645,7 @@ function mount(app, opts) {
     },
     {
       name: 'list_notes', title: 'List notebook notes',
-      description: 'Notebook notes (trading plans, daily notes, session prep, trade notes, lessons). Search by text or folder. Returns ids for get_note.',
+      description: 'Notebook notes (trading plans, daily notes, session prep, trade notes, lessons). Search by text or folder. Each result includes the note id.',
       inputSchema: { type: 'object', properties: { account: ACCOUNT, query: { type: 'string', description: 'Text to look for in title or body.' }, folder: { type: 'string', description: 'Folder name (partial match).' }, limit: { type: 'integer', minimum: 1, maximum: 200, description: 'Default 30.' } }, additionalProperties: false }, annotations: RO,
       run: async (ctx, a) => {
         let all = []; for (const acc of await pickAccounts(ctx, a.account)) all = all.concat(await notesOf(acc));
@@ -658,7 +658,7 @@ function mount(app, opts) {
     {
       name: 'get_note', title: 'Read a note',
       description: 'Full text of one notebook note (tables become " | " rows; images and drawings show as [image]).',
-      inputSchema: { type: 'object', properties: { note_id: { type: 'string', description: 'note_id from list_notes.' } }, required: ['note_id'], additionalProperties: false }, annotations: RO,
+      inputSchema: { type: 'object', properties: { note_id: { type: 'string', description: 'Note id ("note:…").' } }, required: ['note_id'], additionalProperties: false }, annotations: RO,
       run: async (ctx, a) => {
         const m = /^note:([^:]+):(.+)$/.exec(S(a.note_id));
         const accs = await pickAccounts(ctx, m ? m[1] : 'all'), id = m ? m[2] : S(a.note_id);
@@ -674,7 +674,7 @@ function mount(app, opts) {
     },
     {
       name: 'get_trading_rules', title: 'Trading rules',
-      description: 'The trader\'s own trading rules: their personal rule checklist (the rules they tick on each trade) and any older saved rules. Compare them with trades\' rule checks, mistakes and tags to judge discipline.',
+      description: 'The trader\'s own trading rules: their personal rule checklist (the rules they tick on each trade) and any older saved rules.',
       inputSchema: { type: 'object', properties: { account: ACCOUNT }, additionalProperties: false }, annotations: RO,
       run: async (ctx, a) => {
         const accs = await pickAccounts(ctx, a.account);
@@ -708,7 +708,7 @@ function mount(app, opts) {
     },
     {
       name: 'search_journal', title: 'Search the journal',
-      description: 'Search trades and notes by keyword (symbol, strategy, tag, words in notes). Returns ids usable with fetch_journal_item.',
+      description: 'Search trades and notes by keyword (symbol, strategy, tag, words in notes). Each result includes an item id ("trade:…" or "note:…").',
       inputSchema: { type: 'object', properties: { query: { type: 'string', description: 'What to look for.' } }, required: ['query'], additionalProperties: false }, annotations: RO,
       run: async (ctx, a) => {
         const q = low(a.query); if (!q) return { results: [] };
@@ -729,8 +729,8 @@ function mount(app, opts) {
     },
     {
       name: 'fetch_journal_item', title: 'Fetch a journal item',
-      description: 'Full content of a trade or note found with search_journal (id like "trade:…" or "note:…").',
-      inputSchema: { type: 'object', properties: { id: { type: 'string', description: 'An id returned by search_journal.' } }, required: ['id'], additionalProperties: false }, annotations: RO,
+      description: 'Full content of one trade or note by its item id ("trade:…" or "note:…").',
+      inputSchema: { type: 'object', properties: { id: { type: 'string', description: 'Item id ("trade:…" or "note:…").' } }, required: ['id'], additionalProperties: false }, annotations: RO,
       run: async (ctx, a) => {
         const id = S(a.id);
         if (id.startsWith('note:')) { const n = await TOOL.get_note.run(ctx, { note_id: id }); return { id, title: n.title, text: n.text, url: APP_URL, metadata: { account: n.account, folder: n.folder, updated: n.updated } }; }
@@ -740,7 +740,7 @@ function mount(app, opts) {
     },
     {
       name: 'create_note', title: 'Save a note to the notebook',
-      description: 'Save a new note in the trader\'s ETW Journal notebook (e.g. a review, plan or analysis you wrote together). Only works if the trader allowed writing when creating this connector. Supports simple Markdown: # headings, - bullets, 1. lists, **bold**, *italic*, and | tables |.',
+      description: 'Save a new note in the trader\'s ETW Journal notebook (e.g. a review, plan or analysis). Only works if the trader allowed writing when creating this connector. Supports simple Markdown: # headings, - bullets, 1. lists, **bold**, *italic*, and | tables |.',
       inputSchema: { type: 'object', properties: { title: { type: 'string', description: 'Note title.' }, content: { type: 'string', description: 'Note body (Markdown).' }, account: { type: 'string', description: 'Account to save into (default: main journal).' } }, required: ['title', 'content'], additionalProperties: false },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
       write: true,
@@ -756,7 +756,7 @@ function mount(app, opts) {
     },
     {
       name: 'get_report', title: 'Reports',
-      description: 'The journal\'s Reports section, computed from the trades: overview, risk, wins vs losses, mistakes, markets (by symbol), sessions, strategies, day & time, and a daily P&L calendar. Accepts the same account and date filters as search_trades.',
+      description: 'The journal\'s Reports section, computed from the trades: overview, risk, wins vs losses, mistakes, markets (by symbol), sessions, strategies, day & time, and a daily P&L calendar. Accepts account and date filters.',
       inputSchema: { type: 'object', properties: Object.assign({ account: ACCOUNT }, DATE_FILTERS, {
         timezone: { type: 'string', description: 'IANA time zone for the day & time tables (default UTC), e.g. Africa/Nairobi.' },
       }), additionalProperties: false }, annotations: RO,
@@ -846,7 +846,7 @@ function mount(app, opts) {
     },
     {
       name: 'log_trade', title: 'Log a trade',
-      description: 'Add a CLOSED trade to the journal (same as the Add Trade form), with prices, result, session, emotions, notes, tags and chart screenshots. Confirm the details with the trader before saving. It cannot edit or delete existing trades. Needs a connector that allows writing.',
+      description: 'Add a CLOSED trade to the journal (same as the Add Trade form), with prices, result, session, emotions, notes, tags and chart screenshots. It cannot edit or delete existing trades. Needs a connector that allows writing.',
       inputSchema: { type: 'object', properties: {
         account: { type: 'string', description: 'Account to log into (default: main journal).' },
         pair: { type: 'string', description: 'Instrument, e.g. XAUUSD, EURUSD, NAS100.' },
@@ -899,9 +899,9 @@ function mount(app, opts) {
     },
     {
       name: 'update_trade_tags', title: 'Tag a trade',
-      description: 'Add or remove tags on an existing trade — they render as the tag chips on the trade\'s card in the Journal. Reuse the trader\'s existing tag names EXACTLY (same spelling and case; see existingTags in the result or get_performance_stats group_by tag) so they group with their tags; invent a new tag only when the trader asks for one. Only the tags change — nothing else on the trade. Needs a connector that allows writing.',
+      description: 'Add or remove tags on an existing trade; they appear as tag chips on the trade\'s card in the Journal. Tag names are stored exactly as written, so a differently spelled name becomes a separate tag; the result lists the trader\'s existing tags. Only the tags change, nothing else on the trade. Needs a connector that allows writing.',
       inputSchema: { type: 'object', properties: {
-        trade_id: { type: 'string', description: 'Trade id from search_trades.' },
+        trade_id: { type: 'string', description: 'Trade id.' },
         add: { type: 'array', items: { type: 'string' }, maxItems: 10, description: 'Tags to add.' },
         remove: { type: 'array', items: { type: 'string' }, maxItems: 10, description: 'Tags to remove (exact, case-insensitive match).' },
       }, required: ['trade_id'], additionalProperties: false },
@@ -922,7 +922,7 @@ function mount(app, opts) {
     },
     {
       name: 'create_playbook', title: 'Create a playbook',
-      description: 'Create a playbook (a documented setup) in the trader\'s Playbooks: name, description, market, timeframe, numbered rules, entry/exit/risk rules, notes, tags and example chart images. Confirm the content with the trader before saving. Needs a connector that allows writing.',
+      description: 'Create a playbook (a documented setup) in the trader\'s Playbooks: name, description, market, timeframe, numbered rules, entry/exit/risk rules, notes, tags and example chart images. Needs a connector that allows writing.',
       inputSchema: { type: 'object', properties: {
         title: { type: 'string', description: 'Playbook name.' },
         description: { type: 'string' }, market: { type: 'string', description: 'e.g. XAUUSD, indices, forex.' }, timeframe: { type: 'string', description: 'e.g. M5, H1.' },
@@ -953,9 +953,9 @@ function mount(app, opts) {
     },
     {
       name: 'update_playbook', title: 'Update a playbook',
-      description: 'Update one of the trader\'s own playbooks: only the fields you pass change (rules replaces the whole rules list). It cannot touch mentor playbooks and cannot delete anything. Needs a connector that allows writing.',
+      description: 'Update one of the trader\'s own playbooks: only the fields provided change (rules replaces the whole rules list). It cannot touch mentor playbooks and cannot delete anything. Needs a connector that allows writing.',
       inputSchema: { type: 'object', properties: {
-        playbook_id: { type: 'string', description: 'Playbook id from get_playbooks.' },
+        playbook_id: { type: 'string', description: 'Playbook id.' },
         title: { type: 'string' }, description: { type: 'string' }, market: { type: 'string' }, timeframe: { type: 'string' },
         rules: { type: 'array', items: { type: 'string' }, maxItems: 30, description: 'Replaces the full rules list — include every rule to keep.' },
         entry_rules: { type: 'string' }, exit_rules: { type: 'string' }, risk_rule: { type: 'string' }, notes: { type: 'string' },
@@ -987,7 +987,7 @@ function mount(app, opts) {
       name: 'attach_image', title: 'Attach an image',
       description: 'Attach a chart image (https URL or data:image base64) to an existing trade (its screenshot slots), playbook, notebook note, or a day\'s Session Prep (as an HTF chart with an explanation). Needs a connector that allows writing.',
       inputSchema: { type: 'object', properties: {
-        target: { type: 'string', description: 'Where it goes: "trade:<id>", "playbook:<id>", a note_id from list_notes ("note:<account>:<id>"), or "prep:<YYYY-MM-DD>".' },
+        target: { type: 'string', description: 'Where it goes: "trade:<id>", "playbook:<id>", a note id ("note:<account>:<id>"), or "prep:<YYYY-MM-DD>".' },
         image: { type: 'string', description: 'https URL or data:image/…;base64.' },
         name: { type: 'string', description: 'Short label (session prep only).' },
         explanation: { type: 'string', description: 'What the chart shows (session prep only).' },
@@ -1072,12 +1072,9 @@ function mount(app, opts) {
   }
 
   const INSTRUCTIONS = [
-    'ETW Journal is a trading journal. These tools read the trader\'s own journal: closed trades, performance stats, notebook notes, playbooks, trading rules and deposits/withdrawals.',
-    'Start with get_journal_overview. Use get_performance_stats with group_by to find edges and leaks (by symbol, session, strategy, weekday, hour, emotion, tag). Use search_trades then get_trade for specifics.',
-    'P&L figures are in the account currency; dates are UTC ISO-8601. A trader can have several independent journal accounts (personal, prop challenge, funded) — "all" combines them, so say which account a finding comes from.',
-    'Judge profitability on trading P&L versus deposits (get_cash_flows): withdrawals are not losses and deposits are not profit.',
-    'Be a direct, data-driven trading coach: quote the numbers, point out patterns (overtrading, revenge trades after losses, rule breaks, weak sessions), and suggest concrete changes. This is not financial advice.',
-    'Writing (only on a connector the trader created with writing allowed, and always from the trader\'s instructions): create_note and save_session_prep save notes and session prep, log_trade adds a closed trade, update_trade_tags tags a trade (reuse their existing tag names exactly), create_playbook and update_playbook manage their playbooks, attach_image adds chart images. Confirm with the trader before each write. Nothing can be deleted through this connector.',
+    'ETW Journal is a trading journal. This server gives access to the signed-in trader\'s own journal: closed trades, performance statistics and reports, notebook notes and session prep, playbooks, trading rules, and deposits/withdrawals.',
+    'P&L figures are in the account currency and dates are UTC (ISO-8601). A trader can have several independent journal accounts (for example personal, prop-firm challenge, funded); "all" combines them and each result names its account.',
+    'Deposits and withdrawals are recorded separately from trading P&L. Write tools are available only when the trader allowed writing at sign-in, and nothing can be deleted through this server.',
   ].join('\n');
 
   // ════════════════════════ the MCP endpoint ════════════════════════
