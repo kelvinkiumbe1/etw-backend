@@ -131,3 +131,24 @@ calls go through the small relay in `bybit-relay/` (deployed separately in Frank
    - `BYBIT_RELAY_SECRET` = the same secret
    - `MT5_CRED_KEY` must also be set (Bybit API keys are stored encrypted with it).
 4. Check: `https://<relay>/health` should show `"configured": true`.
+
+## AI connector sign-in (OAuth) — Claude Connectors Directory
+
+`src/oauth.js` lets Claude and other MCP apps connect with "Connect → sign in → Allow"
+instead of a pasted connector key. Keys keep working. Nothing is required to turn it
+on; these are optional:
+
+- `OAUTH_CONSENT_URL` — the app's consent page. Default `https://etwiz.space/authorize`.
+- `MCP_DOCS_URL` — public help page for the connector, shown in the OAuth metadata.
+  Default `https://etwjournal.space`.
+- `MCP_EXTRA_HOSTS` — comma-separated extra hostnames this backend answers on (for
+  example a custom domain such as `mcp.etwjournal.space`), so tokens requested for
+  that address are accepted. The request's own host and `PUBLIC_API_URL` /
+  `RENDER_EXTERNAL_URL` are always accepted.
+
+Optional: in the Firebase console, add a Firestore TTL policy on the field `expireAt`
+for the collections `mcpOAuthRequests`, `mcpOAuthCodes` and `mcpOAuthTokens`, so
+expired entries are cleaned up automatically. Everything works without it.
+
+Check: `https://<backend>/.well-known/oauth-authorization-server` returns JSON, and
+`POST https://<backend>/mcp` with no key answers 401 with a `WWW-Authenticate` header.

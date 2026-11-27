@@ -1299,8 +1299,13 @@ async function mcpPlanOf(uid) {
   if (access.isUltra(a)) return 'ultra';
   return access.isPro(a) ? 'pro' : 'essential';
 }
+// OAuth sign-in for the connector (Claude's Connectors Directory requires it). Keys keep working.
+const mcpOAuth = require('./src/oauth').mount(app, {
+  db, admin, requireAuth, limiter: rl,
+  planOf: async (uid) => { const p = await mcpPlanOf(uid); return p === 'essential' ? null : p; },
+});
 require('./src/mcp').mount(app, {
-  db, requireAuth,
+  db, requireAuth, oauth: mcpOAuth,
   planOf: async (uid) => { const p = await mcpPlanOf(uid); return p === 'essential' ? null : p; },
   accountLimit: async (uid) => { const p = await mcpPlanOf(uid); return (PLAN_LIMITS[p] || PLAN_LIMITS.essential).accounts; },
 });
