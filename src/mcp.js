@@ -32,7 +32,15 @@ const crypto = require('crypto');
 let kindFromNote = (k) => k;
 try { kindFromNote = require('./cashflows').kindFromNote || kindFromNote; } catch (e) {}
 
-const SERVER_INFO = { name: 'etw-journal', title: 'ETW Journal', version: '1.0.0' };
+const LOGO = 'https://etwiz.space/assets/brand/etw-logo-';
+// icons + websiteUrl: shown by MCP clients (and Claude's connector directory) next to the name.
+const SERVER_INFO = {
+  name: 'etw-journal', title: 'ETW Journal', version: '1.0.0', websiteUrl: 'https://etwjournal.space',
+  icons: [
+    { src: LOGO + '512.png', mimeType: 'image/png', sizes: ['512x512'] },
+    { src: LOGO + '192.png', mimeType: 'image/png', sizes: ['192x192'] },
+  ],
+};
 const PROTOCOLS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 const KEY_PREFIX = 'etwk_';
 const MAX_KEYS = 5;
