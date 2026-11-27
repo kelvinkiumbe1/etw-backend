@@ -341,6 +341,12 @@ function secretMatches(given, secret) {
   return crypto.timingSafeEqual(h(given), h(secret));
 }
 
+// The backend's own icon (mcp.etwjournal.space/favicon.ico …): the ETW Journal logo
+// hosted on the app, so tools that show a site icon for the connector show ours.
+const ETW_LOGO_192 = 'https://etwiz.space/assets/brand/etw-logo-192.png';
+app.get(['/favicon.ico', '/favicon.png', '/apple-touch-icon.png', '/apple-touch-icon-precomposed.png'], (_req, res) =>
+  res.set('Cache-Control', 'public, max-age=86400').redirect(301, ETW_LOGO_192));
+
 app.get('/', (_req, res) => res.json({
   ok: true,
   service: 'etw-sync-backend',
