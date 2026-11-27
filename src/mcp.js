@@ -15,6 +15,9 @@
 //  the URL  (https://<api>/mcp/<key>  — for apps that only take a URL) or as
 //  "Authorization: Bearer <key>" against https://<api>/mcp. Revoking the key in
 //  Settings cuts the AI off immediately. Pro / Ultra only, like ETW AI.
+//  Or OAuth 2.1 (src/oauth.js): apps that support it connect to https://<api>/mcp
+//  with no key, get a 401 that points at our OAuth metadata, and the trader
+//  signs in and clicks Allow. Their access tokens arrive as a Bearer header.
 //
 //  Data model it reads (same as the app):
 //    trades            top-level, uid == data uid (one per independent account)
@@ -71,6 +74,7 @@ function bust(prefix) { for (const k of [..._cache.keys()]) if (k.startsWith(pre
 
 function mount(app, opts) {
   const { db, requireAuth, planOf, accountLimit } = opts;
+  const oauth = opts.oauth || null;   // { resolve, touch, challenge } from src/oauth.js
   const publicBase = () => S(process.env.PUBLIC_API_URL || process.env.RENDER_EXTERNAL_URL || 'https://etwappmeta5-2.onrender.com').replace(/\/+$/, '');
 
   // ════════════════════════ key management (from the app) ════════════════════════
@@ -1107,12 +1111,16 @@ function mount(app, opts) {
   async function endpoint(req, res) {
     res.set('Cache-Control', 'no-store');
     const key = keyFrom(req);
-    const unauthorized = (why) => res.status(401).json(rpcErr(null, -32001, why));
-    if (!key) return unauthorized('Missing ETW Journal connector key. Create one in ETW Journal › Settings › AI Connectors and use the full connector URL.');
+    // The WWW-Authenticate header is what tells an OAuth-capable client where to sign in.
+    const unauthorized = (why, error) => { if (oauth) res.set('WWW-Authenticate', oauth.challenge(req, error)); return res.status(401).json(rpcErr(null, -32001, why)); };
+    if (!key) return unauthorized('Sign in to ETW Journal to connect, or use the connector URL from ETW Journal › Settings › AI Connectors.');
     if (limited('ip:' + sha(key).slice(0, 16), 240, 60e3)) return res.status(429).json(rpcErr(null, -32002, 'Too many requests. Slow down a little.'));
+    const viaOAuth = !!oauth && key.startsWith('etwa_');
     let rec;
-    try { rec = await resolveKey(key); } catch (e) { console.error('[mcp] key lookup', e.message); return res.status(503).json(rpcErr(null, -32603, 'ETW Journal is temporarily unavailable.')); }
-    if (!rec) return unauthorized('This ETW Journal connector key is not valid or was revoked. Create a new one in Settings › AI Connectors.');
+    try { rec = viaOAuth ? await oauth.resolve(key) : await resolveKey(key); } catch (e) { console.error('[mcp] key lookup', e.message); return res.status(503).json(rpcErr(null, -32603, 'ETW Journal is temporarily unavailable.')); }
+    if (!rec) return viaOAuth
+      ? unauthorized('Your ETW Journal sign-in has expired or was removed. Connect again.', 'invalid_token')
+      : unauthorized('This ETW Journal connector key is not valid or was revoked. Create a new one in Settings › AI Connectors.', 'invalid_token');
     const ctx = { uid: rec.uid, scope: rec.scope === 'write' ? 'write' : 'read', hash: rec.hash, client: S(req.get('user-agent')).slice(0, 60) };
     const body = req.body;
     const batch = Array.isArray(body);
@@ -1120,7 +1128,7 @@ function mount(app, opts) {
     if (!msgs.length || msgs.length > 20) return res.status(400).json(rpcErr(null, -32600, 'Invalid Request'));
     const replies = [];
     for (const m of msgs) { const r = await handle(m, ctx); if (r) replies.push(r); }
-    touch(rec, ctx.client);
+    if (rec.kind === 'oauth') oauth.touch(rec, ctx.client); else touch(rec, ctx.client);
     if (!replies.length) return res.status(202).end();
     res.set('Content-Type', 'application/json');
     return res.status(200).send(JSON.stringify(batch ? replies : replies[0]));
