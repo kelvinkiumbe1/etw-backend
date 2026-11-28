@@ -1745,9 +1745,26 @@ function ownActionLink(firebaseLink, mode) {
 // account exists (no account enumeration). Only when the account exists but
 // Brevo could not send does it answer 502, so the page can fall back to
 // Firebase's own email instead of telling the user to wait for nothing.
+// Per-address limit, on top of the per-IP authLimiter: at most one reset email a
+// minute and 5 an hour to any one inbox, so the form cannot be used to flood
+// someone's mailbox (or burn the Brevo quota / sender reputation).
+const RESET_SENT = new Map();   // email -> [timestamps]
+function resetAllowed(addr) {
+  const now = Date.now(), hour = 3600 * 1000;
+  const list = (RESET_SENT.get(addr) || []).filter((t) => now - t < hour);
+  if (list.length >= 5 || (list.length && now - list[list.length - 1] < 60 * 1000)) { RESET_SENT.set(addr, list); return false; }
+  list.push(now); RESET_SENT.set(addr, list);
+  if (RESET_SENT.size > 5000) for (const [k, v] of RESET_SENT) if (!v.length || now - v[v.length - 1] > hour) RESET_SENT.delete(k);
+  return true;
+}
+// A send that failed does not count: the trader may try again straight away.
+function resetUndo(addr) { const l = RESET_SENT.get(addr); if (l && l.length) l.pop(); }
+
 app.post('/api/auth/send-reset', authLimiter, async (req, res) => {
   const addr = String((req.body && req.body.email) || '').trim().toLowerCase();
   if (!addr || addr.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(addr)) return res.status(400).json({ error: 'A valid email is required.' });
+  // A repeat within the minute: the first email is already on its way.
+  if (!resetAllowed(addr)) return res.json({ ok: true, throttled: true });
   let user = null;
   try { user = await admin.auth().getUserByEmail(addr); }
   catch (e) {
@@ -1755,12 +1772,15 @@ app.post('/api/auth/send-reset', authLimiter, async (req, res) => {
     // Any other failure (credentials, quota, network) used to be answered "ok" too, so the
     // page told the trader an email was coming when nothing was sent. Say it failed instead.
     console.error('send-reset lookup:', e.message);
+    resetUndo(addr);
     return res.status(502).json({ error: 'Could not look up the account' });
   }
   try {
     const link = ownActionLink(await admin.auth().generatePasswordResetLink(addr, actionSettings), 'resetPassword');
     const hasPassword = (user.providerData || []).some((p) => p.providerId === 'password');
-    const hi = user.displayName ? 'Hi ' + escapeHtml(user.displayName.split(' ')[0]) + ',' : 'Hi,';
+    const first = user.displayName ? user.displayName.split(' ')[0] : '';
+    const hi = first ? 'Hi ' + escapeHtml(first) + ',' : 'Hi,';
+    const hiText = first ? 'Hi ' + first + ',' : 'Hi,';   // plain-text copy: no HTML escaping
     const sent = await email.sendEmail({
       to: user.email || addr, toName: user.displayName || '',
       subject: hasPassword ? 'Reset your ETW Journal password' : 'Set a password for your ETW Journal account',
@@ -1769,12 +1789,13 @@ app.post('/api/auth/send-reset', authLimiter, async (req, res) => {
         `<p>If you didn't ask for this, ignore this email: your password stays the same.</p>`,
         hasPassword ? 'Choose a new password' : 'Set my password', link),
       // A plain-text part next to the HTML is part of what keeps mail out of spam.
-      text: `${hi}\n\nWe received a request to ${hasPassword ? 'reset the password for' : 'add a password to'} your ETW Journal account (${user.email || addr}).\n\nChoose a new password here (works once, expires in 1 hour):\n${link}\n\nIf you didn't ask for this, ignore this email: your password stays the same.\n\nETW Journal`,
+      text: `${hiText}\n\nWe received a request to ${hasPassword ? 'reset the password for' : 'add a password to'} your ETW Journal account (${user.email || addr}).\n\nChoose a new password here (works once, expires in 1 hour):\n${link}\n\nIf you didn't ask for this, ignore this email: your password stays the same.\n\nETW Journal`,
     });
-    if (!sent) return res.status(502).json({ error: 'Email send failed' });
+    if (!sent) { resetUndo(addr); return res.status(502).json({ error: 'Email send failed' }); }
     res.json({ ok: true, sent: true });
   } catch (e) {
     console.error('send-reset:', e.message);
+    resetUndo(addr);
     res.status(502).json({ error: 'Could not send the reset email' });
   }
 });
